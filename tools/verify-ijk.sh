@@ -141,6 +141,16 @@ if (ijk / 'config/module.sh').read_bytes() != (package / 'module.sh').read_bytes
     raise SystemExit('Restored module config mismatch')
 if 'offsetof(pstruct, options_field . verify),    AV_OPT_TYPE_INT, { .i64 = 1 }' not in (ff / 'libavformat/tls.h').read_text():
     raise SystemExit('Restored sources do not enable TLS verification by default')
+prefix = 'ios/IJKMediaPlayer/IJKMediaPlayer/'
+for rel, tokens in {
+    'ijkmedia/ijksdl/ijksdl_vout.h': ['double pts;', 'double duration;', 'int serial;'],
+    prefix+'IJKSDLGLViewProtocol.h': ['double pts;', 'double duration;', 'int serial;'],
+    'ijkmedia/ijkplayer/ff_ffplay.c': ['vp->bmp->pts = pts;', 'vp->bmp->duration = duration;', 'vp->bmp->serial = serial;'],
+    prefix+'ijkmedia/ijksdl/ios/ijksdl_vout_ios_gles2.m': ['IJKOverlay ijk_overlay = {0};', 'ijk_overlay.pts = overlay->pts;', 'ijk_overlay.duration = overlay->duration;', 'ijk_overlay.serial = overlay->serial;'],
+}.items():
+    text = (ijk / rel).read_text()
+    if any(text.count(token) != 1 for token in tokens):
+        raise SystemExit('Restored PiP metadata contract mismatch: ' + rel)
 # Archives contain no .git; create a local tag carrying the exact version name.
 subprocess.run(['git', '-C', str(ff), 'add', '.'], check=True)
 subprocess.run(['git', '-C', str(ff), '-c', 'user.name=Source Restore', '-c',
@@ -201,8 +211,14 @@ test -s "$FRAMEWORK/Headers/IJKMediaFramework.h"
 test -s "$FRAMEWORK/Info.plist"
 grep -q 'IJKMediaFramework' "$FRAMEWORK/Modules/module.modulemap"
 # Use the real application integration, not only an import of one class.
+xcrun --sdk iphoneos clang -fsyntax-only -fobjc-arc -fmodules \
+    -target arm64-apple-ios16.0 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+    -F "$(dirname "$FRAMEWORK")" "$ROOT/App/IJKSampleBufferView.m" >"$LOGS/objc-renderer-check.log" 2>&1 || {
+        tail -n 80 "$LOGS/objc-renderer-check.log" >&2; exit 1;
+    }
 xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 \
     -target arm64-apple-ios16.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
+    -import-objc-header "$ROOT/App/NiuNiu-Bridging-Header.h" \
     -F "$(dirname "$FRAMEWORK")" "$ROOT/App/Player.swift" >"$LOGS/swift-player-check.log" 2>&1 || {
         tail -n 80 "$LOGS/swift-player-check.log" >&2; exit 1;
     }

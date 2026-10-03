@@ -30,6 +30,7 @@ import UIKit
     @State private var duration: Double = 0
     @State private var playing = false
     @State private var fullScreen = false
+    @State private var detailVisible = false
     @State private var landscape = true
     @State private var locked = false
     @State private var fill = false
@@ -83,6 +84,11 @@ import UIKit
         .navigationTitle(video?.name ?? "影片详情").navigationBarTitleDisplayMode(.inline)
         .task {
             configureCallbacks()
+            playback.restorePictureInPictureUI = {
+                guard detailVisible else { return false }
+                fullScreen = true
+                return true
+            }
             if video == nil { suspended = false; await loadDetail() }
             else if suspended {
                 suspended = false
@@ -95,12 +101,14 @@ import UIKit
             }
         }
         .onReceive(clock) { _ in tickTimer() }
+        .onAppear { detailVisible = true }
         .onChange(of: scenePhase) { phase in backgroundChanged(phase) }
         .onChange(of: fill) { playback.setFill($0) }
         .onChange(of: playback.isPlaying) { playing = $0 }
         .onChange(of: account.isLoggedIn) { _ in Task { await loadFavoriteStatus() } }
         .onDisappear {
-            if !fullScreen && !playback.isPictureInPicture {
+            detailVisible = false
+            if !fullScreen && !playback.hasPictureInPictureSession {
                 closeDetail()
             }
         }
@@ -183,7 +191,7 @@ import UIKit
         if fullScreen { Button(landscape ? "切换竖屏" : "切换横屏") { landscape.toggle() } }
         Menu("播放方式") { Button("连续播放") { settings.mode = "continuous" }; Button("单集停止") { settings.mode = "single" }; Button("单集循环") { settings.mode = "loop" } }
         Button("AirPlay / 系统投屏") { sheet = .cast }
-        Button("画中画（当前 IJK 不支持）") { sheet = .pip }
+        Button("画中画") { sheet = .pip }
     }
     private func temporaryRate(_ active: Bool) {
         if active {
@@ -316,8 +324,11 @@ import UIKit
             }
         case .pip:
             NavigationStack {
-                Text("当前 IJK 内核尚未接入兼容 iOS 的画中画渲染方案，暂时不能启动画中画。此入口保留用于后续兼容；返回桌面会暂停本机视频播放。")
-                    .padding().navigationTitle("画中画兼容状态")
+                VStack(spacing: 16) {
+                    Text(playback.pictureInPictureStatus)
+                    Button("启动画中画") { sheet = nil; playback.requestPictureInPicture() }
+                        .disabled(!playback.canStartPictureInPicture)
+                }.padding().navigationTitle("画中画")
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { sheet = nil } } }
             }
         }
@@ -421,6 +432,7 @@ import UIKit
         playback.onEnd = { guard !suspended, !playback.isSeeking, resolved != nil, !resolving else { return }; finishEpisode() }
     }
     private func closeDetail() {
+        guard !playback.hasPictureInPictureSession else { return }
         guard !suspended else { return }
         recordHistory()
         if playback.core != nil { time = playback.position.isFinite ? max(0, playback.position) : time }
@@ -551,9 +563,9 @@ import UIKit
         if phase == .background {
             recordHistory()
             backgroundPauseTask = Task { @MainActor in
-                // Leave time for a future compatible PiP adapter to update its state.
+                // Normal background playback remains paused; active PiP owns IJK.
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard !Task.isCancelled, !playback.isPictureInPicture else { return }
+                guard !Task.isCancelled, !playback.hasPictureInPictureSession else { return }
                 playback.pause(); playing = false
             }
         }

@@ -26,7 +26,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: Vendor
-          key: ijk-device16-arm64-30eb9441945da795079492041a791c121d2b8206-e88b5afbf9ca543a098ede6dd6765ef0e629836d-${{ steps.toolchain.outputs.identity }}-${{ hashFiles('tools/build-ijk.sh', 'tools/verify-ijk.sh', 'App/Player.swift', 'LICENSES/IJK.md') }}
+          key: ijk-device16-arm64-30eb9441945da795079492041a791c121d2b8206-e88b5afbf9ca543a098ede6dd6765ef0e629836d-${{ steps.toolchain.outputs.identity }}-${{ hashFiles('tools/build-ijk.sh', 'tools/verify-ijk.sh', 'App/Player.swift', 'App/IJKSampleBufferView.h', 'App/IJKSampleBufferView.m', 'App/NiuNiu-Bridging-Header.h', 'project.yml', 'LICENSES/IJK.md') }}
       - name: Build official IJK and FFmpeg from source
         if: steps.ijk-cache.outputs.cache-hit != 'true'
         run: bash tools/build-ijk.sh

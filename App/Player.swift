@@ -6,7 +6,7 @@ import IJKMediaFramework
 
 /// The playback engine is Bilibili's IJKFFMoviePlayerController (FFmpeg), not AVPlayer.
 @MainActor
-final class PlaybackController: ObservableObject {
+final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
     @Published private(set) var core: IJKFFMoviePlayerController?
     var view: UIView? { core?.view }
     @Published private(set) var position: Double = 0
@@ -22,9 +22,19 @@ final class PlaybackController: ObservableObject {
 
     // An IJK OpenGL view is neither AVPlayerLayer nor an AVSampleBufferDisplayLayer.
     // Supporting PiP requires a new sample-buffer rendering pipeline, not a dummy AVPlayer.
-    let isPictureInPicture = false
-    let canStartPictureInPicture = false
-    let pictureInPictureStatus = "当前 IJK OpenGL 渲染不支持系统画中画；需要实现样本缓冲输出和 PiP 播放代理。"
+    @Published private(set) var isPictureInPicture = false
+    @Published private(set) var canStartPictureInPicture = false
+    var pictureInPictureStatus: String { capabilityMessage ?? "画中画使用 IJK 真实解码帧；首帧显示且系统允许后可启动。" }
+    var restorePictureInPictureUI: (() -> Bool)?
+    private var renderer: IJKSampleBufferView?
+    private var pip: AVPictureInPictureController?
+    private var pipPossibleObservation: NSKeyValueObservation?
+    private var pipStarting = false
+    var hasPictureInPictureSession: Bool { isPictureInPicture || pipStarting }
+    private var pipStartTimeout: Task<Void, Never>?
+    private var skipCompletion: (() -> Void)?
+    private var skipTimeout: Task<Void, Never>?
+    private static var pipOwner: PlaybackController?
     let airPlayStatus = "系统路由按钮可选择音频设备；当前 IJK 未实现 AirPlay 视频远程投送。视频可使用系统屏幕镜像。"
 
     var onProgress: ((Double) -> Void)?
@@ -41,7 +51,8 @@ final class PlaybackController: ObservableObject {
     private var fill = false
     private var lastProgressTime = -Double.infinity
 
-    init() {
+    override init() {
+        super.init()
         videoToolboxEnabled = UserDefaults.standard.object(forKey: "niuniu.hardwareDecode") as? Bool ?? true
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
@@ -78,12 +89,16 @@ final class PlaybackController: ObservableObject {
         options.showHudView = false
         options.setPlayerOptionIntValue(videoToolboxEnabled ? 1 : 0, forKey: "videotoolbox")
         options.setPlayerOptionIntValue(1, forKey: "enable-accurate-seek")
+        // Official software vout converts other AVFrame formats to this I420
+        // output; the ObjC bridge interleaves the real chroma planes to NV12.
+        options.setPlayerOptionIntValue(Int64(0x30323449), forKey: "overlay-format")
         options.setFormatOptionValue(headerOptions.userAgent, forKey: "user_agent")
         if !headerOptions.block.isEmpty {
             // FFmpeg HTTP AVOptions belong to FORMAT, never PLAYER or CODEC.
             options.setFormatOptionValue(headerOptions.block, forKey: "headers")
         }
-        guard let candidate = IJKFFMoviePlayerController(contentURL: url, with: options) else {
+        let output = IJKSampleBufferView(frame: .zero)
+        guard let candidate = IJKSampleBufferView.makePlayer(url: url, options: options, renderer: output) else {
             error = "阶段 initialize · domain IJKMediaFramework · code initialization-failed"
             return
         }
@@ -97,7 +112,28 @@ final class PlaybackController: ObservableObject {
         candidate.setPauseInBackground(true)
         candidate.scalingMode = fill ? .aspectFill : .aspectFit
         candidate.playbackRate = rate
+        renderer = output
+        output.contentMode = fill ? .scaleAspectFill : .scaleAspectFit
+        output.renderError = { [weak self, weak output] message in
+            guard let self, self.renderer === output else { return }
+            self.error = message
+            self.pause()
+            self.pip?.stopPictureInPicture()
+        }
         core = candidate
+        if AVPictureInPictureController.isPictureInPictureSupported() {
+            let source = AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer: output.displayLayer, playbackDelegate: self)
+            let controller = AVPictureInPictureController(contentSource: source)
+            controller.delegate = self
+            controller.canStartPictureInPictureAutomaticallyFromInline = false
+            pip = controller
+            pipPossibleObservation = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self, weak controller] _, _ in
+                DispatchQueue.main.async { [weak self, weak controller] in
+                    guard let self, self.pip === controller else { return }
+                    self.canStartPictureInPicture = controller?.isPictureInPicturePossible == true
+                }
+            }
+        }
         observe(candidate)
         startTimer()
         stage = "prepare"
@@ -134,6 +170,7 @@ final class PlaybackController: ObservableObject {
         seekCompleted = false
         isSeeking = true
         stage = "seek"
+        renderer?.invalidateForSeek()
         core.currentPlaybackTime = target
         // Do not publish the requested target as actual progress; the timer reads IJK's clock.
     }
@@ -144,11 +181,13 @@ final class PlaybackController: ObservableObject {
         guard value.isFinite, value > 0 else { return }
         rate = min(max(value, 0.25), 4)
         core?.playbackRate = rate
+        renderer?.updateClock(position, rate: isPlaying ? Double(rate) : 0)
     }
 
     func setFill(_ value: Bool) {
         fill = value
         core?.scalingMode = value ? .aspectFill : .aspectFit
+        renderer?.contentMode = value ? .scaleAspectFill : .scaleAspectFit
     }
 
     /// Applies to the next load. Reload the current source explicitly to change decoders.
@@ -157,7 +196,23 @@ final class PlaybackController: ObservableObject {
     }
 
     func requestPictureInPicture() {
-        capabilityMessage = pictureInPictureStatus
+        guard let pip, pip.isPictureInPicturePossible, isReady, error == nil else {
+            capabilityMessage = "系统尚不允许画中画：请等待真实首帧显示，或检查设备与播放状态。"
+            return
+        }
+        guard !pipStarting, !isPictureInPicture else { return }
+        capabilityMessage = nil
+        pipStarting = true
+        Self.pipOwner = self
+        core?.setPauseInBackground(false)
+        pip.startPictureInPicture()
+        pipStartTimeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !Task.isCancelled, let self, self.pipStarting else { return }
+            self.pip?.stopPictureInPicture()
+            self.finishPictureInPicture()
+            self.capabilityMessage = "画中画启动超时，已恢复普通后台暂停策略。"
+        }
     }
 
     func stop() {
@@ -290,6 +345,9 @@ final class PlaybackController: ObservableObject {
             isSeeking = false
         }
         position = seconds
+        renderer?.updateClock(seconds, rate: isPlaying && !isSeeking ? Double(rate) : 0)
+        pip?.invalidatePlaybackState()
+        if !isSeeking { completeSkip() }
         onTime?(seconds)
         guard core === candidate, !isSeeking else { return }
         if isReady && abs(seconds - lastProgressTime) >= 5 {
@@ -299,6 +357,18 @@ final class PlaybackController: ObservableObject {
     }
 
     private func releaseCore() {
+        completeSkip()
+        pipPossibleObservation = nil
+        pipStartTimeout?.cancel(); pipStartTimeout = nil
+        pip?.delegate = nil
+        pip?.stopPictureInPicture()
+        pip = nil
+        pipStarting = false
+        isPictureInPicture = false
+        canStartPictureInPicture = false
+        if Self.pipOwner === self { Self.pipOwner = nil }
+        renderer?.close()
+        renderer = nil
         timer?.invalidate()
         timer = nil
         observers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -308,6 +378,64 @@ final class PlaybackController: ObservableObject {
         previous?.view?.removeFromSuperview()
         previous?.stop()
         previous?.shutdown() // Official shutdown releases native FFmpeg threads asynchronously.
+    }
+
+    private func completeSkip() {
+        skipTimeout?.cancel(); skipTimeout = nil
+        let completion = skipCompletion; skipCompletion = nil
+        completion?()
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, setPlaying playing: Bool) {
+        if playing { play() } else { pause() }
+        renderer?.updateClock(position, rate: playing ? Double(rate) : 0)
+        pictureInPictureController.invalidatePlaybackState()
+    }
+    func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
+        CMTimeRange(start: .zero, duration: duration > 0 ? CMTimeMakeWithSeconds(duration, preferredTimescale: 1000000) : .positiveInfinity)
+    }
+    func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool { !isPlaying }
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) {
+        completeSkip()
+        guard duration > 0, isReady, skipInterval.seconds.isFinite else { completionHandler(); return }
+        skipCompletion = completionHandler
+        seek(position + skipInterval.seconds)
+        skipTimeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.completeSkip()
+        }
+    }
+    func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        pipStarting = true; core?.setPauseInBackground(false)
+    }
+    func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        pipStartTimeout?.cancel(); pipStartTimeout = nil
+        pipStarting = false; isPictureInPicture = true
+    }
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
+        finishPictureInPicture()
+        capabilityMessage = "画中画启动失败：\(error.localizedDescription)"
+    }
+    func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) { finishPictureInPicture() }
+    private func finishPictureInPicture() {
+        pipStartTimeout?.cancel(); pipStartTimeout = nil
+        isPictureInPicture = false; pipStarting = false
+        core?.setPauseInBackground(true)
+        if UIApplication.shared.applicationState != .active { pause() }
+        if Self.pipOwner === self { Self.pipOwner = nil }
+    }
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
+        if restorePictureInPictureUI?() == true { completionHandler(true); return }
+        // A popped DetailView cannot honestly claim its @State change restores
+        // navigation. Present the SAME controller/output in a real visible host.
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first(where: { $0.activationState == .foregroundActive }),
+              var host = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else { completionHandler(false); return }
+        while let presented = host.presentedViewController { host = presented }
+        let restored = UIHostingController(rootView: RestoredPictureInPicturePlayer(controller: self))
+        restored.modalPresentationStyle = .fullScreen
+        host.present(restored, animated: true) { completionHandler(true) }
     }
 
     private static func validTime(_ value: Double) -> Double {
@@ -351,6 +479,22 @@ final class PlaybackController: ObservableObject {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         // Native teardown is performed explicitly by stop()/releaseCore() while
         // still MainActor-owned. Nonisolated deinit must not read published core.
+    }
+}
+
+private struct RestoredPictureInPicturePlayer: View {
+    @ObservedObject var controller: PlaybackController
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack {
+            PlaybackSurface(controller: controller, fill: false)
+            HStack {
+                Button("后退15秒") { controller.seek(controller.position - 15) }
+                Button(controller.isPlaying ? "暂停" : "播放") { if controller.isPlaying { controller.pause() } else { controller.play() } }
+                Button("前进15秒") { controller.seek(controller.position + 15) }
+                Button("关闭") { controller.stop(); dismiss() }
+            }.padding()
+        }.background(Color.black).foregroundStyle(.white)
     }
 }
 

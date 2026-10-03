@@ -1,5 +1,11 @@
 # IJK / FFmpeg 第三方声明与可重建来源
 
+## Sample-buffer PiP source change
+
+固定官方 IJK 的 `SDL_VoutOverlay` 与公开 `IJKOverlay` 新增 `pts`、`duration`、`serial`，由 `ff_ffplay.c/queue_picture` 写入，iOS vout 的 `display_pixels:` 同帧传递。初始化回调结构为零，避免软件帧误读未初始化 `pixel_buffer`。不修改 FFmpeg 解码或 AudioUnit；App 的 `IJKSampleBufferView` 使用真实解码像素，不使用截图或 AVPlayer 替代。
+
+该修改由 `tools/build-ijk.sh` 对固定源断言应用，并收入 `ijk-modern-apple.patch`；原始归档、patch hash、tracked source tree hash 与 `verify-ijk.sh --restore-source` 的 metadata 断言一同分发。新增公开结构字段改变 ABI，必须重新构建 framework 与 App，不能使用旧 build 3 framework 搭配新 App。缓存键包含 renderer、bridging header 与项目配置。构建成功不等同于签名真机 PiP 验收。
+
 此文件不是对整个 App 的许可证授权，也不替代第三方许可证全文。
 
 ## 来源锁定

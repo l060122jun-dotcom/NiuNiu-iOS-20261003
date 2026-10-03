@@ -153,6 +153,26 @@ char * av_dict_ptrtostr(uintptr_t value) {
     return av_strdup(valuestr);
 }''', 1)
 controller = ijk/'ios/IJKMediaPlayer/IJKMediaPlayer/IJKFFMoviePlayerController.m'
+prefix = 'ios/IJKMediaPlayer/IJKMediaPlayer/'
+# Metadata follows the SAME scheduled overlay as the pixels (not a decode tap).
+# All edits match the pinned source exactly and are captured by git diff below.
+metadata = '''    double pts;
+    double duration;
+    int serial;
+'''
+replace(ijk/'ijkmedia/ijksdl/ijksdl_vout.h', '    int sar_num;\n    int sar_den;\n', '    int sar_num;\n    int sar_den;\n\n' + metadata, 1)
+replace(ijk/(prefix+'IJKSDLGLViewProtocol.h'), '    int sar_num;\n    int sar_den;\n', '    int sar_num;\n    int sar_den;\n' + metadata, 1)
+replace(ijk/'ijkmedia/ijkplayer/ff_ffplay.c', '        vp->bmp->sar_den = vp->sar.den;\n', '''        vp->bmp->sar_den = vp->sar.den;
+        vp->bmp->pts = pts;
+        vp->bmp->duration = duration;
+        vp->bmp->serial = serial;
+''', 1)
+replace(ijk/(prefix+'ijkmedia/ijksdl/ios/ijksdl_vout_ios_gles2.m'), '        IJKOverlay ijk_overlay;\n', '        IJKOverlay ijk_overlay = {0};\n', 1)
+replace(ijk/(prefix+'ijkmedia/ijksdl/ios/ijksdl_vout_ios_gles2.m'), '        ijk_overlay.sar_den = overlay->sar_den;\n', '''        ijk_overlay.sar_den = overlay->sar_den;
+        ijk_overlay.pts = overlay->pts;
+        ijk_overlay.duration = overlay->duration;
+        ijk_overlay.serial = overlay->serial;
+''', 1)
 replace(controller, 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ijk0.8.8--20201130--001";', 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ijk0.8.8--20210426--001";', 1)
 # Return the actual AVAudioSession result on every BOOL path; keep the
 # upstream deactivation exception handler rather than silencing return-type.
