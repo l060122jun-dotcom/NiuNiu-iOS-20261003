@@ -19,6 +19,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: 牛牛视频
+        CFBundleShortVersionString: "1.6.2"
+        CFBundleVersion: "1"
         UILaunchScreen: {}
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
