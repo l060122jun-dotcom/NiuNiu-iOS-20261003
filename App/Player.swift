@@ -178,15 +178,15 @@ final class PlaybackController: ObservableObject {
 
     private func observe(_ candidate: IJKFFMoviePlayerController) {
         let names: [Notification.Name] = [
-            IJKMPMediaPlaybackIsPreparedToPlayDidChangeNotification,
-            IJKMPMoviePlayerPlaybackStateDidChangeNotification,
-            IJKMPMoviePlayerLoadStateDidChangeNotification,
-            IJKMPMoviePlayerPlaybackDidFinishNotification,
-            IJKMPMoviePlayerOpenInputNotification,
-            IJKMPMoviePlayerFindStreamInfoNotification,
-            IJKMPMoviePlayerComponentOpenNotification,
-            IJKMPMoviePlayerFirstVideoFrameRenderedNotification,
-            IJKMPMoviePlayerDidSeekCompleteNotification
+            .IJKMPMediaPlaybackIsPreparedToPlayDidChange,
+            .IJKMPMoviePlayerPlaybackStateDidChange,
+            .IJKMPMoviePlayerLoadStateDidChange,
+            .IJKMPMoviePlayerPlaybackDidFinish,
+            .IJKMPMoviePlayerOpenInput,
+            .IJKMPMoviePlayerFindStreamInfo,
+            .IJKMPMoviePlayerComponentOpen,
+            .IJKMPMoviePlayerFirstVideoFrameRendered,
+            .IJKMPMoviePlayerDidSeekComplete
         ]
         for name in names {
             observers.append(NotificationCenter.default.addObserver(
@@ -204,7 +204,7 @@ final class PlaybackController: ObservableObject {
 
     private func handle(_ note: Notification, core candidate: IJKFFMoviePlayerController) {
         switch note.name {
-        case IJKMPMediaPlaybackIsPreparedToPlayDidChangeNotification:
+        case .IJKMPMediaPlaybackIsPreparedToPlayDidChange:
             guard candidate.isPreparedToPlay, error == nil else { return }
             isReady = true
             stage = "prepared"
@@ -215,15 +215,15 @@ final class PlaybackController: ObservableObject {
             }
             candidate.playbackRate = rate
             if wantsToPlay { candidate.play() }
-        case IJKMPMoviePlayerOpenInputNotification:
+        case .IJKMPMoviePlayerOpenInput:
             stage = "open-input"
-        case IJKMPMoviePlayerFindStreamInfoNotification:
+        case .IJKMPMoviePlayerFindStreamInfo:
             stage = "find-stream-info"
-        case IJKMPMoviePlayerComponentOpenNotification:
+        case .IJKMPMoviePlayerComponentOpen:
             stage = "open-codec"
-        case IJKMPMoviePlayerFirstVideoFrameRenderedNotification:
+        case .IJKMPMoviePlayerFirstVideoFrameRendered:
             stage = "render"
-        case IJKMPMoviePlayerDidSeekCompleteNotification:
+        case .IJKMPMoviePlayerDidSeekComplete:
             guard isSeeking, let target = seekTarget else { return }
             if let reported = (note.userInfo?[IJKMPMoviePlayerDidSeekCompleteTargetKey] as? NSNumber)?.doubleValue,
                abs(reported / 1000 - target) > 1 { return }
@@ -235,7 +235,7 @@ final class PlaybackController: ObservableObject {
                 seekCompleted = true
                 stage = "playback"
             }
-        case IJKMPMoviePlayerPlaybackDidFinishNotification:
+        case .IJKMPMoviePlayerPlaybackDidFinish:
             // Suppress only natural completion; decoder/network failures remain visible.
             let finishReason = (note.userInfo?[IJKMPMoviePlayerPlaybackDidFinishReasonUserInfoKey] as? NSNumber)?.intValue
             if isSeeking && finishReason == IJKMPMovieFinishReason.playbackEnded.rawValue { return }
