@@ -35,13 +35,19 @@ jobs:
         run: |
           bash tools/verify-ijk.sh
       - run: xcodegen generate
+      - name: Save verified IJK cache independently of application compilation
+        if: steps.ijk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: Vendor
+          key: ${{ steps.ijk-cache.outputs.cache-primary-key }}
       - name: Build iPhone application
         shell: bash
         run: |
           mkdir -p build/ijk-logs
           set -o pipefail
           if ! xcodebuild -quiet -project NiuNiu.xcodeproj -scheme NiuNiu \
-            -configuration Release -sdk iphoneos -arch arm64 \
+            -configuration Release -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build CODE_SIGNING_ALLOWED=NO \
             ENABLE_BITCODE=NO build > build/ijk-logs/app-build.log 2>&1; then

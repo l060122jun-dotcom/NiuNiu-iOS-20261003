@@ -457,6 +457,7 @@ final class DLNAStore: ObservableObject {
     @Published private(set) var duration: Double = 0
     @Published private(set) var mediaTitle = ""
     @Published private(set) var activeMediaURL: URL?
+    @Published private(set) var mediaAccessRevoked = false
     private let client = DLNAClient()
     private var discovery: DLNADiscovery?
     private var searchID = UUID()
@@ -548,6 +549,12 @@ final class DLNAStore: ObservableObject {
             }
             let device = try requireDevice()
             // Revocation is immediate on replacement, even if the new SOAP operation fails.
+            if mediaProxy != nil || isCasting {
+                mediaAccessRevoked = true
+                activeMediaURL = nil
+                // Keep isCasting so status polling can query the actual remote state.
+                transportState = "UNKNOWN"
+            }
             mediaProxy?.stop()
             mediaProxy = nil
             castID = UUID()
@@ -568,6 +575,7 @@ final class DLNAStore: ObservableObject {
             accepted = true
             // URI acceptance is not playback success. If Play fails, retain controls for the loaded URI.
             isCasting = true
+            mediaAccessRevoked = false
             transportState = "URI_SET"
             activeMediaURL = url
             mediaTitle = title
@@ -581,8 +589,17 @@ final class DLNAStore: ObservableObject {
                 mediaProxy?.stop()
                 mediaProxy = nil
                 castID = UUID()
+                if isCasting {
+                    mediaAccessRevoked = true
+                    activeMediaURL = nil
+                    transportState = "UNKNOWN"
+                }
                 self.error = "投屏操作已取消，媒体代理已关闭；设备是否已接收命令需重新查询。"
-            } else { self.error = error.localizedDescription }
+            } else {
+                self.error = mediaAccessRevoked
+                    ? "媒体访问已撤销，远端状态需重新查询。\(error.localizedDescription)"
+                    : error.localizedDescription
+            }
             throw error
         }
     }
@@ -598,6 +615,7 @@ final class DLNAStore: ObservableObject {
         castID = UUID()
         try await control("Stop", state: "STOPPED")
         isCasting = false
+        mediaAccessRevoked = false
         activeMediaURL = nil
         position = 0
         duration = 0
@@ -822,6 +840,11 @@ struct DLNADeviceView: View {
     }
 
     private var stateLabel: String {
+        if store.mediaAccessRevoked {
+            return store.transportState == "UNKNOWN"
+                ? "媒体访问已撤销；远端状态未知，等待查询"
+                : "媒体访问已撤销；远端查询状态：\(store.transportState)"
+        }
         switch store.transportState {
         case "PLAYING": return "设备已接受播放命令"
         case "PAUSED_PLAYBACK": return "已暂停"

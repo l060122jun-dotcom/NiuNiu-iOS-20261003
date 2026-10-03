@@ -239,7 +239,7 @@ final class DLNAMediaProxy {
         }
     }
 
-    private func serve(url: URL, method: String, range: String?, connection: NWConnection) async {
+    private func serve(url: URL, method: String, range: String?, connection: NWConnection, forceHLS: Bool = false) async {
         let delegate = DLNAMediaStreamDelegate()
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
@@ -260,17 +260,30 @@ final class DLNAMediaProxy {
                 for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
             }
             request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-            let likelyHLS = url.pathExtension.lowercased() == "m3u8"
+            let likelyHLS = forceHLS || url.pathExtension.lowercased() == "m3u8"
             if !likelyHLS, let range = range { request.setValue(range, forHTTPHeaderField: "Range") }
             let (chunks, response) = try await delegate.open(session: session, request: request)
             try Task.checkCancellation()
             guard let response = response as? HTTPURLResponse else { throw DLNAError.message("媒体上游没有返回 HTTP 响应。") }
             if (300...399).contains(response.statusCode) { throw DLNAError.message("媒体重定向到未经授权的主机或协议，已拒绝。") }
             let mime = response.mimeType?.lowercased() ?? "application/octet-stream"
+            // An extensionless playlist may only be identifiable after the Range response.
+            // Cancel that partial transfer before retrying once with a fresh delegate/session.
+            if method == "GET", !likelyHLS, range != nil,
+               response.statusCode == 206, mime.contains("mpegurl") {
+                delegate.cancelTransfer()
+                session.invalidateAndCancel()
+                try Task.checkCancellation()
+                await serve(url: url, method: method, range: nil, connection: connection, forceHLS: true)
+                return
+            }
             if let encoding = response.value(forHTTPHeaderField: "Content-Encoding"), encoding.lowercased() != "identity" {
                 throw DLNAError.message("媒体上游忽略 identity 编码要求，不能安全转发其 Range 与长度。")
             }
             let hls = likelyHLS || mime.contains("mpegurl")
+            if forceHLS, response.statusCode != 200 {
+                throw DLNAError.message("HLS 清单重取必须返回完整 HTTP 200 响应。")
+            }
             if !(200...299).contains(response.statusCode) {
                 onError("媒体上游返回 HTTP \(response.statusCode)。")
             }
@@ -393,8 +406,9 @@ private class DLNAMediaRedirectDelegate: NSObject, URLSessionTaskDelegate {
 }
 
 /// Bounded backpressure instead of accumulating a complete movie or an unbounded
-/// AsyncBytes buffer. Each URLSession callback is <=256 KiB; at most two callbacks
-/// are queued (512 KiB). Overflow fails explicitly rather than silently dropping data.
+/// AsyncBytes buffer. This proxy rejects callbacks larger than 256 KiB (an explicit
+/// policy, not a Foundation guarantee) and queues at most two callbacks (512 KiB).
+/// Overflow fails explicitly rather than silently dropping data.
 private final class DLNAMediaStreamDelegate: DLNAMediaRedirectDelegate, URLSessionDataDelegate {
     private let lock = NSLock()
     private var responseWaiter: CheckedContinuation<(AsyncThrowingStream<Data, Error>, URLResponse), Error>?
