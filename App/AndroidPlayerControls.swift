@@ -197,7 +197,6 @@ import MediaPlayer
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .buttonStyle(PlayerMenuActionStyle(close: closeMenu))
-                        .menuStyle(PlayerExpandableMenuStyle())
                         .padding(.vertical, 4)
                     }
                 }
@@ -245,17 +244,6 @@ private struct PlayerMenuActionStyle: PrimitiveButtonStyle {
 
 // Also renders nested Menu values from unchanged adapters (offline playback)
 // inline rather than presenting a second UIKit menu with an opaque lifetime.
-private struct PlayerExpandableMenuStyle: MenuStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        DisclosureGroup {
-            configuration.content
-        } label: {
-            configuration.label
-        }
-        .buttonStyle(.plain)
-        .padding(.horizontal, 12).padding(.vertical, 10)
-    }
-}
 
 // This surface sits BELOW interactive danmaku and control buttons, not above them.
 // UIKit recognizers arbitrate tap/hold/pan so a slider never also starts a seek gesture.

@@ -1152,7 +1152,7 @@ private struct OfflinePlaybackSelection: Identifiable {
                         ) {
                             Button("后退15秒") { seek(playback.position - 15) }
                             Button("前进15秒") { seek(playback.position + 15) }
-                            Menu("播放倍速") {
+                            DisclosureGroup("播放倍速") {
                                 ForEach(rates, id: \.self) { rate in
                                     Button(String(format: "%g×", rate)) { playback.setRate(rate) }
                                 }
