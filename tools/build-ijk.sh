@@ -78,6 +78,79 @@ module.unlink()
 module.write_text((ijk/'config/module-lite.sh').read_text().replace('--disable-protocol=crypto', '--enable-protocol=crypto') + '\nexport COMMON_FF_CFG_FLAGS="$COMMON_FF_CFG_FLAGS --enable-securetransport --disable-openssl --enable-protocol=https --enable-protocol=tls --disable-gpl --disable-nonfree --disable-version3"\n')
 # SecureTransport must verify certificates by default, including HLS key requests.
 replace(ff/'libavformat/tls.h', 'offsetof(pstruct, options_field . verify),    AV_OPT_TYPE_INT, { .i64 = 0 }', 'offsetof(pstruct, options_field . verify),    AV_OPT_TYPE_INT, { .i64 = 1 }', 1)
+# IJK's pointer dictionary helpers use uintptr_t, not void*. Preserve their
+# hexadecimal pointer string format while fixing Clang's type diagnostics.
+# Match the complete pinned upstream block; never rewrite unrelated NULLs.
+replace(ff/'libavutil/dict.c', '''int av_dict_set_intptr(AVDictionary **pm, const char *key, uintptr_t value,
+                int flags)
+{
+    char valuestr[22];
+    snprintf(valuestr, sizeof(valuestr), "%p", value);
+    flags &= ~AV_DICT_DONT_STRDUP_VAL;
+    return av_dict_set(pm, key, valuestr, flags);
+}
+
+uintptr_t av_dict_get_intptr(const AVDictionary *m, const char* key) {
+    uintptr_t ptr = NULL;
+    AVDictionaryEntry *t = NULL;
+    if ((t = av_dict_get(m, key, NULL, 0))) {
+      return av_dict_strtoptr(t->value);
+    }
+    return NULL;
+}
+
+uintptr_t av_dict_strtoptr(char * value) {
+   uintptr_t ptr = NULL;
+   char *next = NULL;
+   if(!value || value[0] !='0' || (value[1]|0x20)!='x') {
+       return NULL;
+   }
+   ptr = strtoull(value, &next, 16);
+   if (next == value) {
+       return NULL;
+   }
+   return ptr;
+}
+
+char * av_dict_ptrtostr(uintptr_t value) {
+    char valuestr[22] = {0};
+    snprintf(valuestr, sizeof(valuestr), "%p", value);
+    return av_strdup(valuestr);
+}''', '''int av_dict_set_intptr(AVDictionary **pm, const char *key, uintptr_t value,
+                int flags)
+{
+    char valuestr[22];
+    snprintf(valuestr, sizeof(valuestr), "%p", (void *)value);
+    flags &= ~AV_DICT_DONT_STRDUP_VAL;
+    return av_dict_set(pm, key, valuestr, flags);
+}
+
+uintptr_t av_dict_get_intptr(const AVDictionary *m, const char* key) {
+    AVDictionaryEntry *t = NULL;
+    if ((t = av_dict_get(m, key, NULL, 0))) {
+      return av_dict_strtoptr(t->value);
+    }
+    return (uintptr_t)0;
+}
+
+uintptr_t av_dict_strtoptr(char * value) {
+   uintptr_t ptr = (uintptr_t)0;
+   char *next = NULL;
+   if(!value || value[0] !='0' || (value[1]|0x20)!='x') {
+       return (uintptr_t)0;
+   }
+   ptr = (uintptr_t)strtoull(value, &next, 16);
+   if (next == value) {
+       return (uintptr_t)0;
+   }
+   return ptr;
+}
+
+char * av_dict_ptrtostr(uintptr_t value) {
+    char valuestr[22] = {0};
+    snprintf(valuestr, sizeof(valuestr), "%p", (void *)value);
+    return av_strdup(valuestr);
+}''', 1)
 controller = ijk/'ios/IJKMediaPlayer/IJKMediaPlayer/IJKFFMoviePlayerController.m'
 replace(controller, 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ijk0.8.8--20201130--001";', 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ijk0.8.8--20210426--001";', 1)
 PY
@@ -121,7 +194,7 @@ git -C "$IJK" archive --format=tar.gz -o "$WORK/compliance/ijkplayer-original.ta
 git -C "$FF" archive --format=tar.gz -o "$WORK/compliance/ffmpeg-original.tar.gz" "$FF_SHA"
 git -C "$IJK/extra/gas-preprocessor" archive --format=tar.gz -o "$WORK/compliance/gas-preprocessor-original.tar.gz" "$GAS_SHA"
 git -C "$IJK" diff --binary >"$WORK/compliance/ijk-modern-apple.patch"
-git -C "$FF" diff --binary >"$WORK/compliance/ffmpeg-tls-verify.patch"
+git -C "$FF" diff --binary >"$WORK/compliance/ffmpeg-source.patch"
 cp "$IJK/config/module.sh" "$WORK/compliance/module.sh"
 cp "$ROOT/tools/build-ijk.sh" "$WORK/compliance/"
 cp "$ROOT/LICENSES/IJK.md" "$WORK/compliance/NOTICE.md"

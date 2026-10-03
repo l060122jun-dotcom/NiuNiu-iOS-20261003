@@ -19,6 +19,7 @@
 - 基于官方 `module-lite.sh`，启用 HLS、crypto、https、tls、Apple SecureTransport；不构建 OpenSSL。
 - 禁用 GPL、nonfree、version3；构建后核对 `config.h`，不满足时失败。
 - 将 FFmpeg `tls_verify` 默认值改为 1，不关闭证书或域名验证。上层也不应设置 `tls_verify=0`。
+- 精确匹配固定 FFmpeg 源码 `libavutil/dict.c` 的四个 pointer 辅助函数：`av_dict_set_intptr` / `av_dict_ptrtostr` 的 `%p` 参数显式转为 `void *`；`av_dict_get_intptr` / `av_dict_strtoptr` 的整数空值改为 `(uintptr_t)0`，删除未使用变量，`strtoull` 结果显式转为 `uintptr_t`。保留原有十六进制字符串协议，不修改正常 `av_dict_set_int` 或其他函数的指针 NULL，不添加 `-Wno-int-conversion` 等全局错误屏蔽。此修改与 TLS 修改一并保存于对应源码包的 `ffmpeg-source.patch`。
 - 更新官方控制器的 FFmpeg 版本匹配常量到 `init-ios.sh` 所指定版本。
 - 仅针对旧 C 源码的 Apple clang 新诊断取消两类错误提升，没有全局禁用警告或错误。
 - 将官方 target 的 `MACH_O_TYPE` 从 staticlib 覆盖为 `mh_dylib`；启用模块，验证 Swift import；FFmpeg 静态库在该动态 IJK framework 内链接。App 嵌入该动态 framework，而不是把 LGPL 库静态并入 App 可执行文件。
