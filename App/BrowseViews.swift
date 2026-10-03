@@ -34,9 +34,21 @@ private struct BrowsePressStyle: ButtonStyle {
 
 private struct BrowseScroll<Content: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Binding private var position: SearchScrollPosition?
+    @Binding private var restoreOnReturn: Bool
+    @State private var tracking = false
+    @State private var lastResetKey: String?
+    private let resetKey: String
     private let content: Content
-    init(@ViewBuilder content: () -> Content) { self.content = content() }
+    init(position: Binding<SearchScrollPosition?> = .constant(nil),
+         restoreOnReturn: Binding<Bool> = .constant(false), resetKey: String = "", @ViewBuilder content: () -> Content) {
+        _position = position
+        _restoreOnReturn = restoreOnReturn
+        self.resetKey = resetKey
+        self.content = content()
+    }
     var body: some View {
+        GeometryReader { viewport in
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(spacing: 0) {
@@ -53,6 +65,62 @@ private struct BrowseScroll<Content: View>: View {
                     }.buttonStyle(BrowsePressStyle()).padding(.vertical, 20)
                 }
             }
+            .coordinateSpace(name: "browse.results")
+            .onPreferenceChange(BrowseVideoFramesKey.self) { frames in
+                guard tracking else { return }
+                let visible = frames.filter { $0.value.maxY > 0 && $0.value.minY < viewport.size.height }
+                guard let first = visible.sorted(by: {
+                    $0.value.minY == $1.value.minY ? $0.key < $1.key : $0.value.minY < $1.value.minY
+                }).first else { return }
+                position = SearchScrollPosition(videoID: first.key, minY: first.value.minY, height: first.value.height)
+            }
+            .task(id: resetKey) {
+                tracking = false
+                if let previous = lastResetKey, previous != resetKey {
+                    position = nil
+                    restoreOnReturn = false
+                }
+                lastResetKey = resetKey
+                if restoreOnReturn, let saved = position {
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    let available = viewport.size.height - saved.height
+                    proxy.scrollTo(saved.videoID, anchor: UnitPoint(x: 0, y: available > 0 ? saved.minY / available : 0))
+                } else if position == nil {
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    proxy.scrollTo("browse.top", anchor: .top)
+                }
+                restoreOnReturn = false
+                tracking = true
+            }
+            .onChange(of: position?.videoID) { id in
+                if id == nil { proxy.scrollTo("browse.top", anchor: .top) }
+            }
+            .onDisappear {
+                tracking = false
+                restoreOnReturn = position != nil
+            }
+        }
+        }
+    }
+}
+
+private struct BrowseVideoFramesKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private struct BrowseAnchor: ViewModifier {
+    let id: String
+    func body(content: Content) -> some View {
+        content.id(id).background {
+            GeometryReader { geometry in
+                Color.clear.preference(key: BrowseVideoFramesKey.self,
+                                       value: [id: geometry.frame(in: .named("browse.results"))])
+            }
         }
     }
 }
@@ -63,8 +131,12 @@ final class BrowseCatalog: ObservableObject {
     @Published private(set) var categories: [VideoCategory] = []
     @Published private(set) var loading = false
     @Published private(set) var error: String?
+    @Published private(set) var visibilityContext = ""
+    private var visibilityRevision: UInt64 = 0
     private var allCategories: [VideoCategory] = []
     func refreshVisibility() {
+        visibilityRevision &+= 1
+        visibilityContext = "\(visibilityRevision)|\(APIClient.shared.isTeenModeEnabled)"
         var seen = Set<String>()
         categories = allCategories.filter {
             !$0.id.isEmpty && seen.insert($0.id).inserted
@@ -121,7 +193,9 @@ private final class VideoPageStore: ObservableObject {
     @Published private(set) var hasMore = true
     private var page = 0
     private var generation = UUID()
+    private var rankCompleted = false
     var needsFirstPage: Bool { page == 0 && error == nil && hasMore }
+    var needsRank: Bool { !rankCompleted && error == nil }
 
     func loadRank(category: String, order: String) async {
         generation = UUID()
@@ -129,6 +203,7 @@ private final class VideoPageStore: ObservableObject {
         videos = []
         hasMore = false
         error = nil
+        rankCompleted = false
         guard !category.isEmpty && !order.isEmpty else { loading = false; return }
         loading = true
         defer { if generation == request { loading = false } }
@@ -138,9 +213,11 @@ private final class VideoPageStore: ObservableObject {
             guard request == generation else { return }
             var seen = Set<String>()
             videos = response.filter { !$0.id.isEmpty && seen.insert($0.id).inserted }
+            rankCompleted = true
         } catch is CancellationError {
         } catch {
             guard request == generation else { return }
+            guard !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
     }
@@ -488,9 +565,12 @@ private struct VideoTile: View {
 private struct VideoGrid: View {
     let videos: [Video]
     let columns: Int
+    var anchorPrefix = "video."
     var body: some View {
         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: columns), spacing: 18) {
-            ForEach(videos) { video in VideoTile(video: video) }
+            ForEach(videos) { video in
+                VideoTile(video: video).modifier(BrowseAnchor(id: anchorPrefix + video.id))
+            }
         }.padding(.horizontal)
     }
 }
@@ -712,15 +792,23 @@ struct HomeView: View {
 @MainActor
 private struct RecommendationsView: View {
     @EnvironmentObject private var catalog: BrowseCatalog
+    @ObservedObject private var account = AccountStore.shared
     @State private var blocks: [Recommendation] = []
     @State private var loading = false
     @State private var error: String?
     @State private var visibleGroups = 4
+    @State private var lastRequestKey: String?
+    @State private var completed = false
+    @State private var scrollPosition: SearchScrollPosition?
+    @State private var restoreOnReturn = false
+    private var requestKey: String {
+        "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|" + catalog.categories.map(\.id).joined(separator: "|")
+    }
 
     var body: some View {
-        BrowseScroll {
+        BrowseScroll(position: $scrollPosition, restoreOnReturn: $restoreOnReturn, resetKey: requestKey) {
             LazyVStack(alignment: .leading, spacing: 22) {
-                if let video = blocks.first?.videos.first {
+                if lastRequestKey == requestKey, let video = blocks.first?.videos.first {
                     NavigationLink { DetailView(videoID: video.id) } label: {
                         HStack(spacing: 18) {
                             VStack(alignment: .leading, spacing: 12) {
@@ -737,8 +825,9 @@ private struct RecommendationsView: View {
                         }.padding(20)
                             .background(Color(red: 0.08, green: 0.12, blue: 0.09), in: RoundedRectangle(cornerRadius: 24))
                     }.buttonStyle(BrowsePressStyle()).padding(.horizontal)
+                        .modifier(BrowseAnchor(id: "recommend.hero." + video.id))
                 }
-                ForEach(Array(blocks.prefix(visibleGroups))) { block in
+                ForEach(Array((lastRequestKey == requestKey ? blocks : []).prefix(visibleGroups))) { block in
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             RoundedRectangle(cornerRadius: 2).fill(BrowseTheme.green).frame(width: 4, height: 20)
@@ -751,7 +840,7 @@ private struct RecommendationsView: View {
                                 }.buttonStyle(BrowsePressStyle())
                             }
                         }.padding(.horizontal)
-                        VideoGrid(videos: Array(block.videos.prefix(6)), columns: 3)
+                        VideoGrid(videos: Array(block.videos.prefix(6)), columns: 3, anchorPrefix: "recommend.\(block.id).")
                     }
                 }
                 if visibleGroups < blocks.count {
@@ -770,23 +859,41 @@ private struct RecommendationsView: View {
                 }
             }.padding(.vertical)
         }
-        .task(id: catalog.categories.map(\.id).joined(separator: "|")) {
-            blocks.removeAll { !catalog.accepts($0) }
-            while loading { try? await Task.sleep(nanoseconds: 50_000_000); if Task.isCancelled { return } }
+        .task(id: requestKey) {
+            if lastRequestKey != requestKey {
+                lastRequestKey = requestKey
+                blocks = []
+                visibleGroups = 4
+                completed = false
+                scrollPosition = nil
+                restoreOnReturn = false
+                error = nil
+            }
+            while loading {
+                do { try await Task.sleep(nanoseconds: 20_000_000) } catch { return }
+            }
+            guard !Task.isCancelled, !completed, error == nil else { return }
             await load()
         }
-        .refreshable { await load() }
+        .refreshable {
+            scrollPosition = nil
+            restoreOnReturn = false
+            visibleGroups = 4
+            await load()
+        }
         .background(BrowseTheme.background)
     }
 
     @MainActor private func load() async {
         guard !loading else { return }
         loading = true
+        let identity = requestKey
         error = nil
         defer { loading = false }
         do {
             let response = try await APIClient.shared.recommendations()
             try Task.checkCancellation()
+            guard identity == requestKey else { return }
             var seen = Set<String>()
             blocks = response.filter { catalog.accepts($0) && !$0.videos.isEmpty && seen.insert($0.id).inserted }
                 .map { block in
@@ -794,21 +901,30 @@ private struct RecommendationsView: View {
                     return Recommendation(id: block.id, title: block.title,
                                           videos: block.videos.filter { !$0.id.isEmpty && videos.insert($0.id).inserted })
                 }
+            completed = true
         } catch is CancellationError {
-        } catch { self.error = error.localizedDescription }
+        } catch {
+            guard !Task.isCancelled, identity == requestKey else { return }
+            self.error = error.localizedDescription
+        }
     }
 }
 
 @MainActor
 struct CategoryVideosView: View {
     let category: VideoCategory
+    @EnvironmentObject private var catalog: BrowseCatalog
+    @ObservedObject private var account = AccountStore.shared
     @StateObject private var store = VideoPageStore()
     @State private var filters: [String: String] = ["by": "time"]
     @AppStorage("niuniu.gridColumns") private var columnCount = 3
     @State private var showFilters = false
+    @State private var lastRequestKey: String?
+    @State private var scrollPosition: SearchScrollPosition?
+    @State private var restoreOnReturn = false
 
     private var requestKey: String {
-        category.id + filters.keys.sorted().map { "|\($0)=\(filters[$0] ?? "")" }.joined()
+        "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|" + category.id + filters.keys.sorted().map { "|\($0)=\(filters[$0] ?? "")" }.joined()
     }
 
     private func binding(_ key: String) -> Binding<String> {
@@ -824,7 +940,7 @@ struct CategoryVideosView: View {
     }
 
     var body: some View {
-        BrowseScroll {
+        BrowseScroll(position: $scrollPosition, restoreOnReturn: $restoreOnReturn, resetKey: requestKey) {
             VStack(spacing: 12) {
                 ChoiceStrip(title: "排序", choices: [Choice(id: "time", title: "最新"), Choice(id: "hits", title: "最热"), Choice(id: "score", title: "评分")], selection: binding("by"))
                     .padding(.horizontal, 8)
@@ -843,11 +959,22 @@ struct CategoryVideosView: View {
                     Text(filterSummary).font(.caption).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
                 }
-                VideoGrid(videos: store.videos, columns: columnCount == 2 ? 2 : 3)
+                VideoGrid(videos: lastRequestKey == requestKey ? store.videos : [], columns: columnCount == 2 ? 2 : 3)
                 PagingFooter(store: store) { Task { await load(reset: false) } }
             }.padding(.vertical, 10)
         }
-        .task(id: requestKey) { await load(reset: true) }
+        .task(id: requestKey) {
+            if lastRequestKey != requestKey {
+                lastRequestKey = requestKey
+                await load(reset: true)
+            } else if store.needsFirstPage {
+                while store.loading {
+                    do { try await Task.sleep(nanoseconds: 20_000_000) } catch { return }
+                }
+                guard !Task.isCancelled, store.needsFirstPage else { return }
+                await load(reset: false)
+            }
+        }
         .refreshable { await load(reset: true) }
         .background(BrowseTheme.background)
         .sheet(isPresented: $showFilters) {
@@ -874,6 +1001,8 @@ struct CategoryVideosView: View {
     }
 
     private func load(reset: Bool) async {
+        guard reset || lastRequestKey == requestKey else { return }
+        if reset { scrollPosition = nil; restoreOnReturn = false }
         await store.load(reset: reset, category: category.id, filters: filters.filter { !$0.value.isEmpty })
     }
 }
@@ -881,9 +1010,16 @@ struct CategoryVideosView: View {
 @MainActor
 struct RankingView: View {
     @EnvironmentObject private var catalog: BrowseCatalog
+    @ObservedObject private var account = AccountStore.shared
     @StateObject private var store = VideoPageStore()
     @State private var categoryID = ""
     @State private var order = ""
+    @State private var lastRequestKey: String?
+    @State private var scrollPosition: SearchScrollPosition?
+    @State private var restoreOnReturn = false
+    private var requestKey: String {
+        "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|\(selectedID)|\(selectedOrder)"
+    }
     private var selectedID: String { catalog.categories.first(where: { $0.id == categoryID })?.id ?? catalog.categories.first?.id ?? "" }
     private var rankChoices: [Choice] {
         let category = catalog.categories.first { $0.id == selectedID }
@@ -911,7 +1047,7 @@ struct RankingView: View {
             ChoiceStrip(title: "榜单", choices: rankChoices,
                         selection: Binding(get: { selectedOrder }, set: { order = $0 }))
                 .padding(.horizontal).padding(.bottom, 8)
-             BrowseScroll {
+             BrowseScroll(position: $scrollPosition, restoreOnReturn: $restoreOnReturn, resetKey: requestKey) {
                  LazyVStack(spacing: 14) {
                      HStack(alignment: .bottom) {
                          VStack(alignment: .leading, spacing: 6) {
@@ -933,7 +1069,7 @@ struct RankingView: View {
                     } else if selectedOrder.isEmpty {
                         BrowseMessage(title: "当前分类暂无榜单", detail: "榜单类型以服务端提供的配置为准")
                     } else {
-                        ForEach(Array(store.videos.enumerated()), id: \.element.id) { index, video in
+                        ForEach(Array((lastRequestKey == requestKey ? store.videos : []).enumerated()), id: \.element.id) { index, video in
                             NavigationLink { DetailView(videoID: video.id) } label: {
                                 HStack(alignment: .top, spacing: 14) {
                                     PosterView(url: video.poster).frame(width: 92)
@@ -951,7 +1087,7 @@ struct RankingView: View {
                                     Spacer(minLength: 0)
                                 }
                                 .padding(14).background(BrowseTheme.surface, in: RoundedRectangle(cornerRadius: 20))
-                            }.buttonStyle(BrowsePressStyle())
+                            }.buttonStyle(BrowsePressStyle()).modifier(BrowseAnchor(id: "rank." + video.id))
                         }
                         if store.loading { ProgressView("正在加载榜单…").padding() }
                         else if let error = store.error {
@@ -967,16 +1103,32 @@ struct RankingView: View {
         .navigationTitle("榜单").navigationBarTitleDisplayMode(.large)
         .toolbarBackground(BrowseTheme.background, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
-        .task(id: selectedID + "|" + selectedOrder) { await load() }
+        .task(id: requestKey) {
+            if lastRequestKey != requestKey {
+                lastRequestKey = requestKey
+                await load()
+            } else if store.needsRank {
+                while store.loading {
+                    do { try await Task.sleep(nanoseconds: 20_000_000) } catch { return }
+                }
+                guard !Task.isCancelled, store.needsRank else { return }
+                await load()
+            }
+        }
     }
 
-    private func load() async { await store.loadRank(category: selectedID, order: selectedOrder) }
+    private func load() async {
+        scrollPosition = nil
+        restoreOnReturn = false
+        await store.loadRank(category: selectedID, order: selectedOrder)
+    }
 }
 
 @MainActor
 struct SearchView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var catalog: BrowseCatalog
+    @ObservedObject private var account = AccountStore.shared
     @StateObject private var store = VideoPageStore()
     @State private var text = ""
     @State private var submitted = ""
@@ -995,7 +1147,9 @@ struct SearchView: View {
     @FocusState private var focused: Bool
     private var selectedID: String { catalog.categories.contains(where: { $0.id == categoryID }) ? categoryID : "" }
     private var trimmedText: String { text.trimmingCharacters(in: .whitespacesAndNewlines) }
-    private var searchRequestKey: String { "\(submission)|\(selectedID)|\(submitted)" }
+    private var searchRequestKey: String {
+        "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|\(submission)|\(selectedID)|\(submitted)"
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1096,6 +1250,7 @@ struct SearchView: View {
                                     load: { Task { await load(reset: false) } },
                                     refresh: { await load(reset: true) })
                     .id(searchRequestKey)
+                    .opacity(requestKey == searchRequestKey ? 1 : 0)
             }
         }
         .background(BrowseTheme.background)
