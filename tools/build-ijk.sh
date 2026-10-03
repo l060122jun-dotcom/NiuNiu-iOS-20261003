@@ -159,6 +159,7 @@ prefix = 'ios/IJKMediaPlayer/IJKMediaPlayer/'
 metadata = '''    double pts;
     double duration;
     int serial;
+    size_t plane_bytes[8];
 '''
 replace(ijk/'ijkmedia/ijksdl/ijksdl_vout.h', '    int sar_num;\n    int sar_den;\n', '    int sar_num;\n    int sar_den;\n\n' + metadata, 1)
 replace(ijk/(prefix+'IJKSDLGLViewProtocol.h'), '    int sar_num;\n    int sar_den;\n', '    int sar_num;\n    int sar_den;\n' + metadata, 1)
@@ -172,6 +173,26 @@ replace(ijk/(prefix+'ijkmedia/ijksdl/ios/ijksdl_vout_ios_gles2.m'), '        ijk
         ijk_overlay.pts = overlay->pts;
         ijk_overlay.duration = overlay->duration;
         ijk_overlay.serial = overlay->serial;
+        for (int i = 0; i < 8; ++i)
+            ijk_overlay.plane_bytes[i] = overlay->plane_bytes[i];
+''', 1)
+# Report actual retained storage bounds for linked decoder and managed frames.
+replace(ijk/'ijkmedia/ijksdl/ffmpeg/ijksdl_vout_overlay_ffmpeg.c', '        overlay->pitches[i] = frame->linesize[i];\n', '''        overlay->pitches[i] = frame->linesize[i];
+        overlay->plane_bytes[i] = 0;
+        uintptr_t start = (uintptr_t)frame->data[i];
+        if (frame->linesize[i] > 0 && frame->linesize[i] <= UINT16_MAX && start) {
+            for (int b = 0; b < AV_NUM_DATA_POINTERS; ++b) {
+                AVBufferRef *buffer = frame->buf[b];
+                if (buffer && start >= (uintptr_t)buffer->data &&
+                    start - (uintptr_t)buffer->data < (size_t)buffer->size)
+                    overlay->plane_bytes[i] = buffer->size - (start - (uintptr_t)buffer->data);
+            }
+            SDL_VoutOverlay_Opaque *opaque = overlay->opaque;
+            AVBufferRef *buffer = opaque->frame_buffer;
+            if (frame == opaque->managed_frame && buffer && start >= (uintptr_t)buffer->data &&
+                start - (uintptr_t)buffer->data < (size_t)buffer->size)
+                overlay->plane_bytes[i] = buffer->size - (start - (uintptr_t)buffer->data);
+        }
 ''', 1)
 replace(controller, 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ijk0.8.8--20201130--001";', 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ijk0.8.8--20210426--001";', 1)
 # Return the actual AVAudioSession result on every BOOL path; keep the

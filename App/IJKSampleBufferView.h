@@ -11,7 +11,9 @@ NS_ASSUME_NONNULL_BEGIN
 + (IJKFFMoviePlayerController * _Nullable)makePlayerWithURL:(NSURL *)url
     options:(IJKFFOptions *)options renderer:(IJKSampleBufferView *)renderer NS_SWIFT_NAME(makePlayer(url:options:renderer:));
 - (void)updateClock:(double)seconds rate:(double)rate NS_SWIFT_NAME(updateClock(_:rate:));
-- (void)invalidateForSeek;
+- (void)beginSeekTo:(double)target NS_SWIFT_NAME(beginSeek(to:));
+- (void)confirmSeek NS_SWIFT_NAME(confirmSeek());
+- (void)cancelSeek NS_SWIFT_NAME(cancelSeek());
 - (void)close;
 @end
 NS_ASSUME_NONNULL_END

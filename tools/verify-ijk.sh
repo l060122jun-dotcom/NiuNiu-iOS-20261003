@@ -143,10 +143,11 @@ if 'offsetof(pstruct, options_field . verify),    AV_OPT_TYPE_INT, { .i64 = 1 }'
     raise SystemExit('Restored sources do not enable TLS verification by default')
 prefix = 'ios/IJKMediaPlayer/IJKMediaPlayer/'
 for rel, tokens in {
-    'ijkmedia/ijksdl/ijksdl_vout.h': ['double pts;', 'double duration;', 'int serial;'],
-    prefix+'IJKSDLGLViewProtocol.h': ['double pts;', 'double duration;', 'int serial;'],
+    'ijkmedia/ijksdl/ijksdl_vout.h': ['double pts;', 'double duration;', 'int serial;', 'size_t plane_bytes[8];'],
+    prefix+'IJKSDLGLViewProtocol.h': ['double pts;', 'double duration;', 'int serial;', 'size_t plane_bytes[8];'],
+    'ijkmedia/ijksdl/ffmpeg/ijksdl_vout_overlay_ffmpeg.c': ['overlay->plane_bytes[i] = 0;', 'frame->linesize[i] <= UINT16_MAX'],
     'ijkmedia/ijkplayer/ff_ffplay.c': ['vp->bmp->pts = pts;', 'vp->bmp->duration = duration;', 'vp->bmp->serial = serial;'],
-    prefix+'ijkmedia/ijksdl/ios/ijksdl_vout_ios_gles2.m': ['IJKOverlay ijk_overlay = {0};', 'ijk_overlay.pts = overlay->pts;', 'ijk_overlay.duration = overlay->duration;', 'ijk_overlay.serial = overlay->serial;'],
+    prefix+'ijkmedia/ijksdl/ios/ijksdl_vout_ios_gles2.m': ['IJKOverlay ijk_overlay = {0};', 'ijk_overlay.pts = overlay->pts;', 'ijk_overlay.duration = overlay->duration;', 'ijk_overlay.serial = overlay->serial;', 'ijk_overlay.plane_bytes[i] = overlay->plane_bytes[i];'],
 }.items():
     text = (ijk / rel).read_text()
     if any(text.count(token) != 1 for token in tokens):

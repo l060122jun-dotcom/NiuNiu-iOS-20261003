@@ -46,6 +46,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
     private var pendingSeek: Double?
     private var seekTarget: Double?
     private var seekCompleted = false
+    // One native seek in flight: IJK notifications contain target but no request
+    // ID. Coalesce UI seeks until its notification; same-target A/B is unambiguous.
+    private var nativeSeekTarget: Double?
     private var wantsToPlay = true
     private var didFinish = false
     private var fill = false
@@ -78,6 +81,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         pendingSeek = resume.isFinite && resume > 0 ? resume : nil
         seekTarget = nil
         seekCompleted = false
+        nativeSeekTarget = nil
         isSeeking = pendingSeek != nil
         lastProgressTime = -Double.infinity
 
@@ -170,8 +174,11 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         seekCompleted = false
         isSeeking = true
         stage = "seek"
-        renderer?.invalidateForSeek()
-        core.currentPlaybackTime = target
+        renderer?.beginSeek(to: target)
+        if nativeSeekTarget == nil {
+            nativeSeekTarget = target
+            core.currentPlaybackTime = target
+        }
         // Do not publish the requested target as actual progress; the timer reads IJK's clock.
     }
 
@@ -279,14 +286,25 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         case .IJKMPMoviePlayerFirstVideoFrameRendered:
             stage = "render"
         case .IJKMPMoviePlayerDidSeekComplete:
-            guard isSeeking, let target = seekTarget else { return }
+            guard isSeeking, let target = seekTarget, let submitted = nativeSeekTarget else { return }
             if let reported = (note.userInfo?[IJKMPMoviePlayerDidSeekCompleteTargetKey] as? NSNumber)?.doubleValue,
-               abs(reported / 1000 - target) > 1 { return }
+               abs(reported / 1000 - submitted) > 0.001 { return }
+            nativeSeekTarget = nil
+            if submitted != target {
+                nativeSeekTarget = target
+                candidate.currentPlaybackTime = target
+                return // Never confirm the latest renderer gate with A's result.
+            }
             let code = (note.userInfo?[IJKMPMoviePlayerDidSeekCompleteErrorKey] as? NSNumber)?.intValue ?? 0
             if code != 0 {
                 isSeeking = false; seekTarget = nil
-                error = Self.describe(stage: "seek", code: code, core: candidate)
+                seekCompleted = false
+                renderer?.cancelSeek()
+                completeSkip()
+                capabilityMessage = Self.describe(stage: "seek", code: code, core: candidate)
+                stage = "playback" // Recover existing playback, including same serial.
             } else {
+                renderer?.confirmSeek()
                 seekCompleted = true
                 stage = "playback"
             }
@@ -357,6 +375,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
     }
 
     private func releaseCore() {
+        nativeSeekTarget = nil
         completeSkip()
         pipPossibleObservation = nil
         pipStartTimeout?.cancel(); pipStartTimeout = nil

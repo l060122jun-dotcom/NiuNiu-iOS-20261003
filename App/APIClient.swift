@@ -221,9 +221,16 @@ final class APIClient {
         _ = try await categories()
         try checkContext(revision)
         if !acceptsCategory(category) { return [] }
-        let params = ["class": filters["class"] ?? "", "order": listOrder(filters["by"] ?? filters["order"] ?? "time"),
-                      "type_id": category, "area": filters["area"] ?? "", "year": filters["year"] ?? "",
-                      "state": filters["state"] ?? "", "wd": filters["wd"] ?? "", "page": String(max(1, page))]
+        let requestedOrder: String = filters["by"] ?? filters["order"] ?? "time"
+        var params: [String: String] = [:]
+        params["class"] = filters["class"] ?? ""
+        params["order"] = listOrder(requestedOrder)
+        params["type_id"] = category
+        params["area"] = filters["area"] ?? ""
+        params["year"] = filters["year"] ?? ""
+        params["state"] = filters["state"] ?? ""
+        params["wd"] = filters["wd"] ?? ""
+        params["page"] = String(max(1, page))
         guard let rows = try await payload("list", params) as? [[String: Any]] else { throw APIError.invalidResponse }
         try checkContext(revision)
         return safeVideos(rows, contextCategory: category)

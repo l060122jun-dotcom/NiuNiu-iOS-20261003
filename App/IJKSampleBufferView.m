@@ -9,6 +9,10 @@
     double _pts, _duration;
     int _serial, _lastSerial;
     BOOL _scheduled, _closed, _waitingSerial, _hasSerial;
+    BOOL _seekConfirmed;
+    double _seekTarget;
+    BOOL _hasAcceptedSerial;
+    int _acceptedSerial;
     uint64_t _generation;
     CMTimebaseRef _timebase;
     CVPixelBufferPoolRef _pool;
@@ -53,16 +57,21 @@
 - (void)display_pixels:(IJKOverlay *)overlay {
     if (!overlay) return;
     os_unfair_lock_lock(&_lock);
-    BOOL reject = _closed || (_waitingSerial && _hasSerial && overlay->serial == _lastSerial);
+    BOOL reject = _closed || (_waitingSerial && (!_seekConfirmed || !isfinite(overlay->pts) || fabs(overlay->pts - _seekTarget) > 1.0)) ||
+        (!_waitingSerial && _hasAcceptedSerial && overlay->serial < _acceptedSerial);
     uint64_t generation = _generation;
     os_unfair_lock_unlock(&_lock);
     if (reject) return;
-    if (!isfinite(overlay->pts) || overlay->w <= 0 || overlay->h <= 0) {
+    if (!isfinite(overlay->pts) || overlay->w <= 0 || overlay->h <= 0 || overlay->w > 8192 || overlay->h > 8192) {
         [self reportError:@"IJK sample-buffer output: invalid frame dimensions or PTS"];
         return;
     }
     CVPixelBufferRef buffer = NULL;
     if (overlay->pixel_buffer) {
+        if (CVPixelBufferGetWidth(overlay->pixel_buffer) != (size_t)overlay->w ||
+            CVPixelBufferGetHeight(overlay->pixel_buffer) != (size_t)overlay->h) {
+            [self reportError:@"IJK sample-buffer output: hardware buffer dimensions mismatch"]; return;
+        }
         buffer = CVPixelBufferRetain(overlay->pixel_buffer);
     } else {
         // Explicitly request I420 in Player.swift. Convert Y/U/V to real NV12,
@@ -74,6 +83,16 @@
             overlay->pitches[0] < w || overlay->pitches[1] < cw || overlay->pitches[2] < cw || w > 8192 || h > 8192) {
             [self reportError:@"IJK sample-buffer output: unsupported software overlay (requires valid I420)"];
             return;
+        }
+        // Capacity comes from retained AVBufferRef storage, not inferred from
+        // pitch alone. Last-row requirement avoids assuming trailing padding.
+        for (int plane = 0; plane < 3; ++plane) {
+            size_t rows = plane == 0 ? (size_t)h : (size_t)ch;
+            size_t bytes = plane == 0 ? (size_t)w : (size_t)cw;
+            size_t needed = (rows - 1) * (size_t)overlay->pitches[plane] + bytes;
+            if (overlay->plane_bytes[plane] < needed) {
+                [self reportError:@"IJK sample-buffer output: insufficient source plane capacity"]; return;
+            }
         }
         // Only ff_vout touches the software pool; queued buffers retain their
         // own storage across pool rebuilds. Allocation cap bounds producer load.
@@ -95,8 +114,18 @@
         if (CVPixelBufferLockBaseAddress(buffer, 0) != kCVReturnSuccess) {
             CVPixelBufferRelease(buffer); [self reportError:@"IJK sample-buffer output: pixel-buffer lock failed"]; return;
         }
+        if (CVPixelBufferGetPlaneCount(buffer) != 2) {
+            CVPixelBufferUnlockBaseAddress(buffer, 0); CVPixelBufferRelease(buffer);
+            [self reportError:@"IJK sample-buffer output: destination is not two-plane NV12"]; return;
+        }
         uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(buffer, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(buffer, 1);
         size_t ys = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1);
+        if (CVPixelBufferGetPlaneCount(buffer) != 2 || !y || !uv || ys < (size_t)w || uvs < (size_t)cw * 2 ||
+            CVPixelBufferGetWidthOfPlane(buffer, 0) < (size_t)w || CVPixelBufferGetHeightOfPlane(buffer, 0) < (size_t)h ||
+            CVPixelBufferGetWidthOfPlane(buffer, 1) < (size_t)cw || CVPixelBufferGetHeightOfPlane(buffer, 1) < (size_t)ch) {
+            CVPixelBufferUnlockBaseAddress(buffer, 0); CVPixelBufferRelease(buffer);
+            [self reportError:@"IJK sample-buffer output: insufficient NV12 destination plane capacity"]; return;
+        }
         for (int row = 0; row < h; ++row) memcpy(y + row * ys, overlay->pixels[0] + row * overlay->pitches[0], w);
         for (int row = 0; row < ch; ++row) {
             const uint8_t *u = overlay->pixels[1] + row * overlay->pitches[1], *v = overlay->pixels[2] + row * overlay->pitches[2];
@@ -104,8 +133,21 @@
         }
         CVPixelBufferUnlockBaseAddress(buffer, 0);
     }
+    // Always overwrite pooled/decoder attachments, including square-pixel
+    // fallback, before creating the format description on the main thread.
+    int sarNum = overlay->sar_num > 0 && overlay->sar_den > 0 ? overlay->sar_num : 1;
+    int sarDen = overlay->sar_num > 0 && overlay->sar_den > 0 ? overlay->sar_den : 1;
+    NSDictionary *aspect = @{(id)kCVImageBufferPixelAspectRatioHorizontalSpacingKey: @(sarNum),
+                             (id)kCVImageBufferPixelAspectRatioVerticalSpacingKey: @(sarDen)};
+    CVBufferSetAttachment(buffer, kCVImageBufferPixelAspectRatioKey, (__bridge CFDictionaryRef)aspect, kCVAttachmentMode_ShouldPropagate);
     os_unfair_lock_lock(&_lock);
     if (_closed || generation != _generation) { os_unfair_lock_unlock(&_lock); CVPixelBufferRelease(buffer); return; }
+    if (_waitingSerial) {
+        // Latch the first confirmed near-target frame at acceptance, NOT drain.
+        // Subsequent seek increments generation even when this hasn't drained.
+        _waitingSerial = NO; _hasSerial = NO;
+    }
+    _acceptedSerial = overlay->serial; _hasAcceptedSerial = YES;
     if (_pending) CVPixelBufferRelease(_pending);
     _pending = buffer;
     _pts = overlay->pts; _duration = overlay->duration; _serial = overlay->serial;
@@ -151,10 +193,22 @@
         CMTimebaseSetRate(_timebase, rate);
     }
 }
-- (void)invalidateForSeek {
+- (void)beginSeekTo:(double)target {
     NSAssert(NSThread.isMainThread, @"Seek invalidation requires main thread");
     os_unfair_lock_lock(&_lock);
-    ++_generation; _waitingSerial = YES;
+    ++_generation; _waitingSerial = YES; _seekConfirmed = NO; _seekTarget = target;
+    if (_pending) { CVPixelBufferRelease(_pending); _pending = NULL; }
+    os_unfair_lock_unlock(&_lock);
+    [self.displayLayer flushAndRemoveImage];
+}
+- (void)confirmSeek {
+    NSAssert(NSThread.isMainThread, @"Seek confirmation requires main thread");
+    os_unfair_lock_lock(&_lock); _seekConfirmed = YES; os_unfair_lock_unlock(&_lock);
+}
+- (void)cancelSeek {
+    NSAssert(NSThread.isMainThread, @"Seek cancellation requires main thread");
+    os_unfair_lock_lock(&_lock);
+    ++_generation; _waitingSerial = NO; _seekConfirmed = NO; _hasSerial = NO; _hasAcceptedSerial = NO;
     if (_pending) { CVPixelBufferRelease(_pending); _pending = NULL; }
     os_unfair_lock_unlock(&_lock);
     [self.displayLayer flushAndRemoveImage];

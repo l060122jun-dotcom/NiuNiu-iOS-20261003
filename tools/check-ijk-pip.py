@@ -1,6 +1,6 @@
 """Static checks only; no Xcode, playback, upload or device access.
 
---upstream checks the four metadata replacements against the exact official SHA.
+--upstream checks the five metadata source files against the exact official SHA.
 It downloads source text only and keeps it in memory.
 """
 import argparse
@@ -53,7 +53,7 @@ def main():
             patched[rel] = patched[rel].replace(old, new)
 
         exec(compile(section, 'metadata-patch', 'exec'), {'ijk': SourcePath(), 'replace': replace})
-        assert len(patched) == 4
+        assert len(patched) == 5
         for rel in patched:
             print('Pinned source assertion passed: ' + rel)
     print('No library/App build or device playback was performed.')
