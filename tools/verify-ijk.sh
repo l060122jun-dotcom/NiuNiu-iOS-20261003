@@ -10,6 +10,7 @@ if [[ "$MODE" == --restore-source ]]; then
 import hashlib, json, os, posixpath, subprocess, sys, tarfile
 from pathlib import Path, PurePosixPath
 package, dest = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
+print('IJK restore runtime: Python ' + sys.version.split()[0] + '; tar symlinks restored with exact original targets', flush=True)
 required = ['ijkplayer-original.tar.gz', 'ffmpeg-original.tar.gz', 'gas-preprocessor-original.tar.gz',
             'ijk-modern-apple.patch', 'ffmpeg-source.patch', 'module.sh', 'config.h', 'config.mak',
             'source-lock.txt', 'source-tree-sha256.json', 'REBUILD.md', 'build-ijk.sh', 'verify-ijk.sh',
@@ -76,7 +77,12 @@ def extract(archive, target, name):
                 tar.extract(m, target)
         for m in members:
             if m.issym() and m.name not in exclusions[name]:
-                tar.extract(m, target)
+                # Python 3.14 data_filter normpath strips trailing '/' from two
+                # official Android include links. Preserve original text after
+                # lexical/ancestor validation, then validate the resolved graph.
+                path = target / m.name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(m.linkname, path)
         for rel in symlinks.keys() - exclusions[name].keys():
             try:
                 resolved = (target / rel).resolve()
@@ -107,8 +113,19 @@ for name, root in [('ijk', ijk), ('ffmpeg', ff), ('gas', gas)]:
         if not p.resolve().is_relative_to(root.resolve()):
             raise SystemExit('Unsafe manifest path: ' + rel)
         data = ('symlink:' + os.readlink(p)).encode() if p.is_symlink() else p.read_bytes()
-        if hashlib.sha256(data).hexdigest() != expected:
-            raise SystemExit('Restored source mismatch: ' + name + '/' + rel)
+        actual_hash = hashlib.sha256(data).hexdigest()
+        if actual_hash != expected:
+            # Only source-relative names, link metadata and hashes; no contents,
+            # credentials, request URLs or absolute build paths are logged.
+            actual_type = 'symlink' if p.is_symlink() else 'file' if p.is_file() else 'missing/other'
+            expected_link = links[name].get(rel) if rel != 'config/module.sh' else None
+            actual_link = os.readlink(p) if p.is_symlink() else None
+            raise SystemExit('Restored source mismatch: ' + name + '/' + rel +
+                             '\nexpected_sha256=' + expected + ' actual_sha256=' + actual_hash +
+                             '\nexpected_type=' + ('symlink' if expected_link is not None else 'file') +
+                             ' actual_type=' + actual_type +
+                             '\nexpected_link_target=' + repr(expected_link) +
+                             ' actual_link_target=' + repr(actual_link))
     actual = set()
     for folder, dirs, files in os.walk(root, followlinks=False):
         here = Path(folder)

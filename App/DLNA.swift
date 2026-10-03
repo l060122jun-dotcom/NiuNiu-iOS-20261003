@@ -462,6 +462,8 @@ final class DLNAStore: ObservableObject {
     private var searchID = UUID()
     private var seenLocations = Set<URL>()
     private var descriptions: [URL: Task<Void, Never>] = [:]
+    private var mediaProxy: DLNAMediaProxy?
+    private var castID = UUID()
 
     private init() {}
 
@@ -533,23 +535,37 @@ final class DLNAStore: ObservableObject {
         error = nil
     }
 
-    /// A nonempty header set needs a LAN HTTP media proxy; silently discarding it is unsafe.
+    /// Each explicit cast gets its own LAN capability and upstream request-header scope.
     func cast(url: URL, title: String, headers: [String: String] = [:]) async throws {
         try begin()
         defer { busy = false }
+        var candidate: DLNAMediaProxy?
+        var accepted = false
         do {
-            guard headers.isEmpty else {
-                throw DLNAError.message("此视频需要鉴权/请求头。DLNA 设备不能继承 App 的 headers；当前未实现受限局域网媒体代理，不能投屏。")
-            }
             guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-                  let host = url.host, !host.isEmpty, url.user == nil, url.password == nil,
-                  !["localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"].contains(host.lowercased()) else {
-                throw DLNAError.message("DLNA 仅支持电视可直接访问的 HTTP(S) 媒体地址；本地文件、回环地址及内嵌用户名密码不可用。")
+                   let host = url.host, !host.isEmpty, url.user == nil, url.password == nil else {
+                throw DLNAError.message("DLNA 仅支持不含内嵌用户名密码的 HTTP(S) 媒体地址；本地文件不可用。")
             }
             let device = try requireDevice()
+            // Revocation is immediate on replacement, even if the new SOAP operation fails.
+            mediaProxy?.stop()
+            mediaProxy = nil
+            castID = UUID()
+            let token = castID
+            let proxy = try DLNAMediaProxy(url: url, headers: headers) { [weak self] message in
+                Task { @MainActor in
+                    guard let self = self, self.castID == token else { return }
+                    self.error = message
+                }
+            }
+            candidate = proxy
+            let rendererURL = try await proxy.start()
+            try Task.checkCancellation()
             _ = try await client.action("SetAVTransportURI", device: device,
-                                        arguments: [("CurrentURI", url.absoluteString),
-                                                    ("CurrentURIMetaData", DLNAXML.metadata(url: url, title: title))])
+                                         arguments: [("CurrentURI", rendererURL.absoluteString),
+                                                     ("CurrentURIMetaData", DLNAXML.metadata(url: rendererURL, title: title))])
+            mediaProxy = proxy
+            accepted = true
             // URI acceptance is not playback success. If Play fails, retain controls for the loaded URI.
             isCasting = true
             transportState = "URI_SET"
@@ -559,12 +575,27 @@ final class DLNAStore: ObservableObject {
             duration = 0
             _ = try await client.action("Play", device: device, arguments: [("Speed", "1")])
             transportState = "PLAYING"
-        } catch { self.error = error.localizedDescription; throw error }
+        } catch {
+            if !accepted { candidate?.stop() }
+            if Task.isCancelled {
+                mediaProxy?.stop()
+                mediaProxy = nil
+                castID = UUID()
+                self.error = "投屏操作已取消，媒体代理已关闭；设备是否已接收命令需重新查询。"
+            } else { self.error = error.localizedDescription }
+            throw error
+        }
     }
 
     func play() async throws { try await control("Play", arguments: [("Speed", "1")], state: "PLAYING") }
     func pause() async throws { try await control("Pause", state: "PAUSED_PLAYBACK") }
     func stop() async throws {
+        // Always revoke media access, including a failed/cancelled remote Stop.
+        // The renderer state is only marked stopped after SOAP confirms success.
+        guard !busy else { throw DLNAError.message("设备操作进行中，请稍后重试。") }
+        mediaProxy?.stop()
+        mediaProxy = nil
+        castID = UUID()
         try await control("Stop", state: "STOPPED")
         isCasting = false
         activeMediaURL = nil
@@ -659,7 +690,7 @@ struct DLNADeviceView: View {
             }
             if !headers.isEmpty {
                 Section {
-                    Text("当前视频含自定义请求头，需要尚未实现的局域网媒体代理，不能直接投屏。")
+                    Text("本次投屏通过手机 Wi-Fi 媒体代理转发。自定义请求头仅用于原始媒体源，不发送给电视或跨源引用。请保持 App 前台运行。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             }
@@ -718,9 +749,6 @@ struct DLNADeviceView: View {
             ForEach(store.devices) { device in
                 Button {
                     perform {
-                        guard headers.isEmpty else {
-                            throw DLNAError.message("当前媒体含请求头；未实现鉴权媒体代理，不能投屏。")
-                        }
                         if store.isCasting && store.selectedDevice?.id != device.id { try await store.stop() }
                         store.select(device)
                         guard store.selectedDevice?.id == device.id else {
@@ -741,13 +769,13 @@ struct DLNADeviceView: View {
                         Spacer()
                         if store.selectedDevice?.id == device.id { Image(systemName: "checkmark.circle.fill") }
                     }
-                }.disabled(uiBusy || !headers.isEmpty)
+                }.disabled(uiBusy)
             }
             if choosingDevice && store.isCasting {
                 Button("返回当前投屏控制") { choosingDevice = false }
             }
         } header: { Text("点击设备开始投屏") }
-        footer: { Text("换设备先停止原设备，停止失败时不会向新设备投屏。电视将直接拉取媒体地址，必须支持该格式。") }
+        footer: { Text("换设备先停止原设备，停止失败时不会向新设备投屏。电视通过同一 Wi-Fi 访问手机媒体代理，必须支持该格式；请保持 App 前台运行。") }
     }
 
     private var controlSection: some View {
@@ -829,12 +857,13 @@ struct DLNADeviceView: View {
                     Text("iOS 设置中允许此 App 访问本地网络。实际签名还需要 Apple 批准的 multicast entitlement；缺少权限可能完全发现不到设备。")
                 }
                 Section("媒体限制") {
-                    Text("电视直接访问媒体 HTTP(S) URL；App 不传递 Cookie、Referer、Authorization 或其他 headers。此版本未实现鉴权媒体代理，带 headers 的媒体会直接拒绝。")
-                    Text("本地下载文件、DRM/加密授权、验证码、转码、HLS/DASH 适配不在此模块中。不会绕过 DRM 或验证码。某些电视不支持直播、HTTPS、编解码器或 Seek。")
+                    Text("仅显式开始投屏时建立 Wi-Fi HTTP 媒体代理。电视只取得本次随机能力地址；Cookie、Referer、Authorization 等请求头仅用于原始媒体源，不转给电视或跨源资源。停止或换视频会关闭旧代理和上游任务。")
+                    Text("支持 HLS 主清单、子清单、分片、KEY、MAP 的引用重写；普通 AES-128 密钥按原有授权读取，不解密或绕过 DRM / SAMPLE-AES。跨源重定向被拒绝。本地 HTTP 回环媒体服务可由手机转发；本地文件、DASH 引用重写、验证码和转码不支持。某些电视不支持 HLS、直播、编解码器或 Seek。")
+                    Text("需可用 Wi-Fi IPv4 和局域网权限。手机必须保持同一 Wi-Fi、App 前台运行；iOS 后台挂起、AP 隔离或电视格式限制可能中断播放。能力 URL 在本次投屏期间相当于媒体访问凭证，请勿分享。")
                 }
                 Section("控制与隐私") {
                     Text("搜索仅由点击触发，约 10 秒后关闭 UDP；返回时取消搜索。没有后台扫描、广告 SDK 或 AirPlay 替代逻辑。")
-                    Text("返回不停止电视；退出投屏先发送 Stop。设备返回 SOAP Fault 时显示真实错误，不能确认成功的操作不会被标记成功。")
+                    Text("返回不停止电视或代理；停止/退出会先撤销媒体代理再发送 Stop。Stop 失败仍显示真实错误，不会假称电视已停止；继续播放需重新投屏。")
                 }
             }
             .navigationTitle("DLNA 投屏帮助")
