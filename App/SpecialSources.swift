@@ -79,7 +79,11 @@ final class SpecialSourceResolver {
         if purpose == .playback { playbackGeneration &+= 1 }
         let playback = playbackGeneration
         if purpose == .download {
-            guard downloadProxies.count + pendingDownloads < maximumDownloads else { throw SpecialSourceError.proxy("下载代理会话已满，请先释放已完成的会话") }
+            while downloadProxies.count + pendingDownloads >= maximumDownloads {
+                try Task.checkCancellation()
+                try check(context, namespace: settings.namespace, generation: generation)
+                try await Task.sleep(nanoseconds: 200_000_000)
+            }
             pendingDownloads += 1
         }
         defer { if purpose == .download { pendingDownloads -= 1 } }

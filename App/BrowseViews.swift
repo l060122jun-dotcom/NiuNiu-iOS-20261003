@@ -57,7 +57,7 @@ private struct BrowseScroll<Content: View>: View {
     }
 }
 
-/// Only service-provided identifiers for the six supported content families are used.
+/// Preserve server order; visibility follows the original teen-mode metadata.
 @MainActor
 final class BrowseCatalog: ObservableObject {
     @Published private(set) var categories: [VideoCategory] = []
@@ -84,13 +84,10 @@ final class BrowseCatalog: ObservableObject {
         do {
             let response = try await APIClient.shared.categories()
             try Task.checkCancellation()
-            let order = ["电影", "剧集", "综艺", "动漫", "短剧", "直播"]
             var seen = Set<String>()
             categories = response.filter {
-                Self.family($0.name) != nil && !$0.id.isEmpty && seen.insert($0.id).inserted
-            }.sorted {
-                (order.firstIndex(of: Self.family($0.name) ?? "") ?? 99)
-                    < (order.firstIndex(of: Self.family($1.name) ?? "") ?? 99)
+                !$0.id.isEmpty && seen.insert($0.id).inserted
+                    && (!APIClient.shared.isTeenModeEnabled || !$0.adultOnly)
             }
         } catch is CancellationError {
         } catch {
@@ -180,6 +177,7 @@ private final class VideoPageStore: ObservableObject {
 
 @MainActor
 struct MainTabView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var account = AccountStore.shared
     @Environment(\.scenePhase) private var scenePhase
     @State private var selection = 0
@@ -205,7 +203,7 @@ struct MainTabView: View {
         }
         .tint(BrowseTheme.green)
         .background(BrowseTheme.background)
-        .background(MainTabAppearance(capsule: capsuleStyle))
+        .background(MainTabAppearance(capsule: capsuleStyle, dark: colorScheme == .dark))
         .toolbarBackground(capsuleStyle ? MainTabAppearance.trackColor : BrowseTheme.surface, for: .tabBar)
         .toolbarBackground(.visible, for: .tabBar)
         .task {
@@ -240,6 +238,7 @@ struct MainTabView: View {
 /// tab-bar visibility/height. Native safe-area and navigation remain authoritative.
 private struct MainTabAppearance: UIViewControllerRepresentable {
     let capsule: Bool
+    let dark: Bool
     static let trackColor = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
             ? UIColor(white: 30.0 / 255, alpha: 239.0 / 255)
@@ -255,11 +254,13 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> Controller { Controller() }
     func updateUIViewController(_ controller: Controller, context: Context) {
         controller.capsule = capsule
+        controller.dark = dark
         controller.applyAppearance()
     }
 
     final class Controller: UIViewController {
         var capsule = false
+        var dark = false
         private var appliedKey = ""
         override func loadView() {
             view = UIView()
@@ -281,7 +282,6 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
 
         func applyAppearance() {
             guard let bar = containingTabController()?.tabBar, bar.bounds.width > 0 else { return }
-            let dark = bar.traitCollection.userInterfaceStyle == .dark
             let key = "\(capsule)|\(dark)|\(bar.bounds.width)|\(bar.items?.count ?? 0)"
             guard key != appliedKey else { return }
             appliedKey = key

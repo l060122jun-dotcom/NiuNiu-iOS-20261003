@@ -117,8 +117,8 @@ import UIKit
             GeometryReader { geometry in
                 ZStack { Color.black.ignoresSafeArea(); playerArea.frame(maxWidth: .infinity, maxHeight: .infinity) }
                     .preferredColorScheme(.dark)
-                    .onAppear { requestOrientation(landscape ? .landscape : .portrait) }
-                    .onChange(of: landscape) { requestOrientation($0 ? .landscape : .portrait) }
+                    .onAppear { requestOrientation(landscape ? .landscapeRight : .portrait) }
+                    .onChange(of: landscape) { requestOrientation($0 ? .landscapeRight : .portrait) }
                     .accessibilityLabel(geometry.size.width > geometry.size.height ? "横屏播放器" : "竖屏播放器")
             }.onDisappear { requestOrientation(.portrait); locked = false }
                 .sheet(item: $sheet) { value in sheetContent(value) }
@@ -148,7 +148,7 @@ import UIKit
                     rate: settings.rate, rates: PlaybackPreferences.rates, danmakuShown: danmaku.show,
                     onBack: { if fullScreen { fullScreen = false } else { closeDetail(); dismiss() } },
                     onPlay: togglePlay, onNext: { startEpisode(episodeIndex + 1) }, onSeek: seek,
-                    onFullScreen: { fullScreen.toggle() }, onFill: { fill.toggle() },
+                    onFullScreen: { if !fullScreen { landscape = true }; fullScreen.toggle() }, onFill: { fill.toggle() },
                     onSettings: { sheet = .settings }, onEpisodes: { sheet = .episodes },
                     onDanmaku: { danmaku.show.toggle() },
                     onRate: applyRate,
@@ -388,16 +388,21 @@ import UIKit
                         continue
                     }
                     let result = try await APIClient.shared.resolve(episode: item, source: source.id, purpose: .download)
-                    defer { SpecialSourceResolver.shared.releaseDownload(url: result.url) }
+                    var transferred = false
+                    defer { if !transferred { SpecialSourceResolver.shared.releaseDownload(url: result.url) } }
                     try Task.checkCancellation()
+                    guard !suspended else { throw CancellationError() }
                     if !downloads.items.contains(where: { $0.title == title && [.queued, .downloading, .completed].contains($0.state) }) {
-                        let id = downloads.add(title: title, url: result.url, headers: result.headers)
+                        let origin = OfflineDownloadOrigin(videoID: video.id, playerID: source.id,
+                                                           episodeIndex: index, episodeURL: item.url)
+                        let id = downloads.add(title: title, url: result.url, headers: result.headers, origin: origin)
                         guard let added = downloads.items.first(where: { $0.id == id }) else {
                             throw NSError(domain: "OfflineDownloads", code: 1, userInfo: [NSLocalizedDescriptionKey: downloads.storageError ?? "下载入队失败，未创建任务"])
                         }
                         guard [.queued, .downloading, .completed].contains(added.state) else {
                             throw NSError(domain: "OfflineDownloads", code: 2, userInfo: [NSLocalizedDescriptionKey: added.errorMessage ?? "下载入队失败"])
                         }
+                        transferred = true
                         queued += 1
                     }
                     selectedDownloads.remove(index)

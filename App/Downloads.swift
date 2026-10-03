@@ -5,7 +5,7 @@ import AVKit
 import SwiftUI
 
 enum OfflineDownloadFormat: String, Codable {
-    case mp4, hls
+    case mp4, hls, foregroundHLS
 }
 
 enum OfflineDownloadState: String, Codable {
@@ -36,6 +36,18 @@ struct OfflineDownload: Identifiable, Codable {
     var errorMessage: String?
     // Relative to the sandbox home, which can change between app installations.
     var localRelativePath: String?
+    // Optional fields decode as nil in manifests written by older versions.
+    var sourceVideoID: String?
+    var sourcePlayerID: String?
+    var sourceEpisodeIndex: Int?
+    var sourceEpisodeURL: String?
+}
+
+struct OfflineDownloadOrigin {
+    let videoID: String
+    let playerID: String
+    let episodeIndex: Int
+    let episodeURL: String
 }
 
 /// Public mutation methods must be called on the main thread (as SwiftUI actions are).
@@ -46,6 +58,7 @@ final class DownloadsStore: NSObject, ObservableObject {
     @Published private(set) var items: [OfflineDownload] = []
     @Published private(set) var storageError: String?
     @Published private(set) var isRestoring = true
+    @Published private(set) var retryingIDs: Set<UUID> = []
 
     private let rootURL: URL
     private let manifestURL: URL
@@ -62,6 +75,11 @@ final class DownloadsStore: NSObject, ObservableObject {
     private var validations: [UUID: UUID] = [:]
     private var validationCounts: [String: Int] = [:]
     private var finishedEventSessions: Set<String> = []
+    private var foregroundWorkers: [UUID: ForegroundHLSDownload] = [:]
+    private var foregroundRuns: [UUID: Task<Void, Never>] = [:]
+    private var foregroundProbes: [UUID: ForegroundHLSProbe] = [:]
+    private var lifecycleObserver: NSObjectProtocol?
+    private var retryTasks: [UUID: Task<Void, Never>] = [:]
 
     private static var sessionPrefix: String {
         (Bundle.main.bundleIdentifier ?? "local.video") + ".offline-downloads"
@@ -89,8 +107,13 @@ final class DownloadsStore: NSObject, ObservableObject {
         manifestURL = rootURL.appendingPathComponent("tasks.json")
         quarantineURL = rootURL.appendingPathComponent("quarantine-tasks.json")
         super.init()
+        lifecycleObserver = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+            object: nil, queue: .main) { [weak self] _ in self?.stopForegroundForBackground() }
         do {
             try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            guard try rootURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+                throw ForegroundHLSDownload.Failure("离线目录不能是 symlink。")
+            }
             var root = rootURL
             var values = URLResourceValues()
             values.isExcludedFromBackup = true
@@ -116,34 +139,118 @@ final class DownloadsStore: NSObject, ObservableObject {
 
     /// Detects HLS by a .m3u8 path or query value. For extensionless HLS use the format overload.
     @discardableResult
-    func add(title: String, url: URL, headers: [String: String] = [:]) -> UUID {
+    func add(title: String, url: URL, headers: [String: String] = [:],
+             origin: OfflineDownloadOrigin? = nil) -> UUID {
         let isHLS = url.pathExtension.lowercased() == "m3u8"
             || (URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
                 .contains { $0.value?.lowercased().contains(".m3u8") == true }
-        return add(title: title, url: url, headers: headers, format: isHLS ? .hls : .mp4)
+        return add(title: title, url: url, headers: headers, format: isHLS ? .hls : .mp4, origin: origin)
     }
 
     @discardableResult
     func add(title: String, url: URL, headers: [String: String] = [:],
-             format: OfflineDownloadFormat) -> UUID {
+             format: OfflineDownloadFormat, origin: OfflineDownloadOrigin? = nil) -> UUID {
         precondition(Thread.isMainThread)
         let id = UUID()
         var item = OfflineDownload(id: id, title: title.isEmpty ? url.lastPathComponent : title,
-                                   sourceURL: url, headers: headers, format: format, createdAt: Date())
+                                   sourceURL: url, headers: headers,
+                                   format: isLoopback(url) && format != .mp4 ? .foregroundHLS : format, createdAt: Date())
         guard manifestReadable else { releaseProxy(url); return id }
-        if isLoopback(url) {
-            releaseProxy(url)
-            item.state = .failed
-            item.errorMessage = "当前不支持特殊源本地代理的后台离线下载；下载代理已释放，不会标记完成。"
-        }
+        item.sourceVideoID = origin?.videoID
+        item.sourcePlayerID = origin?.playerID
+        item.sourceEpisodeIndex = origin?.episodeIndex
+        item.sourceEpisodeURL = origin?.episodeURL
         if !["https", "http"].contains(url.scheme?.lowercased() ?? "") || url.host == nil {
             item.state = .failed
             item.errorMessage = "仅支持有效的 HTTP / HTTPS 视频地址。"
+            releaseProxy(url)
         }
         items.insert(item, at: 0)
         persist()
         if !isRestoring && item.state == .queued { start(id) }
         return id
+    }
+
+    /// Re-resolve special URLs from authoritative detail data, never replay an expired proxy.
+    @MainActor func retry(_ id: UUID) async {
+        guard !retryingIDs.contains(id), let index = index(id),
+              [.failed, .cancelled].contains(items[index].state) else { return }
+        let old = items[index]
+        retryingIDs.insert(id)
+        let task = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            defer {
+                self.retryingIDs.remove(id)
+                self.retryTasks[id] = nil
+                self.persist()
+            }
+            do {
+                try Task.checkCancellation()
+                guard self.manifestReadable, !self.isRestoring else {
+                    throw ForegroundHLSDownload.Failure(self.storageError ?? "下载记录正在恢复，请稍后再试。")
+                }
+                let origin: OfflineDownloadOrigin?
+                if let videoID = old.sourceVideoID, let playerID = old.sourcePlayerID,
+                   let episodeIndex = old.sourceEpisodeIndex, let episodeURL = old.sourceEpisodeURL {
+                    origin = OfflineDownloadOrigin(videoID: videoID, playerID: playerID,
+                                                   episodeIndex: episodeIndex, episodeURL: episodeURL)
+                } else { origin = nil }
+                if self.isLoopback(old.sourceURL) || old.format == .foregroundHLS {
+                    guard let origin = origin, !origin.videoID.isEmpty, !origin.playerID.isEmpty,
+                          origin.episodeIndex >= 0, !origin.episodeURL.isEmpty else {
+                        throw ForegroundHLSDownload.Failure("旧特殊源下载记录没有影片/源/集元数据，不能复用失效代理；请从视频详情重新下载。")
+                    }
+                    guard UIApplication.shared.applicationState != .background else {
+                        throw ForegroundHLSDownload.Failure("特殊源需保持 App 前台解析并完成下载。")
+                    }
+                    let video = try await APIClient.shared.detail(id: origin.videoID)
+                    try Task.checkCancellation()
+                    let matchingSources = video.sources.filter { $0.id == origin.playerID }
+                    guard video.id == origin.videoID, matchingSources.count == 1,
+                          let source = matchingSources.first, source.episodes.indices.contains(origin.episodeIndex),
+                          source.episodes[origin.episodeIndex].url == origin.episodeURL else {
+                        throw ForegroundHLSDownload.Failure("影片详情的原源/集已变更或不存在；未猜测其他影片，请从详情选择后重新下载。")
+                    }
+                    let result = try await APIClient.shared.resolve(episode: source.episodes[origin.episodeIndex],
+                                                                    source: source.id, purpose: .download)
+                    var transferred = false
+                    defer { if !transferred { SpecialSourceResolver.shared.releaseDownload(url: result.url) } }
+                    try Task.checkCancellation()
+                    guard UIApplication.shared.applicationState != .background,
+                          let current = self.index(id), [.failed, .cancelled].contains(self.items[current].state) else {
+                        throw ForegroundHLSDownload.Failure("重试已停止或原记录已删除，未加入新任务。")
+                    }
+                    let addedID = self.add(title: old.title, url: result.url, headers: result.headers, origin: origin)
+                    guard let added = self.items.first(where: { $0.id == addedID }),
+                          [.queued, .downloading, .completed].contains(added.state) else {
+                        throw ForegroundHLSDownload.Failure(self.items.first(where: { $0.id == addedID })?.errorMessage
+                            ?? self.storageError ?? "重新解析成功但下载入队失败。")
+                    }
+                    transferred = true
+                } else {
+                    try Task.checkCancellation()
+                    guard self.index(id) != nil else { return }
+                    let addedID = self.add(title: old.title, url: old.sourceURL, headers: old.headers,
+                                          format: old.format, origin: origin)
+                    guard let added = self.items.first(where: { $0.id == addedID }),
+                          [.queued, .downloading, .completed].contains(added.state) else {
+                        throw ForegroundHLSDownload.Failure(self.storageError ?? "下载入队失败。")
+                    }
+                }
+            } catch {
+                if let current = self.index(id) {
+                    self.items[current].errorMessage = Task.isCancelled
+                        ? "重新解析已取消；未复用失效代理。" : "重新下载失败：\(error.localizedDescription)"
+                }
+            }
+        }
+        retryTasks[id] = task
+        await withTaskCancellationHandler(operation: { await task.value }, onCancel: { task.cancel() })
+    }
+
+    func cancelRetry(_ id: UUID) {
+        precondition(Thread.isMainThread)
+        retryTasks[id]?.cancel()
     }
 
     func cancel(_ id: UUID) {
@@ -155,15 +262,25 @@ final class DownloadsStore: NSObject, ObservableObject {
         validations.removeValue(forKey: id)
         verifiedItems.remove(id)
         activeTasks.removeValue(forKey: id)?.cancel()
-        cleanPendingLocation(id)
+        foregroundWorkers[id]?.cancel()
+        foregroundRuns[id]?.cancel()
+        foregroundProbes.removeValue(forKey: id)?.cancel()
+        if !isLoopback(items[index].sourceURL) { cleanPendingLocation(id) }
         persist()
     }
 
     /// Removes files first; a filesystem error leaves the record visible for a later retry.
     func delete(_ id: UUID) {
         precondition(Thread.isMainThread)
+        cancelRetry(id)
         guard let index = index(id) else { return }
         cancel(id)
+        // A cancelled async transfer must settle before its UUID directory can be deleted.
+        if foregroundRuns[id] != nil {
+            items[index].errorMessage = "下载正在停止；partial 已保留，请稍后再次删除。"
+            persist()
+            return
+        }
         releaseProxy(items[index].sourceURL)
         validations.removeValue(forKey: id)
         verifiedItems.remove(id)
@@ -249,12 +366,21 @@ final class DownloadsStore: NSObject, ObservableObject {
               !relative.split(separator: "/").contains("..") else { return nil }
         let url = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent(relative)
+        if url.deletingLastPathComponent().pathExtension == "foreground" {
+            guard url.deletingLastPathComponent().deletingPathExtension().lastPathComponent == item.id.uuidString else { return nil }
+        }
         return ownedLocation(url) ? url : nil
     }
 
     /// Only our UUID MP4 directory or Apple's sandbox-local HLS packages may be deleted.
     private func ownedLocation(_ url: URL) -> Bool {
         guard url.isFileURL else { return false }
+        let package = url.deletingLastPathComponent()
+        if ["local.m3u8", "video.mp4"].contains(url.lastPathComponent),
+           package.deletingLastPathComponent().standardizedFileURL == rootURL.standardizedFileURL,
+           package.pathExtension == "foreground", UUID(uuidString: package.deletingPathExtension().lastPathComponent) != nil {
+            return ForegroundHLSDownload.safePackage(package)
+        }
         let path = url.standardizedFileURL.resolvingSymlinksInPath().path
         let root = rootURL.standardizedFileURL.resolvingSymlinksInPath().path + "/"
         if path.hasPrefix(root), url.pathExtension.lowercased() == "mp4",
@@ -341,6 +467,12 @@ final class DownloadsStore: NSObject, ObservableObject {
             let checks = DispatchGroup()
             for index in self.items.indices {
                 let item = self.items[index]
+                if self.isLoopback(item.sourceURL), [.queued, .downloading].contains(item.state) {
+                    self.items[index].state = .failed
+                    self.items[index].errorMessage = "前台下载被中断，partial 已保留。必须保持 App 前台并重新解析特殊源后重新下载；不支持后台续传。"
+                    self.releaseProxy(item.sourceURL)
+                    continue
+                }
                 if item.state == .downloading && self.activeTasks[item.id] == nil {
                     // A delegate may already be validating this task's completed file.
                     if self.validations[item.id] != nil { continue }
@@ -357,7 +489,7 @@ final class DownloadsStore: NSObject, ObservableObject {
                     self.preparePlayback(item.id) { _ in checks.leave() }
                 } else if item.state == .failed || item.state == .cancelled {
                     // A failed verification retains its persisted file for explicit deletion.
-                    if item.state == .cancelled || item.localRelativePath == nil {
+                    if !self.isLoopback(item.sourceURL) && (item.state == .cancelled || item.localRelativePath == nil) {
                         self.cleanPendingLocation(item.id)
                     }
                 }
@@ -376,10 +508,8 @@ final class DownloadsStore: NSObject, ObservableObject {
         guard let index = index(id), items[index].state == .queued else { return }
         let item = items[index]
         if isLoopback(item.sourceURL) {
-            releaseProxy(item.sourceURL)
-            items[index].state = .failed
-            items[index].errorMessage = "当前不支持特殊源本地代理的后台离线下载；下载代理已释放。"
-            persist()
+            guard foregroundRuns.count < 4 else { return }
+            startForeground(id)
             return
         }
         let task: URLSessionTask
@@ -400,6 +530,11 @@ final class DownloadsStore: NSObject, ObservableObject {
                 return
             }
             task = assetTask
+        case .foregroundHLS:
+            items[index].state = .failed
+            items[index].errorMessage = "前台 HLS 需要重新解析取得有效本地代理地址。"
+            persist()
+            return
         }
         task.taskDescription = id.uuidString
         activeTasks[id] = task
@@ -434,6 +569,16 @@ final class DownloadsStore: NSObject, ObservableObject {
 
     private func cleanPendingLocation(_ id: UUID) {
         let itemIndex = index(id)
+        if let index = itemIndex, isLoopback(items[index].sourceURL),
+           let relative = items[index].localRelativePath {
+            let expected = rootURL.appendingPathComponent(id.uuidString + ".foreground")
+            let local = expected.appendingPathComponent(items[index].format == .foregroundHLS ? "local.m3u8" : "video.mp4")
+            if relativePath(local) == relative,
+               !FileManager.default.fileExists(atPath: expected.path),
+               (try? expected.resourceValues(forKeys: [.isSymbolicLinkKey])) == nil {
+                items[index].localRelativePath = nil
+            }
+        }
         let recordedURL = itemIndex.flatMap { resolvedLocation(items[$0]) }
         let urls = Set([pendingLocations[id], recordedURL].compactMap { $0 })
         do {
@@ -442,7 +587,8 @@ final class DownloadsStore: NSObject, ObservableObject {
                     throw NSError(domain: "OfflineDownloads", code: 1,
                         userInfo: [NSLocalizedDescriptionKey: "文件不属于本 App 离线目录，未删除。"])
                 }
-                if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+                let removal = url.deletingLastPathComponent().pathExtension == "foreground" ? url.deletingLastPathComponent() : url
+                if FileManager.default.fileExists(atPath: removal.path) { try FileManager.default.removeItem(at: removal) }
             }
             pendingLocations.removeValue(forKey: id)
             if let index = itemIndex { items[index].localRelativePath = nil }
@@ -456,7 +602,34 @@ final class DownloadsStore: NSObject, ObservableObject {
     }
 
     private func validate(_ url: URL, format: OfflineDownloadFormat,
+                          probeID: UUID = UUID(),
                           completion: @escaping (String?) -> Void) {
+        if format == .foregroundHLS {
+            let token = probeID
+            Task.detached(priority: .utility) { [weak self] in
+                do {
+                    try ForegroundHLSDownload.validate(url)
+                    await MainActor.run {
+                        guard let self = self else { completion("下载管理器已释放。"); return }
+                        guard UIApplication.shared.applicationState != .background,
+                              self.index(probeID).map({ self.items[$0].state == .downloading || self.items[$0].state == .completed }) ?? true else {
+                            completion("前台 HLS 校验已停止，请保持 App 前台完成下载。")
+                            return
+                        }
+                        let probe = ForegroundHLSProbe()
+                        self.foregroundProbes[token] = probe
+                        probe.check(url) { [weak self] failure in
+                            self?.foregroundProbes.removeValue(forKey: token)
+                            completion(failure)
+                        }
+                    }
+                } catch {
+                    let message = "本地 HLS 校验失败：\(error.localizedDescription)"
+                    DispatchQueue.main.async { completion(message) }
+                }
+            }
+            return
+        }
         Task.detached(priority: .utility) {
             var failure: String?
             if !FileManager.default.fileExists(atPath: url.path) {
@@ -512,6 +685,79 @@ final class DownloadsStore: NSObject, ObservableObject {
 
     private func finishAllBackgroundEventsIfReady() {
         for identifier in Array(finishedEventSessions) { finishBackgroundEventsIfReady(identifier) }
+    }
+
+    private func stopForegroundForBackground() {
+        for task in retryTasks.values { task.cancel() }
+        for index in items.indices where isLoopback(items[index].sourceURL) && [.queued, .downloading].contains(items[index].state) {
+            let id = items[index].id
+            items[index].state = .failed
+            items[index].errorMessage = "App 已进入后台，特殊源前台下载已停止并保留 partial；请保持前台、重新解析源后重下。不支持系统后台下载/断点续传。"
+            foregroundWorkers[id]?.cancel()
+            foregroundRuns[id]?.cancel()
+            releaseProxy(items[index].sourceURL)
+        }
+        for probe in Array(foregroundProbes.values) { probe.cancel() }
+        persist()
+    }
+
+    private func startForeground(_ id: UUID) {
+        guard let index = index(id), UIApplication.shared.applicationState != .background else {
+            stopForegroundForBackground(); return
+        }
+        let item = items[index]
+        let package = rootURL.appendingPathComponent(id.uuidString + ".foreground", isDirectory: true)
+        let local = package.appendingPathComponent(item.format == .foregroundHLS ? "local.m3u8" : "video.mp4")
+        let worker = ForegroundHLSDownload(origin: item.sourceURL, headers: item.headers) { [weak self] bytes, expected in
+            DispatchQueue.main.async {
+                guard let self = self, let index = self.index(id), self.items[index].state == .downloading else { return }
+                // HLS only publishes a total after finalizing the real local package.
+                // Late delegate callbacks must not erase that final total or inflate it.
+                if item.format == .foregroundHLS, self.items[index].expectedBytes != nil, expected == nil { return }
+                self.items[index].receivedBytes = item.format == .foregroundHLS && expected != nil
+                    ? bytes : max(self.items[index].receivedBytes, bytes)
+                self.items[index].expectedBytes = expected
+                if let expected = expected, expected > 0 {
+                    self.items[index].progress = min(0.999, Double(bytes) / Double(expected))
+                }
+                self.persist(throttled: true)
+            }
+        }
+        foregroundWorkers[id] = worker
+        items[index].state = .downloading
+        items[index].localRelativePath = relativePath(local)
+        items[index].errorMessage = "特殊源仅限前台下载；切后台会停止并保留 partial。HLS 总大小在资源全部完成前未知。"
+        persist()
+        foregroundRuns[id] = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            defer {
+                self.foregroundRuns[id] = nil
+                self.foregroundWorkers[id] = nil
+                self.releaseProxy(item.sourceURL)
+                self.persist()
+                if UIApplication.shared.applicationState != .background {
+                    for queued in self.items.filter({ $0.state == .queued }).map(\.id) { self.start(queued) }
+                }
+            }
+            do {
+                let saved = try await worker.run(package: package, hls: item.format == .foregroundHLS)
+                try Task.checkCancellation()
+                let failure: String? = await withCheckedContinuation { continuation in
+                    self.validate(saved, format: item.format, probeID: id) { continuation.resume(returning: $0) }
+                }
+                try Task.checkCancellation()
+                if let failure = failure { throw ForegroundHLSDownload.Failure(failure) }
+                guard let index = self.index(id), self.items[index].state == .downloading else { return }
+                self.items[index].state = .completed
+                self.items[index].progress = 1
+                self.items[index].errorMessage = nil
+                self.verifiedItems.insert(id)
+            } catch {
+                guard let index = self.index(id), self.items[index].state == .downloading else { return }
+                self.items[index].state = .failed
+                self.items[index].errorMessage = "前台下载失败（partial 已保留）：\(error.localizedDescription)；需要前台重新解析后重下。"
+            }
+        }
     }
 }
 
@@ -701,18 +947,19 @@ struct DownloadsView: View {
                             Text(item.state.label)
                             Spacer()
                             Text(item.format.rawValue.uppercased())
-                            if item.state == .downloading || item.state == .completed {
+                            if item.state == .completed || (item.state == .downloading && (item.format != .foregroundHLS || item.expectedBytes != nil)) {
                                 Text("\(Int(item.progress * 100))%")
                             }
                         }.font(.caption).foregroundColor(.secondary)
                         if item.state == .downloading {
-                            if item.format == .mp4 && item.expectedBytes == nil {
+                            if (item.format == .mp4 || item.format == .foregroundHLS) && item.expectedBytes == nil {
                                 ProgressView()
                             } else {
                                 ProgressView(value: item.progress)
                             }
-                            if item.format == .mp4 {
-                                Text(ByteCountFormatter.string(fromByteCount: item.receivedBytes, countStyle: .file))
+                            if item.format == .mp4 || item.format == .foregroundHLS {
+                                Text(ByteCountFormatter.string(fromByteCount: item.receivedBytes, countStyle: .file)
+                                     + (item.format == .foregroundHLS && item.expectedBytes == nil ? " · 总大小未知" : ""))
                                     .font(.caption).foregroundColor(.secondary)
                             }
                         }
@@ -729,9 +976,13 @@ struct DownloadsView: View {
                                 Button("取消", role: .cancel) { store.cancel(item.id) }
                             }
                             if item.state == .failed || item.state == .cancelled {
-                                Button("重新下载") {
-                                    store.add(title: item.title, url: item.sourceURL,
-                                              headers: item.headers, format: item.format)
+                                if store.retryingIDs.contains(item.id) {
+                                    ProgressView("重新解析…")
+                                    Button("取消重试") { store.cancelRetry(item.id) }
+                                } else {
+                                    Button("重新下载") {
+                                        Task { @MainActor in await store.retry(item.id) }
+                                    }.disabled(store.isRestoring)
                                 }
                             }
                             Spacer()
