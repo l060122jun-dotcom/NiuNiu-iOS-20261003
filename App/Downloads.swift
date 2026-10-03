@@ -781,28 +781,168 @@ private struct OfflinePlaybackSelection: Identifiable {
     let url: URL
 }
 
-private struct OfflinePlayerView: View {
+@MainActor private struct OfflinePlayerView: View {
+    let title: String
+    let url: URL
+
+    var body: some View {
+        // Apple's asset-download package is not an FFmpeg-readable media file.
+        // Never pass a .movpkg URL to IJK or silently fall back for ordinary MP4.
+        if url.pathExtension.lowercased() == "movpkg" {
+            SystemOfflineHLSPlayerView(title: title, url: url)
+        } else {
+            OfflineIJKPlayerView(title: title, url: url)
+        }
+    }
+}
+
+@MainActor private struct OfflineIJKPlayerView: View {
+    let title: String
+    let url: URL
+    @StateObject private var playback = PlaybackController()
+    @StateObject private var interaction = AndroidPlayerInteraction()
+    @State private var locked = false
+    @State private var fullScreen = false
+    @State private var fill = false
+    @State private var explanation: String?
+    @Environment(\.dismiss) private var dismiss
+
+    private let rates: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 2, 3]
+
+    var body: some View {
+        NavigationStack {
+            GeometryReader { geometry in
+                VStack(spacing: 0) {
+                    ZStack {
+                        Color.black
+                        PlaybackSurface(controller: playback, fill: fill)
+                        Color.clear.contentShape(Rectangle())
+                            .onTapGesture { interaction.toggle() }
+                        AndroidPlayerControls(
+                            interaction: interaction, locked: $locked,
+                            sessionID: url.absoluteString, title: title,
+                            time: playback.position, duration: playback.duration,
+                            playing: playback.isPlaying, fullScreen: fullScreen,
+                            wide: geometry.size.width >= 600, fill: fill, canNext: false,
+                            rate: playback.rate, rates: rates, danmakuShown: false,
+                            onBack: { if fullScreen { fullScreen = false } else { dismiss() } },
+                            onPlay: togglePlayback, onNext: {}, onSeek: seek,
+                            onFullScreen: { fullScreen.toggle(); interaction.show() },
+                            onFill: { fill.toggle() },
+                            onSettings: { explanation = "离线 MP4 使用 B站 IJK / FFmpeg。全屏扩展当前播放页，不强制设备横屏。\n\(playback.pictureInPictureStatus)" },
+                            onEpisodes: { explanation = "离线播放仅使用已校验的本地文件，不提供在线选集或换源。" },
+                            onDanmaku: { explanation = "离线视频尚未提供离线弹幕。" },
+                            onRate: { playback.setRate($0) },
+                            onCast: { explanation = playback.airPlayStatus }
+                        ) {
+                            Button("后退15秒") { seek(playback.position - 15) }
+                            Button("前进15秒") { seek(playback.position + 15) }
+                            Menu("播放倍速") {
+                                ForEach(rates, id: \.self) { rate in
+                                    Button(String(format: "%g×", rate)) { playback.setRate(rate) }
+                                }
+                            }
+                            Button(fill ? "画面适应" : "画面填充") { fill.toggle() }
+                            Button("画中画支持说明") { explanation = playback.pictureInPictureStatus }
+                        }
+                        if let error = playback.error {
+                            VStack(spacing: 12) {
+                                Text(error).font(.footnote).multilineTextAlignment(.center)
+                                Button("重试 IJK") { playback.load(url); interaction.show() }
+                            }
+                            .foregroundColor(.white).padding()
+                            .background(Color.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 8))
+                            .padding()
+                        } else if !playback.isReady || playback.isSeeking {
+                            ProgressView(playback.isSeeking ? "正在定位…" : "IJK 正在打开本地视频…")
+                                .tint(.white).foregroundColor(.white).allowsHitTesting(false)
+                        }
+                    }
+                    .frame(height: fullScreen ? geometry.size.height : min(geometry.size.height, max(220, geometry.size.width * 9 / 16)))
+                    if !fullScreen {
+                        HStack {
+                            Button { seek(playback.position - 15) } label: { Label("后退15秒", systemImage: "gobackward.15") }
+                            Spacer()
+                            Menu(String(format: "%g×", playback.rate)) {
+                                ForEach(rates, id: \.self) { rate in
+                                    Button(String(format: "%g×", rate)) { playback.setRate(rate) }
+                                }
+                            }
+                            Spacer()
+                            Button { seek(playback.position + 15) } label: { Label("前进15秒", systemImage: "goforward.15") }
+                        }.font(.footnote).padding()
+                        Text("离线 MP4 · B站 IJK / FFmpeg\n当前 IJK 不支持系统画中画；退出播放页会停止播放。")
+                            .font(.footnote).foregroundColor(.secondary).padding(.horizontal)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(fullScreen ? .hidden : .visible, for: .navigationBar)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+            .statusBarHidden(fullScreen)
+            .onAppear { playback.load(url) }
+            .onDisappear {
+                interaction.cancel()
+                playback.onProgress = nil
+                playback.onTime = nil
+                playback.onEnd = nil
+                playback.stop()
+            }
+            .alert("离线播放说明", isPresented: Binding(
+                get: { explanation != nil }, set: { if !$0 { explanation = nil } }
+            )) {
+                Button("好") { explanation = nil }
+            } message: { Text(explanation ?? "") }
+        }
+    }
+
+    private func togglePlayback() {
+        if playback.isPlaying { playback.pause() } else { playback.play() }
+        interaction.show()
+    }
+
+    private func seek(_ seconds: Double) {
+        guard playback.isReady, playback.duration > 0, !playback.isSeeking else { return }
+        playback.seek(min(playback.duration, max(0, seconds)))
+        interaction.show()
+    }
+}
+
+@MainActor private struct SystemOfflineHLSPlayerView: View {
     let title: String
     @State private var player: AVPlayer
+    @State private var item: AVPlayerItem
     @State private var playerError: String?
     @Environment(\.dismiss) private var dismiss
 
     init(title: String, url: URL) {
         self.title = title
-        _player = State(initialValue: AVPlayer(url: url))
+        let item = AVPlayerItem(asset: AVURLAsset(url: url))
+        _item = State(initialValue: item)
+        _player = State(initialValue: AVPlayer(playerItem: item))
     }
 
     var body: some View {
         NavigationStack {
             VStack {
                 VideoPlayer(player: player)
+                Text("系统离线 HLS · AVPlayer\nApple .movpkg 离线包不支持 IJK，使用系统资产播放器兼容播放。\n本页尚未实现画中画续播；退出页面会暂停并释放播放项。")
+                    .font(.footnote).foregroundColor(.secondary).padding()
                 if let error = playerError { Text(error).foregroundColor(.red).padding() }
             }
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
-            .onAppear { player.play() }
-            .onDisappear { player.pause() }
+            .onAppear {
+                if player.currentItem == nil { player.replaceCurrentItem(with: item) }
+                player.play()
+            }
+            .onDisappear { player.pause(); player.replaceCurrentItem(with: nil) }
+            .onReceive(item.publisher(for: \.status)) { status in
+                if status == .failed { playerError = item.error?.localizedDescription ?? "系统离线 HLS 资源打开失败。" }
+            }
             .onReceive(player.publisher(for: \.status)) { status in
                 if status == .failed { playerError = player.error?.localizedDescription ?? "播放器初始化失败。" }
             }
