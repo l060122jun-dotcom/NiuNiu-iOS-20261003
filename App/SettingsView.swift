@@ -168,6 +168,7 @@ struct SettingsView: View {
 
     private func applyTeenMode(_ enabled: Bool) async {
         APIClient.shared.setTeenMode(enabled)
+        catalog.refreshVisibility()
         teenMode = APIClient.shared.isTeenModeEnabled
         notice = enabled ? "青少年模式已开启" : "青少年模式已关闭"
         // BrowseCatalog has no reload API. Allow an in-flight pre-change load to

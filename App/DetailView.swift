@@ -7,6 +7,7 @@ import UIKit
     @EnvironmentObject private var library: LibraryStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.fullscreenPlayerInsets) private var fullscreenInsets
     @StateObject private var playback = PlaybackController()
     @StateObject private var playerInteraction = AndroidPlayerInteraction()
     @StateObject private var settings: PlaybackPreferences
@@ -67,7 +68,13 @@ import UIKit
 
     public var body: some View {
         VStack(spacing: 0) {
-            if !fullScreen { playerArea }
+            FullscreenPlayerTransition(isPresented: $fullScreen, landscape: landscape,
+                                       orientationFailure: { notice = $0 },
+                                       onDismiss: { locked = false }) {
+                playerArea.preferredColorScheme(.dark).environmentObject(library)
+                    .sheet(item: $sheet) { value in sheetContent(value) }
+            }
+            .aspectRatio(16 / 9, contentMode: .fit)
             Picker("详情标签", selection: $tab) { Text("视频").tag(0); Text("评论").tag(1) }.pickerStyle(.segmented).padding(.horizontal).padding(.vertical, 8)
             if tab == 1 { CommentsView(videoID: videoID) }
             else {
@@ -107,21 +114,11 @@ import UIKit
         .onChange(of: playback.isPlaying) { playing = $0 }
         .onChange(of: account.isLoggedIn) { _ in Task { await loadFavoriteStatus() } }
         .onDisappear {
-            detailVisible = false
+            // A custom fullscreen presentation is not navigation away from detail.
+            if !fullScreen { detailVisible = false }
             if !fullScreen && !playback.hasPictureInPictureSession {
                 closeDetail()
             }
-        }
-        .sheet(item: Binding(get: { fullScreen ? nil : sheet }, set: { sheet = $0 })) { value in sheetContent(value) }
-        .fullScreenCover(isPresented: $fullScreen) {
-            GeometryReader { geometry in
-                ZStack { Color.black.ignoresSafeArea(); playerArea.frame(maxWidth: .infinity, maxHeight: .infinity) }
-                    .preferredColorScheme(.dark)
-                    .onAppear { requestOrientation(landscape ? .landscapeRight : .portrait) }
-                    .onChange(of: landscape) { requestOrientation($0 ? .landscapeRight : .portrait) }
-                    .accessibilityLabel(geometry.size.width > geometry.size.height ? "横屏播放器" : "竖屏播放器")
-            }.onDisappear { requestOrientation(.portrait); locked = false }
-                .sheet(item: $sheet) { value in sheetContent(value) }
         }
     }
 
@@ -155,6 +152,7 @@ import UIKit
                     onCast: { sheet = .cast }) {
                         playerMoreMenu
                     }
+                    .padding(fullScreen ? fullscreenInsets : EdgeInsets())
                 if resolving && !locked { ProgressView("正在解析播放地址…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)) }
                 if let errorText, !locked {
                     VStack(spacing: 12) {
@@ -174,7 +172,8 @@ import UIKit
                 }
             }
         }
-        .aspectRatio(fullScreen ? nil : 16 / 9, contentMode: .fit)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
         .background(.black).foregroundStyle(.white)
     }
     @ViewBuilder private var playerMoreMenu: some View {
@@ -623,12 +622,6 @@ import UIKit
             }
             shareItems = items; sheet = .share
         } catch { notice = "分享准备失败：\(error.localizedDescription)" }
-    }
-    private func requestOrientation(_ mask: UIInterfaceOrientationMask) {
-        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first(where: { $0.activationState == .foregroundActive }) else { return }
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
-            Task { @MainActor in notice = "系统未允许此屏幕方向：\(error.localizedDescription)" }
-        }
     }
     private func formatTime(_ value: Double) -> String { let seconds = value.isFinite ? Int(min(86_400_000, max(0, value))) : 0; return String(format: "%02d:%02d", seconds / 60, seconds % 60) }
 }

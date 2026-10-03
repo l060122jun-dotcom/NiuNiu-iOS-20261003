@@ -63,6 +63,14 @@ final class BrowseCatalog: ObservableObject {
     @Published private(set) var categories: [VideoCategory] = []
     @Published private(set) var loading = false
     @Published private(set) var error: String?
+    private var allCategories: [VideoCategory] = []
+    func refreshVisibility() {
+        var seen = Set<String>()
+        categories = allCategories.filter {
+            !$0.id.isEmpty && seen.insert($0.id).inserted
+                && (!APIClient.shared.isTeenModeEnabled || !$0.adultOnly)
+        }
+    }
 
     nonisolated static func family(_ name: String) -> String? {
         switch name.trimmingCharacters(in: .whitespacesAndNewlines) {
@@ -84,11 +92,8 @@ final class BrowseCatalog: ObservableObject {
         do {
             let response = try await APIClient.shared.categories()
             try Task.checkCancellation()
-            var seen = Set<String>()
-            categories = response.filter {
-                !$0.id.isEmpty && seen.insert($0.id).inserted
-                    && (!APIClient.shared.isTeenModeEnabled || !$0.adultOnly)
-            }
+            allCategories = response
+            refreshVisibility()
         } catch is CancellationError {
         } catch {
             self.error = error.localizedDescription
@@ -290,7 +295,11 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
             appearance.backgroundColor = capsule
                 ? (dark ? UIColor(white: 30.0 / 255, alpha: 239.0 / 255)
                     : UIColor(red: 239.0 / 255, green: 239.0 / 255, blue: 244.0 / 255, alpha: 239.0 / 255))
-                : (dark ? UIColor(white: 0.2, alpha: 1) : .white)
+                : UIColor { traits in
+                    traits.userInterfaceStyle == .dark
+                        ? UIColor(red: 0.105, green: 0.125, blue: 0.110, alpha: 1)
+                        : UIColor(red: 1, green: 0.995, blue: 0.980, alpha: 1)
+                }.resolvedColor(with: UITraitCollection(userInterfaceStyle: dark ? .dark : .light))
             if capsule {
                 appearance.shadowColor = .clear
                 let size = CGSize(width: max(1, bar.bounds.width / CGFloat(max(3, bar.items?.count ?? 3)) - 8), height: 42)
@@ -628,7 +637,11 @@ private struct RecommendationsView: View {
                 }
             }.padding(.vertical)
         }
-        .task { await load() }
+        .task(id: catalog.categories.map(\.id).joined(separator: "|")) {
+            blocks.removeAll { !catalog.accepts($0) }
+            while loading { try? await Task.sleep(nanoseconds: 50_000_000); if Task.isCancelled { return } }
+            await load()
+        }
         .refreshable { await load() }
         .background(BrowseTheme.background)
     }
