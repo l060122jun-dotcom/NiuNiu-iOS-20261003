@@ -176,7 +176,11 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
     private final class TickProxy: NSObject {
         weak var owner: GlassTabContainer?
         init(_ owner: GlassTabContainer) { self.owner = owner }
-        @objc func tick() { owner?.refresh() }
+        @objc func tick() {
+            // The display link fires off the main actor; hop back explicitly
+            // instead of assuming an isolated call is valid.
+            Task { @MainActor [weak owner] in owner?.refresh() }
+        }
     }
 
     /// Detached from the system bottom edge: these are item coordinates, not
