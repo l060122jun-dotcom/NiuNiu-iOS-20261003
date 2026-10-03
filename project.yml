@@ -8,7 +8,7 @@ settings:
     SWIFT_VERSION: "5.0"
     TARGETED_DEVICE_FAMILY: "1,2"
     MARKETING_VERSION: "1.6.2"
-    CURRENT_PROJECT_VERSION: "11"
+    CURRENT_PROJECT_VERSION: "12"
     ARCHS: arm64
     SUPPORTED_PLATFORMS: iphoneos
     ENABLE_BITCODE: NO
@@ -45,7 +45,7 @@ targets:
       properties:
         CFBundleDisplayName: 牛牛视频
         CFBundleShortVersionString: "1.6.2"
-        CFBundleVersion: "11"
+        CFBundleVersion: "12"
         UILaunchScreen: {}
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true

@@ -32,8 +32,28 @@ private struct BrowsePressStyle: ButtonStyle {
     }
 }
 
+private struct BrowseViewportKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 0
+}
+
+private struct BrowseTrackingKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
+private extension EnvironmentValues {
+    var browseViewportHeight: CGFloat {
+        get { self[BrowseViewportKey.self] }
+        set { self[BrowseViewportKey.self] = newValue }
+    }
+    var browseTracking: Bool {
+        get { self[BrowseTrackingKey.self] }
+        set { self[BrowseTrackingKey.self] = newValue }
+    }
+}
+
 private struct BrowseScroll<Content: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var tracking = false
     private let resetKey: String
     private let resetRevision: Int
     private let content: Content
@@ -43,6 +63,7 @@ private struct BrowseScroll<Content: View>: View {
         self.content = content()
     }
     var body: some View {
+        GeometryReader { viewport in
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(spacing: 0) {
@@ -59,10 +80,16 @@ private struct BrowseScroll<Content: View>: View {
                     }.buttonStyle(BrowsePressStyle()).padding(.vertical, 20)
                 }
             }
+            .coordinateSpace(name: "browse.results")
+            .environment(\.browseViewportHeight, viewport.size.height)
+            .environment(\.browseTracking, tracking)
+            .onAppear { tracking = true }
+            .onDisappear { tracking = false }
             // Push/pop keeps this ScrollView's identity. Never issue a scroll command
             // from task/onAppear: a retained scroll already owns its real offset.
             .onChange(of: resetKey) { _ in proxy.scrollTo("browse.top", anchor: .top) }
             .onChange(of: resetRevision) { _ in proxy.scrollTo("browse.top", anchor: .top) }
+        }
         }
     }
 }
@@ -146,10 +173,11 @@ private final class VideoPageStore: ObservableObject {
     var needsFirstPage: Bool { page == 0 && error == nil && hasMore }
     var needsRank: Bool { !rankCompleted && error == nil }
 
-    func loadRank(category: String, order: String) async {
+    func loadRank(category: String, order: String, reset: Bool = false) async {
+        guard reset || !loading else { return }
         generation = UUID()
         let request = generation
-        videos = []
+        if reset { videos = [] }
         hasMore = false
         error = nil
         rankCompleted = false
@@ -218,7 +246,6 @@ struct MainTabView: View {
     @ObservedObject private var account = AccountStore.shared
     @Environment(\.scenePhase) private var scenePhase
     @State private var selection = 0
-    @State private var capsuleStyle = false
     @State private var unreadCount = 0
 
     private var unreadBadge: String? {
@@ -231,21 +258,16 @@ struct MainTabView: View {
         // control its visibility, and each tab retains its own navigation stack.
         TabView(selection: $selection) {
             NavigationStack { HomeView() }
-                .tabItem { Label("首页", image: "MainTabHome") }.tag(0)
+                .tabItem { Label { Text("首页") } icon: { Image(uiImage: GlassTabContainer.icon("MainTabHome")) } }.tag(0)
             NavigationStack { RankingView() }
-                .tabItem { Label("榜单", image: "MainTabRank") }.tag(1)
+                .tabItem { Label { Text("榜单") } icon: { Image(uiImage: GlassTabContainer.icon("MainTabRank")) } }.tag(1)
             NavigationStack { ProfileView() }
-                .tabItem { Label("我", image: "MainTabMe") }.tag(2)
+                .tabItem { Label { Text("我") } icon: { Image(uiImage: GlassTabContainer.icon("MainTabMe")) } }.tag(2)
                 .badge(unreadBadge)
         }
         .tint(BrowseTheme.accent)
         .background(BrowseTheme.background)
-        .background(MainTabAppearance(capsule: capsuleStyle, dark: colorScheme == .dark, selection: selection))
-        .task {
-            if let config = try? await APIClient.shared.configuration() {
-                capsuleStyle = MainTabAppearance.integer(config["tab_style"]) == 1
-            }
-        }
+        .background(MainTabAppearance(dark: colorScheme == .dark, selection: $selection, badge: unreadBadge, active: scenePhase == .active))
         .task(id: "\(account.token)|\(selection)|\(scenePhase)") {
             unreadCount = 0
             guard account.isLoggedIn, scenePhase == .active else { return }
@@ -269,12 +291,12 @@ struct MainTabView: View {
     }
 }
 
-/// Public UITabBarAppearance and an owned, noninteractive decoration beneath items.
-/// Native safe-area, tab hit targets and navigation visibility remain authoritative.
+/// Keep SwiftUI's native navigation/visibility router; the compact bar owns its UI.
 private struct MainTabAppearance: UIViewControllerRepresentable {
-    let capsule: Bool
     let dark: Bool
-    let selection: Int
+    @Binding var selection: Int
+    let badge: String?
+    let active: Bool
     static let trackColor = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
             ? UIColor(white: 30.0 / 255, alpha: 239.0 / 255)
@@ -287,115 +309,25 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
         return 0
     }
 
-    func makeUIViewController(context: Context) -> Controller { Controller() }
-    func updateUIViewController(_ controller: Controller, context: Context) {
-        controller.capsule = capsule
+    func makeUIViewController(context: Context) -> GlassTabContainer { GlassTabContainer() }
+    func updateUIViewController(_ controller: GlassTabContainer, context: Context) {
         controller.dark = dark
         controller.selection = selection
-        controller.applyAppearance()
-    }
-
-    final class Controller: UIViewController {
-        var capsule = false
-        var dark = false
-        var selection = 0
-        private var appliedKey = ""
-        private let decoration = LiquidTabIndicatorView()
-        private var accessibilityObservers: [NSObjectProtocol] = []
-        override func loadView() {
-            view = UIView()
-            view.isUserInteractionEnabled = false
-            view.backgroundColor = .clear
-            for name in [UIAccessibility.reduceMotionStatusDidChangeNotification,
-                         UIAccessibility.reduceTransparencyStatusDidChangeNotification] {
-                accessibilityObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                    self?.appliedKey = ""
-                    self?.applyAppearance()
-                })
-            }
-        }
-        deinit { accessibilityObservers.forEach { NotificationCenter.default.removeObserver($0) } }
-        override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
-            super.traitCollectionDidChange(previousTraitCollection)
-            appliedKey = ""
-            applyAppearance()
-        }
-        override func didMove(toParent parent: UIViewController?) {
-            super.didMove(toParent: parent)
-            applyAppearance()
-        }
-        override func viewDidAppear(_ animated: Bool) {
-            super.viewDidAppear(animated)
-            applyAppearance()
-        }
-        override func viewDidLayoutSubviews() {
-            super.viewDidLayoutSubviews()
-            applyAppearance()
-        }
-
-        func applyAppearance() {
-            guard let bar = containingTabController()?.tabBar, bar.bounds.width > 0 else { return }
-            if decoration.superview !== bar {
-                decoration.removeFromSuperview()
-                bar.addSubview(decoration)
-            }
-            // Public insertion only; no private background/item view lookup.
-            bar.layer.insertSublayer(decoration.layer, at: 1)
-            decoration.frame = bar.bounds
-            decoration.update(selection: selection, count: bar.items?.count ?? 3,
-                              dark: dark, enabled: true, bottomInset: bar.safeAreaInsets.bottom)
-            let key = "\(capsule)|\(dark)|\(bar.bounds)|\(bar.items?.count ?? 0)|\(UIAccessibility.isReduceTransparencyEnabled)"
-            guard key != appliedKey else { return }
-            appliedKey = key
-            let appearance = UITabBarAppearance()
-            appearance.configureWithTransparentBackground()
-            appearance.backgroundEffect = UIAccessibility.isReduceTransparencyEnabled ? nil : UIBlurEffect(style: .systemMaterial)
-            appearance.backgroundColor = dark
-                ? UIColor(red: 0.105, green: 0.125, blue: 0.110, alpha: UIAccessibility.isReduceTransparencyEnabled ? 1 : 0.32)
-                : UIColor(red: 1, green: 0.995, blue: 0.980, alpha: UIAccessibility.isReduceTransparencyEnabled ? 1 : 0.30)
-            appearance.shadowColor = .clear
-            appearance.selectionIndicatorImage = nil
-            let green = dark ? UIColor(red: 151.0 / 255, green: 211.0 / 255, blue: 39.0 / 255, alpha: 1)
-                : UIColor(red: 0.23, green: 0.38, blue: 0.04, alpha: 1)
-            let inactive = UIColor(white: dark ? 0.72 : 0.38, alpha: 1)
-            for item in [appearance.stackedLayoutAppearance, appearance.inlineLayoutAppearance, appearance.compactInlineLayoutAppearance] {
-                item.normal.iconColor = inactive
-                item.selected.iconColor = green
-                item.normal.titleTextAttributes = [.foregroundColor: inactive, .font: UIFont.systemFont(ofSize: capsule ? 10 : 12)]
-                item.selected.titleTextAttributes = [.foregroundColor: green, .font: UIFont.systemFont(ofSize: capsule ? 10 : 12)]
-                item.normal.badgeBackgroundColor = UIColor(red: 1, green: 77.0 / 255, blue: 79.0 / 255, alpha: 1)
-                item.selected.badgeBackgroundColor = item.normal.badgeBackgroundColor
-            }
-            bar.itemPositioning = .fill
-            bar.standardAppearance = appearance
-            bar.scrollEdgeAppearance = appearance
-            bar.layer.insertSublayer(decoration.layer, at: 1)
-        }
-
-        private func containingTabController() -> UITabBarController? {
-            if let controller = tabBarController { return controller }
-            // A TabView background can be a sibling of the native tab controller.
-            // Walk public controller containment, never private UIKit subviews.
-            var root: UIViewController = self
-            while let parent = root.parent { root = parent }
-            return findTabController(in: root)
-        }
-
-        private func findTabController(in controller: UIViewController) -> UITabBarController? {
-            if let tab = controller as? UITabBarController { return tab }
-            for child in controller.children {
-                if let tab = findTabController(in: child) { return tab }
-            }
-            return nil
-        }
+        controller.badge = badge
+        controller.active = active
+        controller.onSelect = { selection = $0 }
+        controller.refresh()
     }
 }
 
 @MainActor
 private struct BrowseTopBar: View {
+    @EnvironmentObject private var search: SearchMorphPresentation
+    @Environment(\.searchMorphNamespace) private var searchNamespace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         HStack(spacing: 8) {
-            NavigationLink { SearchView() } label: {
+            Button { search.open(reduceMotion: reduceMotion) } label: {
                 HStack {
                     Image(systemName: "magnifyingglass")
                     Text("发现下一部好片").font(.subheadline)
@@ -403,21 +335,27 @@ private struct BrowseTopBar: View {
                 }
                 .foregroundStyle(Color.secondary)
                 .padding(.horizontal, 13).frame(minHeight: 44)
-                .background(BrowseTheme.surface, in: Capsule())
+                .background {
+                    if let namespace = searchNamespace, !reduceMotion {
+                        Capsule().fill(.thinMaterial)
+                            .matchedGeometryEffect(id: "browse.search.pill", in: namespace, isSource: !search.expanded)
+                    } else {
+                        Capsule().fill(.thinMaterial)
+                    }
+                }
             }.buttonStyle(BrowsePressStyle()).accessibilityLabel("搜索影片、剧集")
-            NavigationLink { DownloadsView() } label: {
+            NavigationLink { DownloadsView().toolbar(.visible, for: .navigationBar) } label: {
                 Image(systemName: "arrow.down.to.line").font(.body.weight(.semibold)).frame(width: 44, height: 44)
             }.accessibilityLabel("下载管理")
-            NavigationLink { SavedLibraryView(kind: .history) } label: {
+            NavigationLink { SavedLibraryView(kind: .history).toolbar(.visible, for: .navigationBar) } label: {
                 Image(systemName: "clock").font(.body.weight(.semibold)).frame(width: 44, height: 44)
             }.accessibilityLabel("观看历史")
-            NavigationLink { MessagesView() } label: {
+            NavigationLink { MessagesView().toolbar(.visible, for: .navigationBar) } label: {
                 Image(systemName: "bell").font(.body.weight(.semibold)).frame(width: 44, height: 44)
             }.accessibilityLabel("消息通知")
         }
         .foregroundStyle(Color.primary)
         .padding(.horizontal).padding(.vertical, 6)
-        .background(BrowseTheme.background)
     }
 }
 
@@ -612,14 +550,20 @@ private struct VideoGrid: View {
 @MainActor
 private struct PagingFooter: View {
     @ObservedObject var store: VideoPageStore
-    var automatic = false
+    var automatic = true
     var viewportHeight: CGFloat = 0
     var automaticEnabled = true
+    var coordinateSpace = "browse.results"
+    var automaticLoad: (() async -> Void)? = nil
     let load: () -> Void
+    @Environment(\.browseViewportHeight) private var browseViewportHeight
+    @Environment(\.browseTracking) private var browseTracking
     @State private var sentinelVisible = false
+    @State private var measuredVideoCount = -1
+    @State private var pagingTask: Task<Void, Never>?
 
     private var automaticKey: String {
-        "\(automaticEnabled)|\(sentinelVisible)|\(store.videos.count)|\(store.loading)|\(store.hasMore)|\(store.error ?? "")"
+        "\(automaticEnabled)|\(browseTracking)|\(sentinelVisible)|\(measuredVideoCount)|\(store.videos.count)|\(store.loading)|\(store.hasMore)|\(store.error ?? "")"
     }
     var body: some View {
         Group {
@@ -630,11 +574,7 @@ private struct PagingFooter: View {
             } else if store.videos.isEmpty {
                 BrowseMessage(title: "暂无内容", detail: "试试其他分类或筛选条件")
             } else if store.hasMore {
-                if automatic {
-                    ProgressView("继续浏览以加载更多…").padding()
-                } else {
-                    Button("加载更多", action: load).buttonStyle(.bordered).padding()
-                }
+                Text("继续浏览以加载更多…").font(.footnote).foregroundStyle(.secondary).padding()
             } else {
                 Text("已经到底了").font(.footnote).foregroundStyle(.secondary).padding()
             }
@@ -643,26 +583,95 @@ private struct PagingFooter: View {
                 if automatic {
                     GeometryReader { geometry in
                         Color.clear.preference(key: SearchFooterFrameKey.self,
-                                               value: geometry.frame(in: .named("search.results")))
+                                               value: geometry.frame(in: .named(coordinateSpace)))
+                            .preference(key: PagingMeasurementKey.self,
+                                        value: PagingMeasurement(frame: geometry.frame(in: .named(coordinateSpace)),
+                                                                 count: store.videos.count))
                     }
                 }
             }
             .onPreferenceChange(SearchFooterFrameKey.self) { frame in
+                guard automaticLoad == nil else { return }
                 // Unlike onAppear, this does not eagerly fetch a whole eager VStack.
-                sentinelVisible = frame.map { $0.maxY > 0 && $0.minY < viewportHeight } ?? false
+                let height = viewportHeight > 0 ? viewportHeight : browseViewportHeight
+                sentinelVisible = height > 0 && (frame.map { $0.width > 0 && $0.maxY > 0 && $0.minY < height } ?? false)
+            }
+            .onPreferenceChange(PagingMeasurementKey.self) { measurement in
+                measuredVideoCount = measurement?.count ?? -1
+                guard automaticLoad != nil else { return }
+                let height = viewportHeight > 0 ? viewportHeight : browseViewportHeight
+                sentinelVisible = height > 0 && (measurement.map {
+                    $0.frame.width > 0 && $0.frame.maxY > 0 && $0.frame.minY < height
+                } ?? false)
             }
             .task(id: automaticKey) {
-                guard automatic, automaticEnabled, sentinelVisible, !store.loading, store.hasMore,
+                guard automatic, automaticEnabled, browseTracking, sentinelVisible, !store.loading, store.hasMore,
                       store.error == nil, !store.videos.isEmpty else { return }
-                load()
+                guard automaticLoad == nil || measuredVideoCount == store.videos.count else { return }
+                // Own the request separately: loading/geometry updates must not
+                // cancel it, but leaving this page must cancel URLSession work.
+                if let automaticLoad = automaticLoad {
+                    pagingTask = Task { await automaticLoad() }
+                }
+                else { load() }
             }
-            .onDisappear { sentinelVisible = false }
+            .onDisappear {
+                sentinelVisible = false
+                pagingTask?.cancel()
+                pagingTask = nil
+            }
     }
 }
 
 private struct SearchFooterFrameKey: PreferenceKey {
     static var defaultValue: CGRect? = nil
     static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) { value = nextValue() ?? value }
+}
+
+private struct PagingMeasurement: Equatable {
+    let frame: CGRect
+    let count: Int
+}
+
+private struct PagingMeasurementKey: PreferenceKey {
+    static var defaultValue: PagingMeasurement? = nil
+    static func reduce(value: inout PagingMeasurement?, nextValue: () -> PagingMeasurement?) {
+        value = nextValue() ?? value
+    }
+}
+
+/// The eager recommendation stack is already laid out offscreen. Only intersection
+/// with the measured ScrollView viewport is permission to reveal another local batch.
+private struct RecommendationGroupsFooter: View {
+    @Binding var visibleGroups: Int
+    let total: Int
+    let enabled: Bool
+    @Environment(\.browseViewportHeight) private var viewportHeight
+    @Environment(\.browseTracking) private var tracking
+    @State private var visible = false
+
+    var body: some View {
+        Text(visibleGroups < total ? "继续浏览以展示更多推荐…" : "已经到底了")
+            .font(.footnote).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity).padding()
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.preference(key: SearchFooterFrameKey.self,
+                                           value: geometry.frame(in: .named("browse.results")))
+                }
+            }
+            .onPreferenceChange(SearchFooterFrameKey.self) { frame in
+                visible = viewportHeight > 0 && (frame.map {
+                    $0.width > 0 && $0.maxY > 0 && $0.minY < viewportHeight
+                } ?? false)
+            }
+            .task(id: "\(tracking)|\(enabled)|\(visible)|\(visibleGroups)|\(total)") {
+                guard tracking, enabled, visible, visibleGroups < total else { return }
+                visible = false
+                visibleGroups = min(total, visibleGroups + 4)
+            }
+            .onDisappear { visible = false }
+    }
 }
 
 /// Let the retained native scroll own its offset; only a changed query or an
@@ -688,7 +697,7 @@ private struct SearchResultsScroll: View {
                             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
                         VideoGrid(videos: store.videos, columns: 3)
                         PagingFooter(store: store, automatic: true, viewportHeight: viewport.size.height,
-                                     automaticEnabled: tracking, load: load)
+                                     automaticEnabled: tracking, coordinateSpace: "search.results", load: load)
                         Button {
                             withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) {
                                 proxy.scrollTo("search.top", anchor: .top)
@@ -727,10 +736,6 @@ struct HomeView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            BrowseTopBar()
-            ChoiceStrip(title: nil, choices: [Choice(id: "recommended", title: "推荐")] + catalog.categories.map {
-                Choice(id: $0.id, title: BrowseCatalog.family($0.name) ?? $0.name)
-            }, selection: $selection).padding(.vertical, 6)
             if let error = catalog.error {
                 BrowseMessage(title: "分类加载失败", detail: error) { Task { await catalog.load() } }
                 Spacer()
@@ -746,10 +751,15 @@ struct HomeView: View {
             }
         }
         .background(BrowseTheme.background)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                BrowseTopBar()
+                ChoiceStrip(title: nil, choices: [Choice(id: "recommended", title: "推荐")] + catalog.categories.map {
+                    Choice(id: $0.id, title: BrowseCatalog.family($0.name) ?? $0.name)
+                }, selection: $selection).padding(.horizontal, 8).padding(.vertical, 6)
+            }.modifier(FloatingBrowseHeader())
+        }
         .navigationTitle("牛牛视频").navigationBarTitleDisplayMode(.inline)
-        .toolbar(.visible, for: .navigationBar)
-        .toolbarBackground(BrowseTheme.background, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if let video = resumeVideo {
                 HStack(spacing: 10) {
@@ -775,6 +785,7 @@ struct HomeView: View {
                     .padding(.horizontal).padding(.vertical, 8).background(BrowseTheme.background.opacity(0.96))
             }
         }
+        .modifier(SearchMorphHost())
     }
 }
 
@@ -831,13 +842,9 @@ private struct RecommendationsView: View {
                         VideoGrid(videos: Array(block.videos.prefix(6)), columns: 3, anchorPrefix: "recommend.\(block.id).")
                     }
                 }
-                if visibleGroups < blocks.count {
-                    Button { visibleGroups += 4 } label: {
-                        Label("查看更多推荐组", systemImage: "plus.circle")
-                            .font(.subheadline.weight(.semibold)).foregroundStyle(Color.primary)
-                            .frame(maxWidth: .infinity, minHeight: 48)
-                            .background(BrowseTheme.surface, in: RoundedRectangle(cornerRadius: 16))
-                    }.buttonStyle(BrowsePressStyle()).padding(.horizontal)
+                if lastRequestKey == requestKey, !blocks.isEmpty {
+                    RecommendationGroupsFooter(visibleGroups: $visibleGroups, total: blocks.count,
+                                               enabled: !loading && error == nil)
                 }
                 if loading { ProgressView("正在加载推荐…").frame(maxWidth: .infinity).padding() }
                 if let error = error {
@@ -944,7 +951,9 @@ struct CategoryVideosView: View {
                         .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
                 }
                 VideoGrid(videos: lastRequestKey == requestKey ? store.videos : [], columns: columnCount == 2 ? 2 : 3)
-                PagingFooter(store: store) { Task { await load(reset: false) } }
+                PagingFooter(store: store, automaticLoad: { await load(reset: false) }) {
+                    Task { await load(reset: false) }
+                }
             }.padding(.vertical, 10)
         }
         .task(id: requestKey) {
@@ -1028,13 +1037,7 @@ struct RankingView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            BrowseTopBar()
-            ChoiceStrip(title: nil, choices: catalog.categories.map { Choice(id: $0.id, title: BrowseCatalog.family($0.name) ?? $0.name) }, selection: Binding(get: { selectedID }, set: { categoryID = $0 }))
-                .padding(.vertical, 8)
-            ChoiceStrip(title: "榜单", choices: rankChoices,
-                        selection: Binding(get: { selectedOrder }, set: { order = $0 }))
-                .padding(.horizontal).padding(.bottom, 8)
-             BrowseScroll(resetKey: requestKey, resetRevision: scrollResetRevision) {
+              BrowseScroll(resetKey: requestKey, resetRevision: scrollResetRevision) {
                  VStack(spacing: 14) {
                      HStack(alignment: .bottom) {
                          VStack(alignment: .leading, spacing: 6) {
@@ -1084,20 +1087,27 @@ struct RankingView: View {
                         }
                     }
                 }.padding()
-            }.refreshable {
-                scrollResetRevision += 1
-                await load()
+             }.refreshable {
+                 scrollResetRevision += 1
+                 await load(reset: true)
             }
         }
         .background(BrowseTheme.background)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                BrowseTopBar()
+                ChoiceStrip(title: nil, choices: catalog.categories.map { Choice(id: $0.id, title: BrowseCatalog.family($0.name) ?? $0.name) }, selection: Binding(get: { selectedID }, set: { categoryID = $0 }))
+                    .padding(.horizontal, 8).padding(.vertical, 8)
+                ChoiceStrip(title: "榜单", choices: rankChoices,
+                            selection: Binding(get: { selectedOrder }, set: { order = $0 }))
+                    .padding(.horizontal).padding(.bottom, 8)
+            }.modifier(FloatingBrowseHeader())
+        }
         .navigationTitle("榜单").navigationBarTitleDisplayMode(.inline)
-        .toolbar(.visible, for: .navigationBar)
-        .toolbarBackground(BrowseTheme.background, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
         .task(id: requestKey) {
             if lastRequestKey != requestKey {
                 lastRequestKey = requestKey
-                await load()
+                await load(reset: true)
             } else if store.needsRank {
                 while store.loading {
                     do { try await Task.sleep(nanoseconds: 20_000_000) } catch { return }
@@ -1106,15 +1116,21 @@ struct RankingView: View {
                 await load()
             }
         }
+        .modifier(SearchMorphHost())
     }
 
-    private func load() async {
-        await store.loadRank(category: selectedID, order: selectedOrder)
+    private func load(reset: Bool = false) async {
+        await store.loadRank(category: selectedID, order: selectedOrder, reset: reset)
     }
 }
 
 @MainActor
 struct SearchView: View {
+    var morphPresented = true
+    var morphReady = true
+    var onCancel: (() -> Void)? = nil
+    @Environment(\.searchMorphNamespace) private var searchNamespace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var catalog: BrowseCatalog
     @ObservedObject private var account = AccountStore.shared
@@ -1139,19 +1155,35 @@ struct SearchView: View {
         "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|\(submission)|\(selectedID)|\(submitted)"
     }
 
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
+    private var searchHeader: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("搜索影片、演员或关键词", text: $text).focused($focused)
                     .autocorrectionDisabled()
                     .submitLabel(.search).onSubmit { submit(text) }
                 if !text.isEmpty {
                     Button { text = ""; submitted = "" } label: { Image(systemName: "xmark.circle.fill") }
-                         .accessibilityLabel("清空搜索").frame(width: 44, height: 44)
+                        .accessibilityLabel("清空搜索").frame(width: 36, height: 44)
                 }
-                Button("搜索") { submit(text) }.disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }.padding(.horizontal).padding(.vertical, 6).background(BrowseTheme.surface)
+                Button("搜索") { submit(text) }.disabled(trimmedText.isEmpty)
+            }
+            .padding(.horizontal, 13).frame(minHeight: 44)
+            .background {
+                if let namespace = searchNamespace, !reduceMotion {
+                    Capsule().fill(.thinMaterial)
+                        .matchedGeometryEffect(id: "browse.search.pill", in: namespace, isSource: morphPresented)
+                } else { Capsule().fill(.thinMaterial) }
+            }
+            if let onCancel = onCancel {
+                Button("取消") { focused = false; onCancel() }
+                    .frame(minHeight: 44).accessibilityLabel("取消搜索，返回原列表位置")
+            }
+        }.padding(.horizontal).padding(.vertical, 6)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
             if let error = catalog.error {
                 BrowseMessage(title: "分类加载失败", detail: error) { Task { await catalog.load() } }
             } else if catalog.loading {
@@ -1229,8 +1261,6 @@ struct SearchView: View {
                     }.padding()
                 }
             } else {
-                ChoiceStrip(title: nil, choices: [Choice(id: "", title: "全部")] + catalog.categories.map { Choice(id: $0.id, title: BrowseCatalog.family($0.name) ?? $0.name) }, selection: Binding(get: { selectedID }, set: { categoryID = $0 }))
-                    .padding(.vertical, 8)
                 SearchResultsScroll(store: store, query: submitted,
                                      resetKey: searchRequestKey, resetRevision: scrollResetRevision,
                                     load: { Task { await load(reset: false) } },
@@ -1241,9 +1271,28 @@ struct SearchView: View {
                     .opacity(requestKey == searchRequestKey ? 1 : 0)
             }
         }
-        .background(BrowseTheme.background)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                searchHeader
+                if !submitted.isEmpty && !(focused && trimmedText != submitted) {
+                    ChoiceStrip(title: nil, choices: [Choice(id: "", title: "全部")] + catalog.categories.map { Choice(id: $0.id, title: BrowseCatalog.family($0.name) ?? $0.name) }, selection: Binding(get: { selectedID }, set: { categoryID = $0 }))
+                        .padding(.horizontal, 8).padding(.vertical, 8)
+                }
+            }
+        }
+        // One canvas behind content, transparent header and all container safe
+        // areas. Only the pill/category controls carry their own glass surface;
+        // Reduce Transparency must not turn the whole header into surface color.
+        .background {
+            BrowseTheme.background.ignoresSafeArea(.container, edges: .all)
+        }
         .navigationTitle("搜索").navigationBarTitleDisplayMode(.inline)
-        .toolbar(.visible, for: .navigationBar)
+        .onChange(of: morphReady) { ready in
+            // Focus only after expansion. A detail pop does not rerun this edge
+            // or force the keyboard over retained search results.
+            focused = ready && morphPresented
+        }
+        .onChange(of: morphPresented) { if !$0 { focused = false } }
         .task(id: "\(trimmedText)|\(suggestionRetry)") { await loadSuggestions() }
         .task { await loadHot() }
         .task(id: searchRequestKey) {
