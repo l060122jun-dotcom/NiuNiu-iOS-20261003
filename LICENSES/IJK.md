@@ -30,6 +30,8 @@
 
 ## 随二进制提供的资料
 
+固定 IJK tracked symlink 共 18 项，FFmpeg/gas-preprocessor 无 symlink。原始 git archive 完整保留；`archive-symlinks.json` 记录全部原始链接元数据。仅 `android/android-ndk-prof`（target 为 `../../../../../../ijkprof/android-ndk-profiler-dummy/jni`）是包外 dangling Android profiler 链接，恢复时不创建、不跟随，并从实际构建源码树 hash 排除；同一精确名单收入 `restore-exclusions.json`，不影响 iOS 构建。其他安全链接照常恢复，尤其 `config/module.sh` 要先恢复原始 symlink 再应用修改。禁止路径穿越、其他外链、重复成员及经 symlink 目录写入；原始归档 hash、完整链接元数据及恢复排除名单均核验。Windows 恢复要求能创建真实 symlink，不将其静默替换为普通文本；git apply 使用 `core.symlinks=true`、`core.autocrlf=false`。
+
 CI 的 `IJK-corresponding-source` artifact 含 `IJK-corresponding-source.tar.gz`，其中包含两个锁定版本的原始源码归档、本地修改 patch、实际 module 配置、`config.h` / `config.mak`、构建脚本、工具链记录及许可声明。IPA 内包含 `IJK-Licenses` 许可全文及声明。
 
 源码包另包含锁定 gas-preprocessor 的原始归档、`REBUILD.md`、共享验证脚本、包文件 SHA-256 清单及实际构建所用 tracked 源码树 SHA-256 清单。验收先检查来源锁、必需文件非空及内容 hash，再从三个原始归档恢复正确目录，对两份 patch 执行 `git apply --check` 和实际应用，逐文件比对恢复树与实际构建源码输入，核对 module 配置。hash 清单用于内容一致性检查，不是数字签名或独立来源认证。包内有本地源码重建步骤，不必下载未知二进制；原始 `config.mak` 的临时路径仅作构建记录，重建时须重新 configure。源码 tree 校验不承诺编译后二进制逐字节相同，也不代替完整 App 源码分发。

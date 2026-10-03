@@ -233,19 +233,30 @@ xcrun --sdk iphoneos --show-sdk-version >>"$WORK/compliance/source-lock.txt"
 # The restored original archives + patches must reproduce every such input.
 export COMPLIANCE="$WORK/compliance" GAS_SOURCE="$IJK/extra/gas-preprocessor"
 python3 <<'PY'
-import hashlib, json, os, subprocess
+import hashlib, json, os, subprocess, tarfile
 from pathlib import Path
 out = {}
+exclusions = {'ijk': {'android/android-ndk-prof': '../../../../../../ijkprof/android-ndk-profiler-dummy/jni'}, 'ffmpeg': {}, 'gas': {}}
+archives = {'ijk': 'ijkplayer-original.tar.gz', 'ffmpeg': 'ffmpeg-original.tar.gz', 'gas': 'gas-preprocessor-original.tar.gz'}
+links = {}
+package = Path(os.environ['COMPLIANCE'])
 for name, env in [('ijk', 'IJK_SOURCE'), ('ffmpeg', 'FF_SOURCE'), ('gas', 'GAS_SOURCE')]:
     root = Path(os.environ[env])
+    with tarfile.open(package / archives[name], 'r:gz') as tar:
+        links[name] = {m.name: m.linkname for m in tar.getmembers() if m.issym()}
+    for rel, target in exclusions[name].items():
+        if links[name].get(rel) != target:
+            raise SystemExit('Pinned symlink exclusion mismatch: ' + name + '/' + rel)
     paths = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-z']).decode().split('\0')
     entries = {}
-    for rel in sorted(p for p in paths if p):
+    for rel in sorted(p for p in paths if p and p not in exclusions[name]):
         p = root / rel
         data = ('symlink:' + os.readlink(p)).encode() if p.is_symlink() else p.read_bytes()
         entries[rel] = hashlib.sha256(data).hexdigest()
     out[name] = entries
 Path(os.environ['COMPLIANCE'], 'source-tree-sha256.json').write_text(json.dumps(out, sort_keys=True, indent=2) + '\n')
+(package / 'archive-symlinks.json').write_text(json.dumps(links, sort_keys=True, indent=2) + '\n')
+(package / 'restore-exclusions.json').write_text(json.dumps(exclusions, sort_keys=True, indent=2) + '\n')
 PY
 cat >"$WORK/compliance/REBUILD.md" <<'DOC'
 # Restore and rebuild the exact patched sources (macOS / Xcode 16.4)
@@ -271,6 +282,13 @@ xcodebuild -project IJKMediaPlayer/IJKMediaPlayer.xcodeproj -target IJKMediaFram
 
 Restore checks archive/patch hashes, runs git apply --check before applying both
 patches, and checks the restored tracked source trees against the build inputs.
+Original archives retain all 18 IJK symlinks; archive-symlinks.json records their
+exact original targets (FFmpeg/gas have none). Only android/android-ndk-prof ->
+../../../../../../ijkprof/android-ndk-profiler-dummy/jni is omitted from restoration
+and source-tree hashes, recorded in restore-exclusions.json. This dangling external
+Android profiler link is not an iOS build input. Metadata is verified, never followed.
+All other safe links are restored, including config/module.sh before its patch.
+Unexpected escaping links or writes beneath symlink directories are rejected.
 The FFmpeg tag is recreated locally for av_version_info(). No network fetch or
 third-party binary is needed. config.h/config.mak record the original build;
 FFmpeg reconfigures for the local SDK rather than reusing temporary prefix paths.

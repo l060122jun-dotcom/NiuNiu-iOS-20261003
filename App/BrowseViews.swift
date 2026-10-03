@@ -180,18 +180,159 @@ private final class VideoPageStore: ObservableObject {
 
 @MainActor
 struct MainTabView: View {
+    @ObservedObject private var account = AccountStore.shared
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var selection = 0
+    @State private var capsuleStyle = false
+    @State private var unreadCount = 0
+
+    private var unreadBadge: String? {
+        guard account.isLoggedIn, unreadCount > 0 else { return nil }
+        return unreadCount > 99 ? "99+" : String(unreadCount)
+    }
+
     var body: some View {
-        TabView {
+        // Keep the actual system tab bar: destination toolbar(.hidden) must still
+        // control its visibility, and each tab retains its own navigation stack.
+        TabView(selection: $selection) {
             NavigationStack { HomeView() }
-                .tabItem { Label("首页", systemImage: "house.fill") }
+                .tabItem { Label("首页", image: "MainTabHome") }.tag(0)
             NavigationStack { RankingView() }
-                .tabItem { Label("榜单", systemImage: "chart.bar.fill") }
+                .tabItem { Label("榜单", image: "MainTabRank") }.tag(1)
             NavigationStack { ProfileView() }
-                .tabItem { Label("我", systemImage: "person.fill") }
+                .tabItem { Label("我", image: "MainTabMe") }.tag(2)
+                .badge(unreadBadge)
         }
+        .tint(BrowseTheme.green)
         .background(BrowseTheme.background)
-        .toolbarBackground(BrowseTheme.surface, for: .tabBar)
+        .background(MainTabAppearance(capsule: capsuleStyle))
+        .toolbarBackground(capsuleStyle ? MainTabAppearance.trackColor : BrowseTheme.surface, for: .tabBar)
         .toolbarBackground(.visible, for: .tabBar)
+        .task {
+            if let config = try? await APIClient.shared.configuration() {
+                capsuleStyle = MainTabAppearance.integer(config["tab_style"]) == 1
+            }
+        }
+        .task(id: "\(account.token)|\(selection)|\(scenePhase)") {
+            unreadCount = 0
+            guard account.isLoggedIn, scenePhase == .active else { return }
+            // Read actions in MessagesView are intentionally unchanged. Periodic
+            // refresh also catches read-one/read-all without inventing local counts.
+            while !Task.isCancelled {
+                do {
+                    let response = try await account.request("unread/count", authenticated: false)
+                    try Task.checkCancellation()
+                    guard account.isLoggedIn, let counts = response as? [String: Any] else { return }
+                    let total = MainTabAppearance.integer(counts["total"])
+                    unreadCount = total > 0 ? total : ["system", "message_reply", "comment"].reduce(0) {
+                        $0 + max(0, MainTabAppearance.integer(counts[$1]))
+                    }
+                } catch is CancellationError { return }
+                catch { /* An unavailable count must never become a fabricated badge. */ }
+                do { try await Task.sleep(nanoseconds: 30_000_000_000) }
+                catch { return }
+            }
+        }
+    }
+}
+
+/// Public UITabBarAppearance only; no overlay, private subview lookup, or forced
+/// tab-bar visibility/height. Native safe-area and navigation remain authoritative.
+private struct MainTabAppearance: UIViewControllerRepresentable {
+    let capsule: Bool
+    static let trackColor = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(white: 30.0 / 255, alpha: 239.0 / 255)
+            : UIColor(red: 239.0 / 255, green: 239.0 / 255, blue: 244.0 / 255, alpha: 239.0 / 255)
+    })
+
+    static func integer(_ value: Any?) -> Int {
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0 }
+        return 0
+    }
+
+    func makeUIViewController(context: Context) -> Controller { Controller() }
+    func updateUIViewController(_ controller: Controller, context: Context) {
+        controller.capsule = capsule
+        controller.applyAppearance()
+    }
+
+    final class Controller: UIViewController {
+        var capsule = false
+        private var appliedKey = ""
+        override func loadView() {
+            view = UIView()
+            view.isUserInteractionEnabled = false
+            view.backgroundColor = .clear
+        }
+        override func didMove(toParent parent: UIViewController?) {
+            super.didMove(toParent: parent)
+            applyAppearance()
+        }
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            applyAppearance()
+        }
+        override func viewDidLayoutSubviews() {
+            super.viewDidLayoutSubviews()
+            applyAppearance()
+        }
+
+        func applyAppearance() {
+            guard let bar = containingTabController()?.tabBar, bar.bounds.width > 0 else { return }
+            let dark = bar.traitCollection.userInterfaceStyle == .dark
+            let key = "\(capsule)|\(dark)|\(bar.bounds.width)|\(bar.items?.count ?? 0)"
+            guard key != appliedKey else { return }
+            appliedKey = key
+            let appearance = UITabBarAppearance()
+            appearance.configureWithOpaqueBackground()
+            appearance.backgroundColor = capsule
+                ? (dark ? UIColor(white: 30.0 / 255, alpha: 239.0 / 255)
+                    : UIColor(red: 239.0 / 255, green: 239.0 / 255, blue: 244.0 / 255, alpha: 239.0 / 255))
+                : (dark ? UIColor(white: 0.2, alpha: 1) : .white)
+            if capsule {
+                appearance.shadowColor = .clear
+                let size = CGSize(width: max(1, bar.bounds.width / CGFloat(max(3, bar.items?.count ?? 3)) - 8), height: 42)
+                appearance.selectionIndicatorImage = UIGraphicsImageRenderer(size: size).image { context in
+                    let fill = dark ? UIColor(red: 90.0 / 255, green: 90.0 / 255, blue: 96.0 / 255, alpha: 242.0 / 255)
+                        : UIColor(white: 1, alpha: 242.0 / 255)
+                    context.cgContext.setFillColor(fill.cgColor)
+                    UIBezierPath(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 21).fill()
+                }
+            }
+            let green = UIColor(red: 151.0 / 255, green: 211.0 / 255, blue: 39.0 / 255, alpha: 1)
+            let inactive = capsule ? UIColor(white: dark ? 161.0 / 255 : 147.0 / 255, alpha: 1)
+                : UIColor(white: dark ? 82.0 / 255 : 217.0 / 255, alpha: 1)
+            for item in [appearance.stackedLayoutAppearance, appearance.inlineLayoutAppearance, appearance.compactInlineLayoutAppearance] {
+                item.normal.iconColor = inactive
+                item.selected.iconColor = green
+                item.normal.titleTextAttributes = [.foregroundColor: inactive, .font: UIFont.systemFont(ofSize: capsule ? 10 : 12)]
+                item.selected.titleTextAttributes = [.foregroundColor: green, .font: UIFont.systemFont(ofSize: capsule ? 10 : 12)]
+                item.normal.badgeBackgroundColor = UIColor(red: 1, green: 77.0 / 255, blue: 79.0 / 255, alpha: 1)
+                item.selected.badgeBackgroundColor = item.normal.badgeBackgroundColor
+            }
+            bar.itemPositioning = .fill
+            bar.standardAppearance = appearance
+            bar.scrollEdgeAppearance = appearance
+        }
+
+        private func containingTabController() -> UITabBarController? {
+            if let controller = tabBarController { return controller }
+            // A TabView background can be a sibling of the native tab controller.
+            // Walk public controller containment, never private UIKit subviews.
+            var root: UIViewController = self
+            while let parent = root.parent { root = parent }
+            return findTabController(in: root)
+        }
+
+        private func findTabController(in controller: UIViewController) -> UITabBarController? {
+            if let tab = controller as? UITabBarController { return tab }
+            for child in controller.children {
+                if let tab = findTabController(in: child) { return tab }
+            }
+            return nil
+        }
     }
 }
 

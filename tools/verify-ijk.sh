@@ -7,13 +7,14 @@ MODE="${1:-}"
 if [[ "$MODE" == --restore-source ]]; then
     [[ $# == 2 ]] || { echo 'Usage: verify-ijk.sh --restore-source NEW_DIRECTORY' >&2; exit 1; }
     python3 - "${IJK_COMPLIANCE_DIR:-$(cd "$(dirname "$0")" && pwd)}" "$2" <<'PY'
-import hashlib, json, os, subprocess, sys, tarfile
-from pathlib import Path
+import hashlib, json, os, posixpath, subprocess, sys, tarfile
+from pathlib import Path, PurePosixPath
 package, dest = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
 required = ['ijkplayer-original.tar.gz', 'ffmpeg-original.tar.gz', 'gas-preprocessor-original.tar.gz',
             'ijk-modern-apple.patch', 'ffmpeg-source.patch', 'module.sh', 'config.h', 'config.mak',
             'source-lock.txt', 'source-tree-sha256.json', 'REBUILD.md', 'build-ijk.sh', 'verify-ijk.sh',
-            'NOTICE.md', 'COPYING.LGPLv2.1', 'FFmpeg-LICENSE.md']
+            'NOTICE.md', 'COPYING.LGPLv2.1', 'FFmpeg-LICENSE.md',
+            'archive-symlinks.json', 'restore-exclusions.json']
 hashes = json.loads((package / 'package-sha256.json').read_text())
 for name, expected in hashes.items():
     if Path(name).name != name:
@@ -35,30 +36,72 @@ for line in ['ijk=30eb9441945da795079492041a791c121d2b8206',
 if dest.exists():
     raise SystemExit('Restore destination must not exist: ' + str(dest))
 dest.mkdir(parents=True)
-def extract(archive, target):
+exclusions = {'ijk': {'android/android-ndk-prof': '../../../../../../ijkprof/android-ndk-profiler-dummy/jni'}, 'ffmpeg': {}, 'gas': {}}
+if json.loads((package / 'restore-exclusions.json').read_text()) != exclusions:
+    raise SystemExit('Restore exclusions differ from pinned allowlist')
+links = json.loads((package / 'archive-symlinks.json').read_text())
+if set(links) != set(exclusions):
+    raise SystemExit('Symlink metadata missing repositories')
+def extract(archive, target, name):
     target.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, 'r:gz') as tar:
-        for m in tar.getmembers():
-            p = (target / m.name).resolve()
-            if not p.is_relative_to(target.resolve()) or not (m.isfile() or m.isdir() or m.issym()):
+        members = tar.getmembers()
+        symlinks = {m.name: m.linkname for m in members if m.issym()}
+        if symlinks != links[name]:
+            raise SystemExit('Archive symlink metadata mismatch: ' + name)
+        seen = set()
+        for m in members:
+            rel = PurePosixPath(m.name)
+            if rel.is_absolute() or '..' in rel.parts or not rel.parts or '\\' in m.name or ':' in m.name or m.name in seen:
                 raise SystemExit('Unsafe archive member: ' + m.name)
-            if m.issym() and not (p.parent / m.linkname).resolve().is_relative_to(target.resolve()):
-                raise SystemExit('Unsafe archive symlink: ' + m.name)
-            tar.extract(m, target)
+            seen.add(m.name)
+            if any(parent.as_posix() in symlinks for parent in rel.parents if parent.as_posix() != '.'):
+                raise SystemExit('Archive member beneath symlink: ' + m.name)
+            if not (m.isfile() or m.isdir() or m.issym()):
+                raise SystemExit('Unsafe archive member type: ' + m.name)
+            if m.name in exclusions[name]:
+                if not m.issym() or m.linkname != exclusions[name][m.name]:
+                    raise SystemExit('Pinned excluded link mismatch: ' + m.name)
+                continue
+            if m.issym():
+                link = PurePosixPath(m.linkname)
+                normalized = posixpath.normpath(posixpath.join(str(rel.parent), m.linkname))
+                if link.is_absolute() or '\\' in m.linkname or ':' in m.linkname or normalized == '..' or normalized.startswith('../'):
+                    raise SystemExit('Unsafe archive symlink: ' + m.name)
+        if not set(exclusions[name]).issubset(symlinks):
+            raise SystemExit('Missing excluded link: ' + name)
+        # Validate before writes, restore files before links, reject chained escapes.
+        for m in members:
+            if m.name not in exclusions[name] and not m.issym():
+                tar.extract(m, target)
+        for m in members:
+            if m.issym() and m.name not in exclusions[name]:
+                tar.extract(m, target)
+        for rel in symlinks.keys() - exclusions[name].keys():
+            try:
+                resolved = (target / rel).resolve()
+            except (OSError, RuntimeError) as error:
+                raise SystemExit('Invalid symlink graph: ' + rel) from error
+            if not resolved.is_relative_to(target.resolve()):
+                raise SystemExit('Unsafe symlink graph: ' + rel)
 ijk = dest / 'ijk'
 ff = ijk / 'ios/ffmpeg-arm64'
 gas = ijk / 'extra/gas-preprocessor'
-extract(package / 'ijkplayer-original.tar.gz', ijk)
-extract(package / 'ffmpeg-original.tar.gz', ff)
-extract(package / 'gas-preprocessor-original.tar.gz', gas)
+extract(package / 'ijkplayer-original.tar.gz', ijk, 'ijk')
+extract(package / 'ffmpeg-original.tar.gz', ff, 'ffmpeg')
+extract(package / 'gas-preprocessor-original.tar.gz', gas, 'gas')
 for root, patch in [(ijk, 'ijk-modern-apple.patch'), (ff, 'ffmpeg-source.patch')]:
     subprocess.run(['git', 'init', '-q', str(root)], check=True)
+    subprocess.run(['git', '-C', str(root), 'config', 'core.autocrlf', 'false'], check=True)
+    subprocess.run(['git', '-C', str(root), 'config', 'core.symlinks', 'true'], check=True)
     subprocess.run(['git', '-C', str(root), 'apply', '--check', str(package / patch)], check=True)
     subprocess.run(['git', '-C', str(root), 'apply', str(package / patch)], check=True)
 manifest = json.loads((package / 'source-tree-sha256.json').read_text())
 for name, root in [('ijk', ijk), ('ffmpeg', ff), ('gas', gas)]:
     if not manifest.get(name):
         raise SystemExit('Empty source manifest: ' + name)
+    if set(exclusions[name]) & set(manifest[name]):
+        raise SystemExit('Excluded link present in restored manifest: ' + name)
     for rel, expected in manifest[name].items():
         p = root / rel
         if not p.resolve().is_relative_to(root.resolve()):
