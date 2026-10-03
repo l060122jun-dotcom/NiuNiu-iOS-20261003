@@ -449,7 +449,6 @@ final class APIClient {
             } catch is CancellationError { throw CancellationError() }
             catch let error as URLError where error.code == .cancelled { throw error }
             catch { continue }
-            }
             for line in plain.components(separatedBy: .newlines) {
                 let candidate = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard let url = URL(string: candidate), url.scheme == "https", url.host != nil, url.user == nil, url.password == nil,

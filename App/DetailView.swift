@@ -230,18 +230,31 @@ public struct DetailView: View {
             HStack {
                 Picker("每50集分组", selection: $group) {
                     ForEach(0..<max(1, (episodes.count + 49) / 50), id: \.self) { value in
-                        Text(reversed ? "\(max(1, episodes.count - (value + 1) * 50 + 1))–\(max(0, episodes.count - value * 50))" : "\(value * 50 + 1)–\(min(episodes.count, (value + 1) * 50))").tag(value)
+                        Text(groupLabel(value)).tag(value)
                     }
                 }
                 Spacer(); Button(reversed ? "倒序 ↓" : "正序 ↑") { reversed.toggle(); group = max(0, (reversed ? episodes.count - 1 - episodeIndex : episodeIndex) / 50) }
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 86))], spacing: 10) {
                 ForEach(displayedIndices, id: \.self) { index in
-                    Button { startEpisode(index) } label: { Text(episodes[index].name).font(.subheadline).frame(maxWidth: .infinity).padding(10).background(index == episodeIndex ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8)) }
+                    Button { startEpisode(index) } label: { episodeLabel(index) }
                 }
             }
             if episodes.isEmpty { Text("服务端没有可播放的集数").foregroundStyle(.secondary) }
         }
+    }
+    private func groupLabel(_ value: Int) -> String {
+        let lower = reversed ? max(1, episodes.count - (value + 1) * 50 + 1) : value * 50 + 1
+        let upper = reversed ? max(0, episodes.count - value * 50) : min(episodes.count, (value + 1) * 50)
+        return "\(lower)–\(upper)"
+    }
+    private func episodeLabel(_ index: Int) -> some View {
+        let active = index == episodeIndex
+        return Text(episodes[index].name)
+            .font(.subheadline)
+            .frame(maxWidth: .infinity)
+            .padding(10)
+            .background(active ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
     }
     private var displayedIndices: [Int] {
         let indices = Array(episodes.indices)
