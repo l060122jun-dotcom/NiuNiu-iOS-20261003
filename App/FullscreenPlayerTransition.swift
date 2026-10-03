@@ -19,6 +19,7 @@ extension EnvironmentValues {
     let landscape: Bool
     let orientationFailure: (String) -> Void
     let onDismiss: () -> Void
+    var onDismantle: () -> Void = {}
     @ViewBuilder let content: () -> Content
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -26,7 +27,7 @@ extension EnvironmentValues {
     func makeUIViewController(context: Context) -> PlayerPlacementController {
         let inline = PlayerPlacementController()
         context.coordinator.inline = inline
-        context.coordinator.host = UIHostingController(rootView: AnyView(content()))
+        context.coordinator.host = UIHostingController(rootView: AnyView(content().environment(\.fullscreenPlayerInsets, EdgeInsets())))
         context.coordinator.attachInline()
         inline.onShown = { [weak coordinator = context.coordinator] in
             if coordinator?.desiredPresented == true { coordinator?.presentIfNeeded() }
@@ -38,6 +39,7 @@ extension EnvironmentValues {
         let coordinator = context.coordinator
         coordinator.setPresented = { isPresented = $0 }
         coordinator.didDismiss = onDismiss
+        coordinator.didDismantle = onDismantle
         coordinator.orientationFailure = orientationFailure
         coordinator.content = { insets in AnyView(content().environment(\.fullscreenPlayerInsets, insets)) }
         coordinator.host?.rootView = coordinator.content?(coordinator.insets) ?? AnyView(content())
@@ -47,12 +49,17 @@ extension EnvironmentValues {
         else { coordinator.dismissIfNeeded() }
     }
 
+    static func dismantleUIViewController(_ controller: PlayerPlacementController, coordinator: Coordinator) {
+        coordinator.dismantle()
+    }
+
     final class Coordinator: NSObject, UIViewControllerTransitioningDelegate {
         weak var inline: PlayerPlacementController?
         var host: UIHostingController<AnyView>?
         var fullscreen: PlayerFullscreenController?
         var setPresented: ((Bool) -> Void)?
         var didDismiss: (() -> Void)?
+        var didDismantle: (() -> Void)?
         var orientationFailure: ((String) -> Void)?
         var content: ((EdgeInsets) -> AnyView)?
         var insets = EdgeInsets()
@@ -60,17 +67,49 @@ extension EnvironmentValues {
         var desiredPresented = false
         var dismissing = false
         var presentationPending = false
+        var transitioning = false
+        var invalidated = false
+
+        func updateInsets(_ next: EdgeInsets) {
+            guard !invalidated, next != insets else { return }
+            insets = next
+            if let content { host?.rootView = content(next) }
+        }
+
+        func dismantle() {
+            guard !invalidated else { return }
+            invalidated = true
+            desiredPresented = false
+            inline?.onShown = nil
+            inline?.layoutPlayer = nil
+            fullscreen?.onShown = nil
+            fullscreen?.layoutPlayer = nil
+            fullscreen?.orientationFailure = nil
+            fullscreen?.cancelPendingPortrait()
+            fullscreen?.setLandscape(false)
+            fullscreen?.dismiss(animated: false)
+            if let host { detach(host) }
+            host = nil
+            fullscreen = nil
+            content = nil
+            setPresented = nil
+            didDismiss = nil
+            orientationFailure = nil
+            didDismantle?()
+            didDismantle = nil
+        }
 
         func attachInline() {
-            guard let inline, let host else { return }
+            guard !invalidated, let inline, let host else { return }
             move(host, to: inline)
             inline.layoutPlayer = { [weak self] in
-                guard let self, self.host?.parent === self.inline else { return }
+                guard let self, !self.transitioning, self.host?.parent === self.inline else { return }
                 self.host?.view.frame = self.inline?.view.bounds ?? .zero
             }
         }
 
         func presentIfNeeded() {
+            guard !invalidated else { return }
             if let fullscreen {
                 if !dismissing && fullscreen.didShow { fullscreen.setLandscape(desiredLandscape) }
                 return
@@ -81,7 +120,7 @@ extension EnvironmentValues {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.presentationPending = false
-                guard self.desiredPresented, let inline = self.inline, inline.view.window != nil,
+                guard !self.invalidated, self.desiredPresented, let inline = self.inline, inline.view.window != nil,
                       let presenter = inline.parent, presenter.presentedViewController == nil,
                       let host = self.host else { return }
                 let fullscreen = PlayerFullscreenController()
@@ -91,18 +130,18 @@ extension EnvironmentValues {
                 fullscreen.host = host
                 fullscreen.inline = inline
                 fullscreen.onShown = { [weak self, weak fullscreen] in
-                    guard let self else { return }
+                    guard let self, !self.invalidated, self.fullscreen === fullscreen else { return }
                     fullscreen?.setLandscape(self.desiredLandscape)
+                    if !self.desiredPresented { self.dismissIfNeeded() }
                 }
                 fullscreen.orientationFailure = { [weak self] message in self?.orientationFailure?(message) }
                 fullscreen.layoutPlayer = { [weak self, weak fullscreen] in
-                    guard let self, let fullscreen else { return }
+                    guard let self, !self.invalidated, !self.transitioning, let fullscreen,
+                          host.parent === fullscreen else { return }
                     host.view.frame = fullscreen.view.bounds
                     let safe = fullscreen.view.safeAreaInsets
                     let next = EdgeInsets(top: safe.top, leading: safe.left, bottom: safe.bottom, trailing: safe.right)
-                    guard next != self.insets else { return }
-                    self.insets = next
-                    if let content = self.content { host.rootView = content(next) }
+                    self.updateInsets(next)
                 }
                 self.fullscreen = fullscreen
                 presenter.present(fullscreen, animated: true)
@@ -110,7 +149,7 @@ extension EnvironmentValues {
         }
 
         func dismissIfNeeded() {
-            guard let fullscreen, !dismissing else { return }
+            guard !invalidated, !desiredPresented, let fullscreen, !dismissing else { return }
             guard !fullscreen.isBeingPresented else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.dismissIfNeeded() }
                 return
@@ -118,10 +157,13 @@ extension EnvironmentValues {
             dismissing = true
             // Restore real portrait geometry before measuring the inline destination.
             fullscreen.restorePortrait { [weak self, weak fullscreen] in
-                guard let self, let fullscreen else { return }
+                guard let self, !self.invalidated, let fullscreen else { return }
                 fullscreen.dismiss(animated: true) {
-                    self.insets = EdgeInsets()
-                    if let content = self.content { self.host?.rootView = content(self.insets) }
+                    guard !self.invalidated, self.host?.parent === self.inline else { return }
+                    self.updateInsets(EdgeInsets())
+                    fullscreen.onShown = nil
+                    fullscreen.layoutPlayer = nil
+                    fullscreen.orientationFailure = nil
                     self.fullscreen = nil
                     self.dismissing = false
                     self.setPresented?(false)
@@ -192,6 +234,7 @@ extension EnvironmentValues {
         portraitCompletion = nil
         completion?()
     }
+    func cancelPendingPortrait() { portraitCompletion = nil }
     override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
         super.viewWillTransition(to: size, with: coordinator)
         coordinator.animate(alongsideTransition: { [weak self] _ in self?.view.setNeedsLayout(); self?.view.layoutIfNeeded() }) { [weak self] _ in
@@ -230,12 +273,9 @@ extension EnvironmentValues {
         // The live hosting view (including the existing sample-buffer renderer) is
         // moved, never recreated or snapshot-replaced. UIKit owns actual rotation
         // after didAppear; LandscapeRight is the system's counterclockwise turn.
-        host.willMove(toParent: nil)
-        host.view.removeFromSuperview()
-        host.removeFromParent()
-        fullscreen.addChild(host)
-        fullscreenView.addSubview(host.view)
-        host.didMove(toParent: fullscreen)
+        coordinator.transitioning = true
+        // Dismissal already owns this host: do not remove/add the same child again.
+        move(host, to: fullscreen)
         host.view.frame = presenting ? fullscreenView.convert(inlineFrame, from: container) : fullscreenView.bounds
         host.view.clipsToBounds = true
         let target = presenting ? fullscreenView.bounds : fullscreenView.convert(inlineFrame, from: container)
@@ -244,20 +284,56 @@ extension EnvironmentValues {
             host.view.frame = target
             host.view.layoutIfNeeded()
         } completion: { _ in
-            if !self.presenting { self.coordinator.attachInline() }
-            context.completeTransition(!context.transitionWasCancelled)
+            let cancelled = context.transitionWasCancelled
+            self.coordinator.transitioning = false
+            if self.coordinator.invalidated {
+                detach(host)
+                context.completeTransition(false)
+                return
+            }
+            if cancelled {
+                if self.presenting {
+                    self.coordinator.attachInline()
+                    self.coordinator.updateInsets(EdgeInsets())
+                    fullscreen.onShown = nil
+                    fullscreen.layoutPlayer = nil
+                    fullscreen.orientationFailure = nil
+                    self.coordinator.fullscreen = nil
+                    self.coordinator.desiredPresented = false
+                    self.coordinator.setPresented?(false)
+                } else {
+                    // A cancelled dismissal stays fullscreen, including orientation.
+                    move(host, to: fullscreen)
+                    self.coordinator.dismissing = false
+                    self.coordinator.desiredPresented = true
+                    self.coordinator.setPresented?(true)
+                    fullscreen.setLandscape(self.coordinator.desiredLandscape)
+                    fullscreen.view.setNeedsLayout()
+                    fullscreen.view.layoutIfNeeded()
+                }
+            } else if !self.presenting {
+                self.coordinator.attachInline()
+            } else {
+                fullscreen.view.setNeedsLayout()
+                fullscreen.view.layoutIfNeeded()
+            }
+            context.completeTransition(!cancelled)
         }
     }
 }
 
 @MainActor private func move(_ child: UIViewController, to parent: UIViewController) {
     if child.parent === parent { child.view.frame = parent.view.bounds; return }
-    child.willMove(toParent: nil)
-    child.view.removeFromSuperview()
-    child.removeFromParent()
+    detach(child)
     parent.addChild(child)
     parent.view.addSubview(child.view)
     child.view.frame = parent.view.bounds
     child.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     child.didMove(toParent: parent)
+}
+
+@MainActor private func detach(_ child: UIViewController) {
+    if child.parent != nil { child.willMove(toParent: nil) }
+    child.view.removeFromSuperview()
+    if child.parent != nil { child.removeFromParent() }
 }

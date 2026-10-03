@@ -7,7 +7,6 @@ import UIKit
     @EnvironmentObject private var library: LibraryStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.fullscreenPlayerInsets) private var fullscreenInsets
     @StateObject private var playback = PlaybackController()
     @StateObject private var playerInteraction = AndroidPlayerInteraction()
     @StateObject private var settings: PlaybackPreferences
@@ -86,8 +85,10 @@ import UIKit
         VStack(spacing: 0) {
             FullscreenPlayerTransition(isPresented: $fullScreen, landscape: landscape,
                                        orientationFailure: { notice = $0 },
-                                       onDismiss: { locked = false }) {
-                playerArea.preferredColorScheme(.dark).environmentObject(library)
+                                       onDismiss: { locked = false },
+                                       onDismantle: dismantleDetail) {
+                FullscreenInsetsReader { insets in playerArea(insets: insets) }
+                    .preferredColorScheme(.dark).environmentObject(library)
                     .sheet(item: $sheet) { value in sheetContent(value) }
             }
             .aspectRatio(16 / 9, contentMode: .fit)
@@ -152,7 +153,7 @@ import UIKit
         }
     }
 
-    private var playerArea: some View {
+    private func playerArea(insets: EdgeInsets) -> some View {
         GeometryReader { geometry in
             ZStack {
                 Color.black
@@ -182,7 +183,7 @@ import UIKit
                     onCast: { sheet = .cast }) {
                         playerMoreMenu
                     }
-                    .padding(fullScreen ? fullscreenInsets : EdgeInsets())
+                    .padding(fullScreen ? insets : EdgeInsets())
                 if resolving && !locked { ProgressView("正在解析播放地址…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)) }
                 if let attemptStatus, !locked {
                     VStack { Spacer(); Text(attemptStatus).font(.caption).padding(8).background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 8)); Spacer().frame(height: 80) }
@@ -495,6 +496,22 @@ import UIKit
         playback.onTime = nil; playback.onProgress = nil; playback.onEnd = nil
         playback.stop(); danmaku.stop(); playing = false
     }
+    private func dismantleDetail() {
+        detailVisible = false
+        playback.restorePictureInPictureUI = nil
+        closeDetail()
+        // closeDetail deliberately returns for PiP. Cancel the departed UI's work
+        // without stopping its core/renderer, which PlaybackController.pipOwner owns.
+        firstFrameTimeout?.cancel(); firstFrameTimeout = nil
+        resolveTask?.cancel(); resolveTask = nil
+        downloadTask?.cancel(); downloadTask = nil
+        backgroundPauseTask?.cancel(); backgroundPauseTask = nil
+        resolutionGeneration += 1; resolving = false; suspended = true
+        temporaryRate(false)
+        playerInteraction.cancel()
+        playback.onTime = nil; playback.onProgress = nil; playback.onEnd = nil
+        danmaku.stop()
+    }
     private func loadDetail() async {
         guard !loading, !suspended else { return }
         loading = true; failure = nil
@@ -734,6 +751,14 @@ import UIKit
         } catch { notice = "分享准备失败：\(error.localizedDescription)" }
     }
     private func formatTime(_ value: Double) -> String { let seconds = value.isFinite ? Int(min(86_400_000, max(0, value))) : 0; return String(format: "%02d:%02d", seconds / 60, seconds % 60) }
+}
+
+// Read inside the hosting subtree, not in DetailView above the environment injection.
+// Keeping this wrapper's type/position stable preserves the existing PlaybackSurface.
+private struct FullscreenInsetsReader<Content: View>: View {
+    @Environment(\.fullscreenPlayerInsets) private var insets
+    @ViewBuilder let content: (EdgeInsets) -> Content
+    var body: some View { content(insets) }
 }
 
 private enum DetailSheet: String, Identifiable { case settings, composer, danmaku, episodes, downloads, share, dlna, cast, pip; var id: String { rawValue } }
