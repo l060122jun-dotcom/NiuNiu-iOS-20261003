@@ -1,5 +1,4 @@
 import SwiftUI
-import AVKit
 import Combine
 import UIKit
 
@@ -9,6 +8,7 @@ public struct DetailView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var playback = PlaybackController()
+    @StateObject private var playerInteraction = AndroidPlayerInteraction()
     @StateObject private var settings: PlaybackPreferences
     @StateObject private var danmaku: DanmakuStore
     @ObservedObject private var downloads = DownloadsStore.shared
@@ -33,12 +33,12 @@ public struct DetailView: View {
     @State private var landscape = true
     @State private var locked = false
     @State private var fill = false
-    @State private var tools = true
     @State private var introPending = false
     @State private var backgroundPauseTask: Task<Void, Never>?
     @State private var resolveTask: Task<Void, Never>?
     @State private var resolutionGeneration = 0
     @State private var handledEnd = false
+    @State private var loopSeekPending = false
     @State private var savedHistorySecond = -1
     @State private var sheet: DetailSheet?
     @State private var shareItems: [Any] = []
@@ -49,6 +49,7 @@ public struct DetailView: View {
     @State private var downloadTask: Task<Void, Never>?
     @State private var downloading = false
     @State private var holdOriginalRate: Float?
+    @State private var holdWasPlaying = false
     private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     public init(videoID: String) {
@@ -82,6 +83,8 @@ public struct DetailView: View {
         .task { configureCallbacks(); await loadDetail() }
         .onReceive(clock) { _ in tickTimer() }
         .onChange(of: scenePhase) { phase in backgroundChanged(phase) }
+        .onChange(of: fill) { playback.setFill($0) }
+        .onChange(of: playback.isPlaying) { playing = $0 }
         .onChange(of: account.isLoggedIn) { _ in Task { await loadFavoriteStatus() } }
         .onDisappear {
             if !fullScreen && !playback.isPictureInPicture {
@@ -94,9 +97,6 @@ public struct DetailView: View {
             GeometryReader { geometry in
                 ZStack { Color.black.ignoresSafeArea(); playerArea.frame(maxWidth: .infinity, maxHeight: .infinity) }
                     .preferredColorScheme(.dark)
-                    .overlay(alignment: .topLeading) {
-                        if !locked { Button { fullScreen = false } label: { Label("退出全屏", systemImage: "xmark").padding(12).background(.ultraThinMaterial, in: Capsule()) }.padding() }
-                    }
                     .onAppear { requestOrientation(landscape ? .landscape : .portrait) }
                     .onChange(of: landscape) { requestOrientation($0 ? .landscape : .portrait) }
                     .accessibilityLabel(geometry.size.width > geometry.size.height ? "横屏播放器" : "竖屏播放器")
@@ -106,14 +106,35 @@ public struct DetailView: View {
     }
 
     private var playerArea: some View {
-        VStack(spacing: 0) {
+        GeometryReader { geometry in
             ZStack {
                 Color.black
-                NativePlayer(player: playback.player, onPictureInPictureChanged: { playback.isPictureInPicture = $0 }, videoGravity: fill ? .resizeAspectFill : .resizeAspect)
-                    .allowsHitTesting(!locked)
+                PlaybackSurface(controller: playback, fill: fill)
+                    .allowsHitTesting(false)
+                AndroidPlayerGestureSurface(
+                    enabled: resolved != nil && !resolving && errorText == nil,
+                    locked: locked, time: time, duration: duration, holdRate: settings.holdRate,
+                    interaction: playerInteraction, onPlay: togglePlay, onSeek: seek,
+                    onHold: temporaryRate)
                 if !locked { DanmakuOverlay(store: danmaku) }
-                if resolving { ProgressView("正在解析播放地址…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)) }
-                if let errorText {
+                AndroidPlayerControls(
+                    interaction: playerInteraction, locked: $locked,
+                    title: [video?.name, episode?.name].compactMap { $0 }.joined(separator: " · "),
+                    time: time, duration: duration, playing: playing, fullScreen: fullScreen,
+                    wide: fullScreen && geometry.size.width > geometry.size.height, fill: fill,
+                    canNext: episodeIndex + 1 < episodes.count && !resolving,
+                    rate: settings.rate, rates: PlaybackPreferences.rates, danmakuShown: danmaku.show,
+                    onBack: { if fullScreen { fullScreen = false } else { dismiss() } },
+                    onPlay: togglePlay, onNext: { startEpisode(episodeIndex + 1) }, onSeek: seek,
+                    onFullScreen: { fullScreen.toggle() }, onFill: { fill.toggle() },
+                    onSettings: { sheet = .settings }, onEpisodes: { sheet = .episodes },
+                    onDanmaku: { danmaku.show.toggle() },
+                    onRate: applyRate,
+                    onCast: { sheet = .cast }) {
+                        playerMoreMenu
+                    }
+                if resolving && !locked { ProgressView("正在解析播放地址…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)) }
+                if let errorText, !locked {
                     VStack(spacing: 12) {
                         Text(errorText).multilineTextAlignment(.center)
                         HStack {
@@ -125,71 +146,42 @@ public struct DetailView: View {
                         if let notice { Text(notice).font(.caption) }
                     }.padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)).padding()
                 }
-                if let countdown = settings.countdown {
+                if let countdown = settings.countdown, !locked {
                     VStack { Text("\(countdown) 秒后停止播放"); Button("取消定时停止") { settings.cancelTimer() } }
                         .padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
-                if locked {
-                    Color.black.opacity(0.01).contentShape(Rectangle())
-                    Button { locked = false } label: { Label("解锁", systemImage: "lock.open").padding().background(.ultraThinMaterial, in: Capsule()) }
-                }
             }
-            .aspectRatio(fullScreen ? nil : 16 / 9, contentMode: .fit)
-            if !locked {
-                gestureStrip
-                if tools { playerTools }
-            }
-        }.background(.black).foregroundStyle(.white)
+        }
+        .aspectRatio(fullScreen ? nil : 16 / 9, contentMode: .fit)
+        .background(.black).foregroundStyle(.white)
     }
-    private var gestureStrip: some View {
-        Text(holdOriginalRate == nil ? "单击显隐工具 · 双击播放/暂停 · 长按临时倍速" : String(format: "临时 %g× · 松手恢复", settings.holdRate))
-            .font(.caption2).frame(maxWidth: .infinity).frame(height: 32).background(Color.white.opacity(0.08)).contentShape(Rectangle())
-            .onTapGesture(count: 2) { togglePlay() }
-            .onTapGesture(count: 1) { tools.toggle() }
-            .onLongPressGesture(minimumDuration: 0.35, pressing: { down in
-                if !down, let original = holdOriginalRate { playback.setRate(original); holdOriginalRate = nil; if !playing { playback.pause() } }
-            }, perform: {
-                if holdOriginalRate == nil { holdOriginalRate = playback.rate; playback.setRate(settings.holdRate) }
-            })
+    @ViewBuilder private var playerMoreMenu: some View {
+        Button("上一集") { startEpisode(episodeIndex - 1) }.disabled(episodeIndex == 0 || resolving)
+        Button("后退15秒") { seek(time - 15) }
+        Button("前进15秒") { seek(time + 15) }
+        Menu("倍速") { ForEach(PlaybackPreferences.rates, id: \.self) { value in Button(String(format: "%g×", value)) { applyRate(value) } } }
+        Button("选集 / 换源") { sheet = .episodes }
+        Button(danmaku.show ? "关闭弹幕" : "打开弹幕") { danmaku.show.toggle() }
+        Button("发送弹幕") { sheet = .composer }
+        Button("弹幕样式") { sheet = .danmaku }
+        Button(fill ? "画面适应" : "画面填充") { fill.toggle() }
+        Button("锁屏") { locked = true; playerInteraction.show() }
+        if fullScreen { Button(landscape ? "切换竖屏" : "切换横屏") { landscape.toggle() } }
+        Menu("播放方式") { Button("连续播放") { settings.mode = "continuous" }; Button("单集停止") { settings.mode = "single" }; Button("单集循环") { settings.mode = "loop" } }
+        Button("AirPlay / 系统投屏") { sheet = .cast }
+        Button("画中画（当前 IJK 不支持）") { sheet = .pip }
     }
-    private var playerTools: some View {
-        VStack(spacing: 10) {
-            HStack {
-                Text(formatTime(time)).monospacedDigit()
-                Slider(value: Binding(get: { min(time, max(1, duration)) }, set: { seek($0) }), in: 0...max(1, duration))
-                    .disabled(duration <= 0).accessibilityLabel("播放进度")
-                Text(formatTime(duration)).monospacedDigit()
-            }.font(.caption)
-            HStack {
-                tool("上一集", "backward.end") { startEpisode(episodeIndex - 1) }.disabled(episodeIndex == 0 || resolving)
-                tool("后退15秒", "gobackward.15") { seek(time - 15) }
-                tool(playing ? "暂停" : "播放", playing ? "pause.fill" : "play.fill", action: togglePlay)
-                tool("前进15秒", "goforward.15") { seek(time + 15) }
-                tool("下一集", "forward.end") { startEpisode(episodeIndex + 1) }.disabled(episodeIndex + 1 >= episodes.count || resolving)
-                Menu { ForEach(PlaybackPreferences.rates, id: \.self) { rate in Button(String(format: "%g×", rate)) { settings.rate = rate; playback.setRate(rate); playing = true } } }
-                    label: { Text(String(format: "%g×", settings.rate)).font(.caption) }
-            }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 20) {
-                    tool("设置", "gearshape") { sheet = .settings }
-                    tool("选集换源", "list.bullet") { sheet = .episodes }
-                    tool(danmaku.show ? "关闭弹幕" : "打开弹幕", "text.bubble") { danmaku.show.toggle() }
-                    tool("发送弹幕", "square.and.pencil") { sheet = .composer }
-                    tool("弹幕样式", "textformat.size") { sheet = .danmaku }
-                    tool("全屏", "arrow.up.left.and.arrow.down.right") { fullScreen.toggle() }
-                    if fullScreen { tool(landscape ? "竖屏" : "横屏", "rotate.right") { landscape.toggle() } }
-                    tool("锁屏", "lock") { locked = true }
-                    tool(fill ? "适应" : "填充", "arrow.up.left.and.down.right.magnifyingglass") { fill.toggle() }
-                    Menu("播放方式") { Button("连续播放") { settings.mode = "continuous" }; Button("单集停止") { settings.mode = "single" }; Button("单集循环") { settings.mode = "loop" } }
-                    AirPlayButton().frame(width: 36, height: 36).accessibilityLabel("AirPlay 投屏")
-                    tool("DLNA投屏", "tv") { if resolved != nil { sheet = .dlna } else { notice = "请先解析当前视频后投屏" } }
-                    Button("画中画说明") { sheet = .pip }
-                }.font(.caption)
-            }
-        }.padding(12)
-    }
-    private func tool(_ label: String, _ icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) { Image(systemName: icon).frame(minWidth: 32, minHeight: 32) }.accessibilityLabel(label)
+    private func temporaryRate(_ active: Bool) {
+        if active {
+            guard holdOriginalRate == nil else { return }
+            guard resolved != nil, !resolving, settings.holdRate.isFinite, settings.holdRate > 0 else { return }
+            holdOriginalRate = playback.rate; holdWasPlaying = playback.isPlaying
+            playback.setRate(settings.holdRate)
+            if !holdWasPlaying { playback.pause() }
+        } else if let original = holdOriginalRate {
+            holdOriginalRate = nil; playback.setRate(original)
+            if !holdWasPlaying { playback.pause(); playing = false }
+        }
     }
 
     private func information(_ video: Video) -> some View {
@@ -287,7 +279,10 @@ public struct DetailView: View {
 
     @ViewBuilder private func sheetContent(_ item: DetailSheet) -> some View {
         switch item {
-        case .settings: PlaybackSettingsView(settings: settings) { playback.setRate($0); playing = true }
+        case .settings:
+            PlaybackSettingsView(settings: settings, rateChanged: { applyRate($0) }, hardwareDecodeChanged: { _ in
+                notice = "硬件解码设置已保存，下次加载影片或重试播放时生效"
+            })
         case .composer: DanmakuComposer(store: danmaku, episode: String(episodeIndex), time: time)
         case .danmaku: NavigationStack { DanmakuSettingsView(store: danmaku).toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { sheet = nil } } } }
         case .episodes: NavigationStack { ScrollView { episodeSection.padding() }.navigationTitle("全部线路与选集").toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { sheet = nil } } } }
@@ -295,10 +290,21 @@ public struct DetailView: View {
         case .share: DetailShareSheet(items: shareItems)
         case .dlna:
             if let resolved { DLNADeviceView(mediaURL: resolved.url, title: video?.name ?? "视频", headers: resolved.headers) }
+        case .cast:
+            NavigationStack {
+                VStack(spacing: 20) {
+                    AirPlayButton().frame(width: 64, height: 64).accessibilityLabel("选择 AirPlay 设备")
+                    Text("系统音频路由 / AirPlay").font(.headline)
+                    Text("IJK 不提供与 AVPlayer 相同的直接 AirPlay 视频投屏。系统路由可用于音频设备；电视视频投屏请使用下方 DLNA。")
+                        .font(.callout).multilineTextAlignment(.center)
+                    Button("搜索 DLNA 电视") { sheet = .dlna }.disabled(resolved == nil)
+                }.padding().navigationTitle("电视投屏").toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { sheet = nil } } }
+            }
         case .pip:
             NavigationStack {
-                Text("点击视频系统控制栏中的画中画按钮。只有系统支持且媒体可用时按钮才会出现。进入画中画后可返回桌面继续观看；非画中画进入后台会暂停。AirPlay 与画中画是否可同时使用由系统决定。")
-                    .padding().navigationTitle("系统画中画").toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { sheet = nil } } }
+                Text("当前 IJK 内核尚未接入兼容 iOS 的画中画渲染方案，暂时不能启动画中画。此入口保留用于后续兼容；返回桌面会暂停本机视频播放。")
+                    .padding().navigationTitle("画中画兼容状态")
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { sheet = nil } } }
             }
         }
     }
@@ -367,20 +373,31 @@ public struct DetailView: View {
 
     private func configureCallbacks() {
         playback.onTime = { seconds in
-            guard resolved != nil, !resolving else { return }
-            time = seconds
-            let rawDuration = playback.player.currentItem?.duration.seconds ?? 0
+            guard resolved != nil, !resolving, seconds.isFinite, seconds >= 0 else { return }
+            let position = playback.position
+            guard position.isFinite, position >= 0 else { return }
+            time = position
+            let rawDuration = playback.duration
             duration = rawDuration.isFinite ? max(0, rawDuration) : 0
+            if loopSeekPending {
+                // IJK seek is asynchronous: ignore old tail samples until the loop seek lands.
+                let boundary = duration - max(settings.outro, 0.5)
+                guard duration > 0 ? time < max(0, boundary) : time <= 1 else { return }
+                loopSeekPending = false; handledEnd = false
+            }
             if introPending, duration > 0 {
                 introPending = false
-                if duration > settings.intro + settings.outro + 1, seconds < settings.intro { seek(settings.intro) }
+                if duration > settings.intro + settings.outro + 1, time < settings.intro { seek(settings.intro) }
             }
-            playing = playback.player.timeControlStatus == .playing
-            danmaku.updatePlayback(episode: String(episodeIndex), time: seconds)
-            if duration > settings.intro + settings.outro + 1, settings.outro > 0, seconds >= duration - settings.outro, !handledEnd { finishEpisode() }
+            playing = playback.isPlaying
+            danmaku.updatePlayback(episode: String(episodeIndex), time: time)
+            if duration > settings.intro + settings.outro + 1, settings.outro > 0, time >= duration - settings.outro, !handledEnd { finishEpisode() }
         }
-        playback.onProgress = { _ in recordHistory() }
-        playback.onEnd = { finishEpisode() }
+        playback.onProgress = { seconds in
+            guard seconds.isFinite, seconds >= 0, resolved != nil, !resolving else { return }
+            recordHistory()
+        }
+        playback.onEnd = { guard resolved != nil, !resolving else { return }; finishEpisode() }
     }
     private func loadDetail() async {
         guard !loading else { return }
@@ -422,7 +439,8 @@ public struct DetailView: View {
         let generation = resolutionGeneration
         episodeIndex = index; group = (reversed ? episodes.count - 1 - index : index) / 50
         let episode = source.episodes[index]
-        playback.pause(); playing = false; handledEnd = false; failure = nil; resolved = nil; resolving = true
+        temporaryRate(false)
+        playback.stop(); playback.error = nil; playing = false; handledEnd = false; loopSeekPending = false; failure = nil; resolved = nil; resolving = true
         time = 0; duration = 0; savedHistorySecond = -1
         danmaku.updatePlayback(episode: String(index), time: 0)
         resolveTask = Task { @MainActor in
@@ -430,9 +448,10 @@ public struct DetailView: View {
                 let result = try await APIClient.shared.resolve(episode: episode, source: source.id)
                 guard generation == resolutionGeneration, !Task.isCancelled else { return }
                 resolved = result
-                playback.rate = settings.rate
+                playback.setRate(settings.rate)
                 introPending = resume <= 0 && settings.intro > 0
-                playback.load(result.url, headers: result.headers, resume: resume)
+                playback.load(result.url, headers: result.headers, resume: resume.isFinite ? max(0, resume) : 0)
+                playback.setFill(fill)
                 resolving = false
             } catch {
                 guard generation == resolutionGeneration, !Task.isCancelled else { return }
@@ -441,39 +460,45 @@ public struct DetailView: View {
         }
     }
     private func seek(_ seconds: Double) {
-        guard seconds.isFinite else { return }
-        let target = max(0, duration > 0 ? min(seconds, duration) : seconds)
+        guard seconds.isFinite, resolved != nil, !resolving else { return }
+        let rawDuration = playback.duration
+        let limit = rawDuration.isFinite ? max(0, rawDuration) : 0
+        let target = max(0, limit > 0 ? min(seconds, limit) : seconds)
         handledEnd = false
-        playback.player.seek(to: CMTime(seconds: target, preferredTimescale: 600)); time = target
+        loopSeekPending = false
+        playback.seek(seconds: target); time = target
         danmaku.updatePlayback(episode: String(episodeIndex), time: target)
     }
     private func togglePlay() {
-        if playback.player.timeControlStatus == .playing { playback.pause(); playing = false }
-        else if resolved != nil { playback.player.playImmediately(atRate: settings.rate); playing = true }
+        guard resolved != nil, !resolving else { return }
+        if playback.isPlaying { playback.pause(); playing = false }
+        else { playback.setRate(settings.rate); playback.play(); playing = playback.isPlaying }
+    }
+    private func applyRate(_ value: Float) {
+        guard value.isFinite, PlaybackPreferences.rates.contains(value) else { return }
+        settings.rate = value; playback.setRate(value); playing = playback.isPlaying
     }
     private func finishEpisode() {
-        guard !handledEnd else { return }
+        guard !handledEnd, !loopSeekPending, resolved != nil, !resolving else { return }
         handledEnd = true; recordHistory()
         if settings.timerMode == -1 { settings.deadline = Date().addingTimeInterval(10); settings.countdown = 10; playback.pause(); playing = false; return }
         switch settings.mode {
         case "loop":
             let target = duration > settings.intro + settings.outro + 1 ? settings.intro : 0
-            playback.player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { finished in
-                Task { @MainActor in
-                    guard finished else { return }
-                    handledEnd = false; playback.player.playImmediately(atRate: settings.rate)
-                }
-            }
+            loopSeekPending = true
+            playback.seek(seconds: target)
+            playback.setRate(settings.rate); playback.play(); playing = playback.isPlaying
         case "continuous" where episodeIndex + 1 < episodes.count: startEpisode(episodeIndex + 1)
         default: playback.pause(); playing = false
         }
     }
     private func recordHistory() {
-        guard var saved = video?.saved, resolved != nil, time.isFinite, time >= 0 else { return }
-        let second = Int(time)
+        let position = playback.position
+        guard var saved = video?.saved, resolved != nil, !resolving, position.isFinite, position >= 0, position < Double(Int.max) else { return }
+        let second = Int(position)
         guard second != savedHistorySecond else { return }
         savedHistorySecond = second
-        saved.source = source?.id ?? ""; saved.episode = String(episodeIndex); saved.position = time
+        saved.source = source?.id ?? ""; saved.episode = String(episodeIndex); saved.position = position
         saved.playbackURL = resolved?.url.absoluteString ?? ""
         library.record(saved)
     }
@@ -488,9 +513,9 @@ public struct DetailView: View {
         if phase == .background {
             recordHistory()
             backgroundPauseTask = Task { @MainActor in
-                // Allow the AVPlayerViewController PiP delegate transition to settle first.
+                // Leave time for a future compatible PiP adapter to update its state.
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard !Task.isCancelled, !playback.isPictureInPicture, !playback.player.isExternalPlaybackActive else { return }
+                guard !Task.isCancelled, !playback.isPictureInPicture else { return }
                 playback.pause(); playing = false
             }
         }
@@ -553,7 +578,7 @@ public struct DetailView: View {
     private func formatTime(_ value: Double) -> String { let seconds = value.isFinite ? Int(max(0, value)) : 0; return String(format: "%02d:%02d", seconds / 60, seconds % 60) }
 }
 
-private enum DetailSheet: String, Identifiable { case settings, composer, danmaku, episodes, downloads, share, dlna, pip; var id: String { rawValue } }
+private enum DetailSheet: String, Identifiable { case settings, composer, danmaku, episodes, downloads, share, dlna, cast, pip; var id: String { rawValue } }
 
 private struct DetailShareSheet: UIViewControllerRepresentable {
     let items: [Any]

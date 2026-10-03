@@ -11,13 +11,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: brew install xcodegen
+      - name: Identify Apple toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          echo "identity=$(xcodebuild -version | shasum -a 256 | cut -c1-16)-$(xcrun --sdk iphoneos --show-sdk-version)" >> "$GITHUB_OUTPUT"
+      - name: Cache pinned official IJK framework and corresponding source
+        id: ijk-cache
+        uses: actions/cache@v4
+        with:
+          path: Vendor
+          key: ijk-device16-arm64-30eb9441945da795079492041a791c121d2b8206-e88b5afbf9ca543a098ede6dd6765ef0e629836d-${{ steps.toolchain.outputs.identity }}-${{ hashFiles('tools/build-ijk.sh', 'LICENSES/IJK.md') }}
+      - name: Build official IJK and FFmpeg from source
+        if: steps.ijk-cache.outputs.cache-hit != 'true'
+        run: bash tools/build-ijk.sh
+      - name: Verify cached device framework
+        shell: bash
+        run: |
+          test "$(xcrun lipo -archs Vendor/IJKMediaFramework.framework/IJKMediaFramework)" = arm64
+          test -f Vendor/IJKMediaFramework.framework/Modules/module.modulemap
+          test -s Vendor/IJK-corresponding-source.tar.gz
       - run: xcodegen generate
       - name: Build iPhone application
-        run: >-
-          xcodebuild -project NiuNiu.xcodeproj -scheme NiuNiu
-          -configuration Release -sdk iphoneos
-          -destination 'generic/platform=iOS'
-          -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+        shell: bash
+        run: |
+          mkdir -p build/ijk-logs
+          set -o pipefail
+          if ! xcodebuild -quiet -project NiuNiu.xcodeproj -scheme NiuNiu \
+            -configuration Release -sdk iphoneos -arch arm64 \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO \
+            ENABLE_BITCODE=NO build > build/ijk-logs/app-build.log 2>&1; then
+            tail -n 100 build/ijk-logs/app-build.log
+            exit 1
+          fi
       - name: Package
         run: |
           mkdir -p package/Payload
@@ -26,6 +54,22 @@ jobs:
           zip -qry ../NiuNiu-unsigned.ipa Payload
           cd ..
           shasum -a 256 NiuNiu-unsigned.ipa > NiuNiu-unsigned.ipa.sha256
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: IJK-build-logs
+          path: build/ijk-logs
+          if-no-files-found: warn
+      - name: Upload LGPL corresponding sources and configuration
+        uses: actions/upload-artifact@v4
+        with:
+          name: IJK-corresponding-source
+          path: |
+            Vendor/IJK-corresponding-source.tar.gz
+            Vendor/IJK-Licenses
+            LICENSES/IJK.md
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: NiuNiu-unsigned

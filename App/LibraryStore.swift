@@ -24,6 +24,12 @@ final class LibraryStore: ObservableObject {
         favorites = load("favorites", fallback: [])
         history = load("history", fallback: [])
         searches = load("searches", fallback: [])
+        // Android p3.a applies incognito cleanup on the next process start.
+        if defaults.bool(forKey: "niuniu.incognito") {
+            clearHistory()
+            clearSearches()
+            APIClient.shared.setTeenMode(true)
+        }
     }
 
     private func load<T: Decodable>(_ key: String, fallback: T) -> T {
@@ -45,7 +51,6 @@ final class LibraryStore: ObservableObject {
     }
 
     func record(_ video: SavedVideo) {
-        guard !defaults.bool(forKey: "niuniu.incognito") else { return }
         var entry = video
         entry.updated = Date()
         history.removeAll { $0.id == video.id }

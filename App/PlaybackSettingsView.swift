@@ -41,6 +41,8 @@ import Combine
 struct PlaybackSettingsView: View {
     @ObservedObject var settings: PlaybackPreferences
     let rateChanged: (Float) -> Void
+    var hardwareDecodeChanged: (Bool) -> Void = { _ in }
+    @AppStorage("niuniu.hardwareDecode") private var hardwareDecode = true
     @State private var brightness = Double(UIScreen.main.brightness)
     @Environment(\.dismiss) private var dismiss
     var body: some View {
@@ -60,7 +62,7 @@ struct PlaybackSettingsView: View {
                     Picker("长按倍速", selection: $settings.holdRate) {
                         ForEach(PlaybackPreferences.holdRates, id: \.self) { Text(String(format: "%g×", $0)).tag($0) }
                     }
-                    Text("长按播放器下方手势区临时加速，松手恢复；不覆盖系统进度条或画中画按钮。")
+                    Text("长按视频画面临时加速，松手恢复；左右竖滑分别调节亮度与音量，横滑调节播放进度。控件和弹幕互动区域独立响应。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("本影片跳过设置（0–300 秒）") {
@@ -82,11 +84,11 @@ struct PlaybackSettingsView: View {
                     if let date = settings.deadline { Text("到时：\(date.formatted(date: .omitted, time: .shortened))；停止前可在 10 秒倒计时中取消。") }
                     if settings.timerMode != 0 { Button("取消定时停止") { settings.cancelTimer() } }
                 }
-                Section {
-                    NavigationLink("硬件解码说明") {
-                        Text("本应用使用系统 AVPlayer。硬件解码由 iOS 按设备能力、媒体编码与系统状态自动决定；应用无法强制切换硬件或软件解码，因此不提供无效的开关。若播放失败，请尝试换源或反馈。")
-                            .padding().navigationTitle("硬件解码")
-                    }
+                Section("IJK 解码") {
+                    Toggle("优先使用硬件解码", isOn: $hardwareDecode)
+                        .onChange(of: hardwareDecode) { hardwareDecodeChanged($0) }
+                    Text("使用 IJK 的 VideoToolbox 硬件解码选项。设置在下次加载影片或重试播放时生效；不支持的媒体能否回退取决于内核和设备。关闭后使用软件解码，可能增加耗电与发热。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }.navigationTitle("播放设置")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }

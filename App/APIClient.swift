@@ -209,8 +209,22 @@ final class APIClient {
         guard !id.isEmpty else { throw APIError.invalidResponse }
         _ = try await categories()
         guard let row = try await payload("detail", ["vod_id": id]) as? [String: Any], row.text("vod_id") == id else { throw APIError.invalidResponse }
-        guard let video = safeVideos([row], contextCategory: knownVideoCategories[id]).first else { throw APIError.unsafeCategory }
+        guard var video = safeVideos([row], contextCategory: knownVideoCategories[id]).first else { throw APIError.unsafeCategory }
+        // Match VideoParser.filterVideoBeanSource: disabled/missing parser entries
+        // must not be offered as selectable playback lines.
+        let config = try await configuration()
+        video.sources.removeAll { !sourceEnabled($0.id, config: config) }
         return video
+    }
+
+    private func sourceEnabled(_ source: String, config: [String: Any]) -> Bool {
+        let special = ["xm3u8": "src1", "hema": "src2", "xiaocao": "src7"]
+        if let key = special[source] ?? threeStepSources[source] {
+            guard let settings = config[key] as? [String: Any] else { return false }
+            return (integer(settings["enable"]) ?? 0) != 0
+        }
+        guard let parser = (config["parser"] as? [[String: Any]] ?? []).first(where: { $0.text("player_id") == source }) else { return false }
+        return (integer(parser["enable"]) ?? 1) == 1
     }
 
     func rank(category: String, order: String) async throws -> [Video] {

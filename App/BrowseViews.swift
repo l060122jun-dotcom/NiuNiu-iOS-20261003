@@ -609,7 +609,9 @@ struct RankingView: View {
                 let parts = value.components(separatedBy: "_")
                 let name = parts.count > 1 ? parts[1] : value
                 let period = ["day": "日榜", "week": "周榜", "month": "月榜"][parts.first ?? ""]
-                return Choice(id: value, title: period.map { "\(name) · \($0)" } ?? name)
+                // Android getRankParams() sends only the first component (day),
+                // not the full UI metadata string day_电影榜_1.
+                return Choice(id: parts.first ?? value, title: period.map { "\(name) · \($0)" } ?? name)
             }
     }
     private var selectedOrder: String { rankChoices.first(where: { $0.id == order })?.id ?? rankChoices.first?.id ?? "" }

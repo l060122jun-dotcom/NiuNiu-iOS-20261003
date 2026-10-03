@@ -8,19 +8,43 @@ settings:
     SWIFT_VERSION: "5.0"
     TARGETED_DEVICE_FAMILY: "1,2"
     MARKETING_VERSION: "1.6.2"
-    CURRENT_PROJECT_VERSION: "1"
+    CURRENT_PROJECT_VERSION: "2"
+    ARCHS: arm64
+    SUPPORTED_PLATFORMS: iphoneos
+    ENABLE_BITCODE: NO
+    CLANG_ENABLE_MODULES: YES
 targets:
   NiuNiu:
     type: application
     platform: iOS
     sources:
       - App
+      - path: Vendor/IJK-Licenses
+        buildPhase: resources
+        type: folder
+    dependencies:
+      - framework: Vendor/IJKMediaFramework.framework
+        embed: true
+        codeSign: false
+      - sdk: libbz2.tbd
+      - sdk: libz.tbd
+      - sdk: Security.framework
+      - sdk: CoreFoundation.framework
+      - sdk: UIKit.framework
+      - sdk: Foundation.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: VideoToolbox.framework
+      - sdk: OpenGLES.framework
+      - sdk: QuartzCore.framework
     info:
       path: Info.plist
       properties:
         CFBundleDisplayName: 牛牛视频
         CFBundleShortVersionString: "1.6.2"
-        CFBundleVersion: "1"
+        CFBundleVersion: "2"
         UILaunchScreen: {}
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true

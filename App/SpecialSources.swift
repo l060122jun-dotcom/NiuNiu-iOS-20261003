@@ -29,6 +29,23 @@ final class SpecialSourceResolver {
     private var hemaClock: [String: Int64] = [:]
     private let transport = SpecialTransport()
 
+    func cacheStatus(source: String, config: [String: Any]) throws -> String {
+        let settings = try SpecialSettings(source: source, config: config)
+        let credentials = SpecialCredentials(namespace: settings.namespace)
+        let hasToken = !(try credentials.get("token") ?? "").isEmpty
+        return hasToken ? "已缓存授权" : "未缓存"
+    }
+
+    func clearCache(source: String, config: [String: Any]) throws {
+        let settings = try SpecialSettings(source: source, config: config)
+        initialization[settings.namespace]?.cancel()
+        initialization.removeValue(forKey: settings.namespace)
+        hemaClock.removeValue(forKey: settings.namespace)
+        let credentials = SpecialCredentials(namespace: settings.namespace)
+        try credentials.remove("token")
+        try credentials.remove("device")
+    }
+
     func resolve(episode: Episode, source: String, config: [String: Any]) async throws -> ResolvedVideo {
         let settings = try SpecialSettings(source: source, config: config)
         let parts = episode.url.components(separatedBy: "@")
@@ -255,6 +272,10 @@ private struct SpecialCredentials {
             status = SecItemAdd(query(key).merging(attributes) { _, new in new } as CFDictionary, nil)
         }
         guard status == errSecSuccess else { throw SpecialSourceError.keychain(status) }
+    }
+    func remove(_ key: String) throws {
+        let status = SecItemDelete(query(key) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw SpecialSourceError.keychain(status) }
     }
 }
 
