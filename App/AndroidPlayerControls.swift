@@ -203,9 +203,14 @@ import MediaPlayer
                 .foregroundStyle(.white).tint(.white)
                 .frame(width: min(280, max(160, geometry.size.width - 24)))
                 .frame(maxHeight: max(80, geometry.size.height - 56))
-                .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 12))
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .shadow(color: .black.opacity(0.4), radius: 8)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 26, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.5)
+                        .allowsHitTesting(false)
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .shadow(color: .black.opacity(0.2), radius: 16, y: 6)
                 .padding(.top, 44).padding(.trailing, 8)
             }
         }

@@ -88,6 +88,7 @@ import UIKit
                                        onDismiss: { locked = false },
                                        onDismantle: dismantleDetail) {
                 FullscreenInsetsReader { insets in playerArea(insets: insets) }
+                    .overlay(alignment: .leading) { edgeBackArea }
                     .preferredColorScheme(.dark).environmentObject(library)
                     .sheet(item: $sheet) { value in sheetContent(value) }
             }
@@ -107,6 +108,7 @@ import UIKit
         }
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
+        .overlay(alignment: .leading) { if !fullScreen { edgeBackArea } }
         .task {
             configureCallbacks()
             playback.restorePictureInPictureUI = {
@@ -151,6 +153,19 @@ import UIKit
                 closeDetail()
             }
         }
+    }
+
+    private var edgeBackArea: some View {
+        Color.clear.frame(width: 22).contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 16, coordinateSpace: .local)
+                .onEnded { value in
+                    guard !locked, value.startLocation.x <= 22,
+                          value.translation.width > 70,
+                          abs(value.translation.width) > abs(value.translation.height) * 1.5 else { return }
+                    if fullScreen { fullScreen = false }
+                    else { closeDetail(); dismiss() }
+                })
+            .accessibilityLabel("从左边缘右滑返回")
     }
 
     private func playerArea(insets: EdgeInsets) -> some View {
