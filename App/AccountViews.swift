@@ -197,7 +197,11 @@ public final class AccountStore: ObservableObject {
         guard !changes.isEmpty else { throw AccountFailure.message("没有需要保存的修改") }
         _ = try await request("profile/update", method: "POST", body: changes)
         if changes["user_pwd"] != nil { try logout() }
-        else { changes.forEach { profile[$0.key] = $0.value } }
+        else {
+            for key in ["user_portrait", "user_nick_name", "user_qq"] {
+                if let value = changes[key] { profile[key] = value }
+            }
+        }
     }
     func updateQuestion(question: String, answer: String) async throws {
         guard !question.isEmpty, !answer.isEmpty else { throw AccountFailure.message("请选择密保问题并填写答案") }
@@ -229,10 +233,11 @@ private final class AccountAction: ObservableObject {
     }
 }
 
+@MainActor
 private struct AccountNotice: ViewModifier {
     @ObservedObject var action: AccountAction
     func body(content: Content) -> some View {
-        content
+        content.disabled(action.busy)
             .overlay { if action.busy { ProgressView().padding(20).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)) } }
             .alert("账号服务", isPresented: Binding(get: { action.notice != nil }, set: { if !$0 { action.notice = nil } })) {
                 Button("知道了", role: .cancel) { action.notice = nil }
@@ -662,6 +667,8 @@ public struct MemberCenterView: View {
                     let expiry = AccountJSON.text(vip, "vip_expire_at")
                     if let value = Double(expiry), value > 0 { LabeledContent("到期时间", value: AccountJSON.time(expiry)) }
                     if let remaining = remaining, remaining >= 0 { LabeledContent("剩余秒数", value: String(remaining)) }
+                    if let adFree = AccountJSON.flag(vip, "vip_ad_free") { LabeledContent("账号免广告权益", value: adFree ? "是" : "否") }
+                    if let canAdFree = AccountJSON.flag(vip, "can_ad_free") { LabeledContent("服务端当前免广告权限", value: canAdFree ? "允许" : "不允许") }
                     Text("显示的是服务器账号权益，不会因无广告客户端而伪造会员身份。")
                         .font(.footnote).foregroundStyle(.secondary)
                 } else { Text("会员状态尚未获取").foregroundStyle(.secondary) }
@@ -707,10 +714,9 @@ public struct MemberCenterView: View {
             if let lastResult = lastResult { Section("服务器确认结果") { Text(lastResult).textSelection(.enabled) } }
             Section { Button("刷新会员 / 积分 / 购买入口") { Task { await load() } }.disabled(action.busy) }
         }.navigationTitle("会员中心").modifier(AccountNotice(action: action))
-            .task { await load() }
-            .onChange(of: account.token) { _ in
-                vip = nil; points = nil; selectedProduct = nil; lastResult = nil
-                Task { await load() }
+            .task(id: account.token) {
+                vip = nil; points = nil; selectedProduct = nil; lastResult = nil; code = ""
+                await load()
             }
             .sheet(item: $web) { AccountWebView(url: $0.url) }
             .confirmationDialog("确认用此卡密兑换到当前账号？", isPresented: $confirmCard, titleVisibility: .visible) {
@@ -786,6 +792,7 @@ private struct AccountRecord: Identifiable {
     let title: String
     let detail: String
     let time: String
+    let timestamp: Double
 }
 
 @MainActor
@@ -809,9 +816,11 @@ private struct AccountRecordsView: View {
             if rows.isEmpty && !action.busy { Text("暂无服务器记录").foregroundStyle(.secondary) }
             if more && account.isLoggedIn { Button("加载更多") { Task { await load(reset: false) } }.disabled(action.busy) }
         }.navigationTitle(kind.title).modifier(AccountNotice(action: action))
-            .task { if account.isLoggedIn { await load(reset: true) } }
+            .task(id: account.token) {
+                rows = []; page = 0; more = true
+                if account.isLoggedIn { await load(reset: true) }
+            }
             .refreshable { await load(reset: true) }
-            .onChange(of: account.token) { _ in rows = []; page = 0; more = true; Task { if account.isLoggedIn { await load(reset: true) } } }
     }
     private func load(reset: Bool) async {
         await action.run {
@@ -823,10 +832,10 @@ private struct AccountRecordsView: View {
                 let list = data["items"] as? [[String: Any]] ?? []
                 items = list.map { item in
                     let code = AccountJSON.text(item, "code")
-                    let masked = code.count > 4 ? "••••" + code.suffix(4) : "••••"
+                    let masked = code.count > 4 ? "••••" + String(code.suffix(4)) : "••••"
                     return AccountRecord(id: "card-" + AccountJSON.text(item, "id"), title: "\(AccountJSON.text(item, "days")) 天会员",
                         detail: "卡密 \(masked)\n\(AccountJSON.text(item, "remark"))\n到期：\(AccountJSON.time(AccountJSON.text(item, "vip_expire_after")))",
-                        time: AccountJSON.time(AccountJSON.text(item, "created_at")))
+                        time: AccountJSON.time(AccountJSON.text(item, "created_at")), timestamp: 0)
                 }
                 let total = AccountJSON.integer(data, "total")
                 more = total.map { next * 20 < $0 } ?? (list.count == 20)
@@ -836,18 +845,21 @@ private struct AccountRecordsView: View {
                 if kind == .points {
                     items += income.map { item in
                         AccountRecord(id: "earn-" + AccountJSON.text(item, "id"), title: "+\(AccountJSON.text(item, "points")) 积分",
-                            detail: AccountJSON.text(item, "remark"), time: AccountJSON.time(AccountJSON.text(item, "created_ts")))
+                            detail: AccountJSON.text(item, "remark"), time: AccountJSON.time(AccountJSON.text(item, "created_ts")),
+                            timestamp: Double(AccountJSON.text(item, "created_ts")) ?? 0)
                     }
                 }
                 items += purchases.map { item in
                     AccountRecord(id: "buy-" + AccountJSON.text(item, "id"), title: AccountJSON.text(item, "product_name"),
                         detail: "支出 \(AccountJSON.text(item, "points_spent")) 积分 · 余额 \(AccountJSON.text(item, "balance_after"))",
-                        time: AccountJSON.time(AccountJSON.text(item, "created_ts")))
+                        time: AccountJSON.time(AccountJSON.text(item, "created_ts")),
+                        timestamp: Double(AccountJSON.text(item, "created_ts")) ?? 0)
                 }
                 more = (kind == .points && income.count == 20) || purchases.count == 20
             }
             if reset { rows = [] }
             for item in items { if !rows.contains(where: { $0.id == item.id }) { rows.append(item) } }
+            if kind != .cards { rows.sort { $0.timestamp > $1.timestamp } }
             page = next
         }
     }
@@ -1168,11 +1180,12 @@ public struct AccountLibraryView: View {
     public init() {}
     private var historyRows: [AccountLibraryRow] { cloud.map { AccountLibraryRow(history: $0) }.filter { !$0.id.isEmpty } }
     public var body: some View {
+        ScrollViewReader { proxy in
         List {
             Section {
                 Picker("账号资料", selection: $historyMode) { Text("账号收藏").tag(false); Text("云历史").tag(true) }.pickerStyle(.segmented).disabled(action.busy)
                 if !account.isLoggedIn { NavigationLink("请先登录账号") { LoginView() } }
-            }
+            }.id("account-library-top")
             if historyMode {
                 Section("手动同步") {
                     Text("云历史下载到独立的账号快照，不覆盖游客本地历史。上传会发送当前本地最近 100 条记录；服务端是否合并由真实接口决定。")
@@ -1212,6 +1225,7 @@ public struct AccountLibraryView: View {
             }
         }.navigationTitle("账号收藏与历史")
             .toolbar {
+                Button("回顶部") { withAnimation { proxy.scrollTo("account-library-top", anchor: .top) } }
                 if !historyMode && account.isLoggedIn { Button(editing ? "完成" : "多选") { editing.toggle(); selected = [] }.disabled(action.busy) }
             }
             .modifier(AccountNotice(action: action))
@@ -1246,6 +1260,7 @@ public struct AccountLibraryView: View {
                     } }
                 }
             }
+        }
     }
     private func libraryRow(_ row: AccountLibraryRow) -> some View {
         HStack(spacing: 12) {
@@ -1314,7 +1329,10 @@ public struct AccountLibraryView: View {
                     row["vod_behind"] = AccountJSON.text(detail, "vod_behind")
                     row["isAdultOnly"] = AccountJSON.text(detail, "vod_behind") == "adult" ? 1 : 0
                 }
-                if !saved.source.isEmpty || !saved.episode.isEmpty {
+                guard !saved.source.isEmpty, !saved.episode.isEmpty else {
+                    throw AccountFailure.message("《\(saved.title)》缺少本地播放线路或集数，无法生成真实云历史，未上传任何条目")
+                }
+                if !saved.source.isEmpty && !saved.episode.isEmpty {
                     let sources = detail["sources"] as? [[String: Any]] ?? []
                     guard let videoSource = sources.first(where: { AccountJSON.text($0, "player_id") == saved.source }),
                           let episodes = videoSource["episodes"] as? [[String: Any]],

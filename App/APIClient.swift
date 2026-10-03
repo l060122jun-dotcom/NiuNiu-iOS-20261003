@@ -1,17 +1,26 @@
 import Foundation
 import UIKit
 
+extension VideoCategory {
+    /// Android MainPageTypeExtendModel.isAdultOnly(): exact server metadata match.
+    var adultOnly: Bool { filters["version"] == "adult" }
+
+    /// UI-compatible constructor without adding stored properties to Models.swift.
+    init(id: String, name: String, filters: [String: String]) {
+        self.init(["type_id": id, "type_name": name, "type_extend": filters])
+    }
+}
+
 enum APIError: LocalizedError {
     case invalidURL, http(Int), business(Int, String), invalidResponse, unsafeCategory
-    case unsupportedSource(String), parserDisabled, parseFailed(String), configurationUnavailable
+    case parserDisabled, parseFailed(String), configurationUnavailable
     var errorDescription: String? {
         switch self {
         case .invalidURL: return "请求地址无效"
         case .http(let code): return "服务器请求失败（HTTP \(code)）；不会绕过访问验证"
         case .business(let code, let message): return message.isEmpty ? "业务请求失败（\(code)）" : message
         case .invalidResponse: return "服务器返回的数据结构无效"
-        case .unsafeCategory: return "该内容不属于当前允许的青少年分类"
-        case .unsupportedSource(let source): return "\(source) 需要专用分段签名与验证流程，当前播放器尚未接入；请切换其他线路"
+        case .unsafeCategory: return "该内容所属分类在青少年模式下不可用"
         case .parserDisabled: return "该播放线路已被服务器停用"
         case .parseFailed(let stage): return "播放地址解析失败：\(stage)"
         case .configurationUnavailable: return "动态播放配置不可用，请稍后重试；不会使用内置密钥或绕过验证"
@@ -28,16 +37,18 @@ final class APIClient {
     private let deviceID: String
     private var token = ""
     private var categoryCache: [VideoCategory]?
-    private var allowedCategories = Set<String>()
-    private var knownSafeVideoIDs = Set<String>()
+    private var adultCategories = Set<String>()
     private var knownVideoCategories: [String: String] = [:]
-    private var approvedEpisodes = Set<String>()
+    private var episodeCategories: [String: Set<String>] = [:]
+    private(set) var isTeenModeEnabled: Bool
     private var runtimeConfig: [String: Any]?
     private var configLoadedAt = Date.distantPast
     private let discoveries = ["https://nnal.oss-cn-beijing.aliyuncs.com/nn.php", "https://nn-1352193558.cos.ap-guangzhou.myqcloud.com/nn.php"]
     private let threeStepSources = ["pp": "src3", "madou": "src4", "douban": "src5", "juzi": "src6", "shanju": "src8", "ningmeng": "src9", "shizi": "src10", "paopao": "src11", "leidian": "src12"]
 
     private init() {
+        let defaults = UserDefaults.standard
+        isTeenModeEnabled = defaults.object(forKey: "api.teenMode") as? Bool ?? true
         let saved = defaults.string(forKey: "api.baseURL") ?? "https://nn.123xiangshang.com:35620/"
         baseURL = URL(string: saved) ?? URL(string: "https://nn.123xiangshang.com:35620/")!
         if let stored = defaults.string(forKey: "api.deviceUUID"), UUID(uuidString: stored) != nil {
@@ -58,14 +69,22 @@ final class APIClient {
         token = value
         runtimeConfig = nil
         categoryCache = nil
-        allowedCategories = []
-        knownSafeVideoIDs = []
+        adultCategories = []
         knownVideoCategories = [:]
-        approvedEpisodes = []
+        episodeCategories = [:]
+    }
+
+    /// Source-equivalent mode state, without adding a UI control. Default is enabled.
+    func setTeenMode(_ enabled: Bool) {
+        guard isTeenModeEnabled != enabled else { return }
+        isTeenModeEnabled = enabled
+        defaults.set(enabled, forKey: "api.teenMode")
+        runtimeConfig = nil
+        categoryCache = nil
     }
 
     private var protocolHeaders: [String: String] {
-        ["p": "android", "pkg": "com.qingbian.jz", "v": "1.6.2", "y": "1", "d": deviceID,
+        ["p": "android", "pkg": "com.qingbian.jz", "v": "1.6.2", "y": isTeenModeEnabled ? "1" : "0", "d": deviceID,
          "t": token, "product": UIDevice.current.model, "os": UIDevice.current.systemVersion]
     }
 
@@ -113,40 +132,43 @@ final class APIClient {
     func categories() async throws -> [VideoCategory] {
         if let categoryCache = categoryCache { return categoryCache }
         guard let rows = try await payload("types") as? [[String: Any]] else { throw APIError.invalidResponse }
-        let names: Set<String> = ["电影", "电影片", "剧集", "电视剧", "连续剧", "综艺", "综艺片", "动漫", "动画", "动漫片", "短剧", "短剧片", "AI短剧", "直播", "电视直播"]
-        var seen = Set<String>()
-        let safe = rows.filter {
-            names.contains($0.text("type_name")) && ($0["type_extend"] as? [String: Any])?.text("version") != "adult"
-        }.map { row -> VideoCategory in
-            var category = VideoCategory(row)
-            if category.name == "AI短剧" { category.name = "短剧" }
-            return category
-        }.filter { !$0.id.isEmpty && seen.insert($0.id).inserted }
-        allowedCategories = Set(safe.map(\.id))
-        categoryCache = safe
-        return safe
+        // Preserve every server row, name and ordering. Visibility is a separate mode policy.
+        let catalog = rows.map { row in
+            var row = row
+            if let extend = row["type_extend"] as? [String: Any] {
+                row["type_extend"] = extend.reduce(into: [String: String]()) { result, item in
+                    result[item.key] = extend.text(item.key)
+                }
+            }
+            return VideoCategory(row)
+        }
+        adultCategories = Set(catalog.filter(\.adultOnly).map(\.id))
+        categoryCache = catalog
+        return catalog
     }
 
-    private func requireCategory(_ category: String) async throws {
-        _ = try await categories()
-        guard allowedCategories.contains(category) else { throw APIError.unsafeCategory }
+    private func acceptsCategory(_ category: String?) -> Bool {
+        guard isTeenModeEnabled, let category = category, !category.isEmpty else { return true }
+        return !adultCategories.contains(category)
     }
 
     private func safeVideos(_ rows: [[String: Any]], contextCategory: String? = nil) -> [Video] {
-        // /list and /main cards omit type_id. Trust only the already-approved request/block
-        // category; explicit unknown or adult categories are still rejected.
-        rows.filter {
-            let category = $0.text("type_id")
-            return allowedCategories.contains(category.isEmpty ? (contextCategory ?? "") : category)
-        }.map { row in
+        // No content/name whitelist. Missing or unknown classification is retained, like
+        // the source; only explicit adult metadata is excluded when teen mode is enabled.
+        rows.compactMap { row in
             var row = row
-            if row.text("type_id").isEmpty, let contextCategory = contextCategory { row["type_id"] = contextCategory }
+            let videoID = row.text("vod_id")
+            let fallback = contextCategory.flatMap { $0.isEmpty ? nil : $0 } ?? knownVideoCategories[videoID]
+            if row.text("type_id").isEmpty, let fallback = fallback { row["type_id"] = fallback }
+            let category = row.text("type_id")
             let video = Video(row)
-            knownSafeVideoIDs.insert(video.id)
-            knownVideoCategories[video.id] = row.text("type_id")
+            if !category.isEmpty { knownVideoCategories[video.id] = category }
             for source in video.sources {
-                for episode in source.episodes { approvedEpisodes.insert(source.id + "|" + episode.id) }
+                for episode in source.episodes where !category.isEmpty {
+                    episodeCategories[source.id + "|" + episode.id, default: []].insert(category)
+                }
             }
+            guard acceptsCategory(contextCategory), acceptsCategory(category) else { return nil }
             return video
         }
     }
@@ -154,7 +176,7 @@ final class APIClient {
     func recommendations() async throws -> [Recommendation] {
         _ = try await categories()
         guard let rows = try await payload("main") as? [[String: Any]] else { throw APIError.invalidResponse }
-        return rows.filter { allowedCategories.contains($0.text("type_id")) }.map {
+        return rows.filter { acceptsCategory($0.text("type_id")) }.map {
             Recommendation(id: $0.text("type_id"), title: $0.text("title"), videos: safeVideos($0["list"] as? [[String: Any]] ?? [], contextCategory: $0.text("type_id")))
         }
     }
@@ -169,7 +191,8 @@ final class APIClient {
     }
 
     func videos(category: String, page: Int = 1, filters: [String: String] = [:]) async throws -> [Video] {
-        try await requireCategory(category)
+        _ = try await categories()
+        if !acceptsCategory(category) { return [] }
         let params = ["class": filters["class"] ?? "", "order": listOrder(filters["by"] ?? filters["order"] ?? "time"),
                       "type_id": category, "area": filters["area"] ?? "", "year": filters["year"] ?? "",
                       "state": filters["state"] ?? "", "wd": filters["wd"] ?? "", "page": String(max(1, page))]
@@ -178,22 +201,12 @@ final class APIClient {
     }
 
     func search(query: String, category: String, page: Int = 1) async throws -> [Video] {
-        if !category.isEmpty { return try await videos(category: category, page: page, filters: ["wd": query]) }
-        // Global search = one scoped page per allowed family (at most six requests),
-        // aggregated in catalog order and deduplicated. Ten aggregate pages maximum.
-        guard page <= 10 else { return [] }
-        let catalog = try await categories()
-        var result: [Video] = []
-        var seen = Set<String>()
-        for category in catalog.prefix(6) {
-            try Task.checkCancellation()
-            let rows = try await videos(category: category.id, page: page, filters: ["wd": query])
-            result += rows.filter { seen.insert($0.id).inserted }
-        }
-        return result
+        // Empty type_id requests the source's global search: one request per page.
+        try await videos(category: category, page: page, filters: ["wd": query])
     }
 
     func detail(id: String) async throws -> Video {
+        guard !id.isEmpty else { throw APIError.invalidResponse }
         _ = try await categories()
         guard let row = try await payload("detail", ["vod_id": id]) as? [String: Any], row.text("vod_id") == id else { throw APIError.invalidResponse }
         guard let video = safeVideos([row], contextCategory: knownVideoCategories[id]).first else { throw APIError.unsafeCategory }
@@ -201,7 +214,9 @@ final class APIClient {
     }
 
     func rank(category: String, order: String) async throws -> [Video] {
-        try await requireCategory(category)
+        guard !category.isEmpty else { throw APIError.invalidResponse }
+        _ = try await categories()
+        if !acceptsCategory(category) { return [] }
         guard let rows = try await payload("rank", ["type_id": category, "order": order]) as? [[String: Any]] else { throw APIError.invalidResponse }
         return safeVideos(rows, contextCategory: category)
     }
@@ -212,25 +227,11 @@ final class APIClient {
     }
 
     func related(id: String) async throws -> [Video] {
-        if !knownSafeVideoIDs.contains(id) { _ = try await detail(id: id) }
+        guard !id.isEmpty else { throw APIError.invalidResponse }
+        _ = try await categories()
+        if !acceptsCategory(knownVideoCategories[id]) { return [] }
         guard let rows = try await payload("recommend", ["vod_id": id]) as? [[String: Any]] else { throw APIError.invalidResponse }
-        return try await verifiedUnscopedVideos(rows)
-    }
-
-    private func verifiedUnscopedVideos(_ rows: [[String: Any]]) async throws -> [Video] {
-        var result: [Video] = []
-        for row in rows {
-            try Task.checkCancellation()
-            if !row.text("type_id").isEmpty {
-                result += safeVideos([row])
-            } else if knownSafeVideoIDs.contains(row.text("vod_id")) {
-                result += safeVideos([row], contextCategory: knownVideoCategories[row.text("vod_id")])
-            } else if !row.text("vod_id").isEmpty {
-                do { result.append(try await detail(id: row.text("vod_id"))) }
-                catch APIError.unsafeCategory { continue }
-            }
-        }
-        return result
+        return safeVideos(rows)
     }
 
     /// No bundled fallback: sensitive configuration remains in memory and comes only from /config.
@@ -243,8 +244,10 @@ final class APIClient {
     }
 
     func resolve(episode: Episode, source: String) async throws -> ResolvedVideo {
-        guard approvedEpisodes.contains(source + "|" + episode.id) else { throw APIError.unsafeCategory }
         guard !episode.url.isEmpty else { throw APIError.parseFailed("原始地址为空") }
+        _ = try await categories()
+        let contexts = episodeCategories[source + "|" + episode.id] ?? []
+        if !contexts.isEmpty && !contexts.contains(where: { acceptsCategory($0) }) { throw APIError.unsafeCategory }
         let config = try await configuration()
         if ["xm3u8", "hema", "xiaocao"].contains(source) {
             return try await SpecialSourceResolver.shared.resolve(episode: episode, source: source, config: config)
