@@ -34,21 +34,15 @@ private struct BrowsePressStyle: ButtonStyle {
 
 private struct BrowseScroll<Content: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Binding private var position: SearchScrollPosition?
-    @Binding private var restoreOnReturn: Bool
-    @State private var tracking = false
-    @State private var lastResetKey: String?
     private let resetKey: String
+    private let resetRevision: Int
     private let content: Content
-    init(position: Binding<SearchScrollPosition?> = .constant(nil),
-         restoreOnReturn: Binding<Bool> = .constant(false), resetKey: String = "", @ViewBuilder content: () -> Content) {
-        _position = position
-        _restoreOnReturn = restoreOnReturn
+    init(resetKey: String = "", resetRevision: Int = 0, @ViewBuilder content: () -> Content) {
         self.resetKey = resetKey
+        self.resetRevision = resetRevision
         self.content = content()
     }
     var body: some View {
-        GeometryReader { viewport in
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(spacing: 0) {
@@ -65,63 +59,18 @@ private struct BrowseScroll<Content: View>: View {
                     }.buttonStyle(BrowsePressStyle()).padding(.vertical, 20)
                 }
             }
-            .coordinateSpace(name: "browse.results")
-            .onPreferenceChange(BrowseVideoFramesKey.self) { frames in
-                guard tracking else { return }
-                let visible = frames.filter { $0.value.maxY > 0 && $0.value.minY < viewport.size.height }
-                guard let first = visible.sorted(by: {
-                    $0.value.minY == $1.value.minY ? $0.key < $1.key : $0.value.minY < $1.value.minY
-                }).first else { return }
-                position = SearchScrollPosition(videoID: first.key, minY: first.value.minY, height: first.value.height)
-            }
-            .task(id: resetKey) {
-                tracking = false
-                if let previous = lastResetKey, previous != resetKey {
-                    position = nil
-                    restoreOnReturn = false
-                }
-                lastResetKey = resetKey
-                if restoreOnReturn, let saved = position {
-                    await Task.yield()
-                    guard !Task.isCancelled else { return }
-                    let available = viewport.size.height - saved.height
-                    proxy.scrollTo(saved.videoID, anchor: UnitPoint(x: 0, y: available > 0 ? saved.minY / available : 0))
-                } else if position == nil {
-                    await Task.yield()
-                    guard !Task.isCancelled else { return }
-                    proxy.scrollTo("browse.top", anchor: .top)
-                }
-                restoreOnReturn = false
-                tracking = true
-            }
-            .onChange(of: position?.videoID) { id in
-                if id == nil { proxy.scrollTo("browse.top", anchor: .top) }
-            }
-            .onDisappear {
-                tracking = false
-                restoreOnReturn = position != nil
-            }
+            // Push/pop keeps this ScrollView's identity. Never issue a scroll command
+            // from task/onAppear: a retained scroll already owns its real offset.
+            .onChange(of: resetKey) { _ in proxy.scrollTo("browse.top", anchor: .top) }
+            .onChange(of: resetRevision) { _ in proxy.scrollTo("browse.top", anchor: .top) }
         }
-        }
-    }
-}
-
-private struct BrowseVideoFramesKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 
 private struct BrowseAnchor: ViewModifier {
     let id: String
     func body(content: Content) -> some View {
-        content.id(id).background {
-            GeometryReader { geometry in
-                Color.clear.preference(key: BrowseVideoFramesKey.self,
-                                       value: [id: geometry.frame(in: .named("browse.results"))])
-            }
-        }
+        content.id(id)
     }
 }
 
@@ -289,11 +238,9 @@ struct MainTabView: View {
                 .tabItem { Label("我", image: "MainTabMe") }.tag(2)
                 .badge(unreadBadge)
         }
-        .tint(BrowseTheme.green)
+        .tint(BrowseTheme.accent)
         .background(BrowseTheme.background)
-        .background(MainTabAppearance(capsule: capsuleStyle, dark: colorScheme == .dark))
-        .toolbarBackground(capsuleStyle ? MainTabAppearance.trackColor : BrowseTheme.surface, for: .tabBar)
-        .toolbarBackground(.visible, for: .tabBar)
+        .background(MainTabAppearance(capsule: capsuleStyle, dark: colorScheme == .dark, selection: selection))
         .task {
             if let config = try? await APIClient.shared.configuration() {
                 capsuleStyle = MainTabAppearance.integer(config["tab_style"]) == 1
@@ -322,11 +269,12 @@ struct MainTabView: View {
     }
 }
 
-/// Public UITabBarAppearance only; no overlay, private subview lookup, or forced
-/// tab-bar visibility/height. Native safe-area and navigation remain authoritative.
+/// Public UITabBarAppearance and an owned, noninteractive decoration beneath items.
+/// Native safe-area, tab hit targets and navigation visibility remain authoritative.
 private struct MainTabAppearance: UIViewControllerRepresentable {
     let capsule: Bool
     let dark: Bool
+    let selection: Int
     static let trackColor = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
             ? UIColor(white: 30.0 / 255, alpha: 239.0 / 255)
@@ -343,17 +291,34 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: Controller, context: Context) {
         controller.capsule = capsule
         controller.dark = dark
+        controller.selection = selection
         controller.applyAppearance()
     }
 
     final class Controller: UIViewController {
         var capsule = false
         var dark = false
+        var selection = 0
         private var appliedKey = ""
+        private let decoration = LiquidTabIndicatorView()
+        private var accessibilityObservers: [NSObjectProtocol] = []
         override func loadView() {
             view = UIView()
             view.isUserInteractionEnabled = false
             view.backgroundColor = .clear
+            for name in [UIAccessibility.reduceMotionStatusDidChangeNotification,
+                         UIAccessibility.reduceTransparencyStatusDidChangeNotification] {
+                accessibilityObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    self?.appliedKey = ""
+                    self?.applyAppearance()
+                })
+            }
+        }
+        deinit { accessibilityObservers.forEach { NotificationCenter.default.removeObserver($0) } }
+        override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+            super.traitCollectionDidChange(previousTraitCollection)
+            appliedKey = ""
+            applyAppearance()
         }
         override func didMove(toParent parent: UIViewController?) {
             super.didMove(toParent: parent)
@@ -370,32 +335,29 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
 
         func applyAppearance() {
             guard let bar = containingTabController()?.tabBar, bar.bounds.width > 0 else { return }
-            let key = "\(capsule)|\(dark)|\(bar.bounds.width)|\(bar.items?.count ?? 0)"
+            if decoration.superview !== bar {
+                decoration.removeFromSuperview()
+                bar.addSubview(decoration)
+            }
+            // Public insertion only; no private background/item view lookup.
+            bar.layer.insertSublayer(decoration.layer, at: 1)
+            decoration.frame = bar.bounds
+            decoration.update(selection: selection, count: bar.items?.count ?? 3,
+                              dark: dark, enabled: true, bottomInset: bar.safeAreaInsets.bottom)
+            let key = "\(capsule)|\(dark)|\(bar.bounds)|\(bar.items?.count ?? 0)|\(UIAccessibility.isReduceTransparencyEnabled)"
             guard key != appliedKey else { return }
             appliedKey = key
             let appearance = UITabBarAppearance()
-            appearance.configureWithOpaqueBackground()
-            appearance.backgroundColor = capsule
-                ? (dark ? UIColor(white: 30.0 / 255, alpha: 239.0 / 255)
-                    : UIColor(red: 239.0 / 255, green: 239.0 / 255, blue: 244.0 / 255, alpha: 239.0 / 255))
-                : UIColor { traits in
-                    traits.userInterfaceStyle == .dark
-                        ? UIColor(red: 0.105, green: 0.125, blue: 0.110, alpha: 1)
-                        : UIColor(red: 1, green: 0.995, blue: 0.980, alpha: 1)
-                }.resolvedColor(with: UITraitCollection(userInterfaceStyle: dark ? .dark : .light))
-            if capsule {
-                appearance.shadowColor = .clear
-                let size = CGSize(width: max(1, bar.bounds.width / CGFloat(max(3, bar.items?.count ?? 3)) - 8), height: 42)
-                appearance.selectionIndicatorImage = UIGraphicsImageRenderer(size: size).image { context in
-                    let fill = dark ? UIColor(red: 90.0 / 255, green: 90.0 / 255, blue: 96.0 / 255, alpha: 242.0 / 255)
-                        : UIColor(white: 1, alpha: 242.0 / 255)
-                    context.cgContext.setFillColor(fill.cgColor)
-                    UIBezierPath(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 21).fill()
-                }
-            }
-            let green = UIColor(red: 151.0 / 255, green: 211.0 / 255, blue: 39.0 / 255, alpha: 1)
-            let inactive = capsule ? UIColor(white: dark ? 161.0 / 255 : 147.0 / 255, alpha: 1)
-                : UIColor(white: dark ? 82.0 / 255 : 217.0 / 255, alpha: 1)
+            appearance.configureWithTransparentBackground()
+            appearance.backgroundEffect = UIAccessibility.isReduceTransparencyEnabled ? nil : UIBlurEffect(style: .systemMaterial)
+            appearance.backgroundColor = dark
+                ? UIColor(red: 0.105, green: 0.125, blue: 0.110, alpha: UIAccessibility.isReduceTransparencyEnabled ? 1 : 0.32)
+                : UIColor(red: 1, green: 0.995, blue: 0.980, alpha: UIAccessibility.isReduceTransparencyEnabled ? 1 : 0.30)
+            appearance.shadowColor = .clear
+            appearance.selectionIndicatorImage = nil
+            let green = dark ? UIColor(red: 151.0 / 255, green: 211.0 / 255, blue: 39.0 / 255, alpha: 1)
+                : UIColor(red: 0.23, green: 0.38, blue: 0.04, alpha: 1)
+            let inactive = UIColor(white: dark ? 0.72 : 0.38, alpha: 1)
             for item in [appearance.stackedLayoutAppearance, appearance.inlineLayoutAppearance, appearance.compactInlineLayoutAppearance] {
                 item.normal.iconColor = inactive
                 item.selected.iconColor = green
@@ -407,6 +369,7 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
             bar.itemPositioning = .fill
             bar.standardAppearance = appearance
             bar.scrollEdgeAppearance = appearance
+            bar.layer.insertSublayer(decoration.layer, at: 1)
         }
 
         private func containingTabController() -> UITabBarController? {
@@ -465,6 +428,13 @@ private struct Choice: Identifiable {
 
 private struct ChoiceStrip: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Namespace private var indicatorNamespace
+    @State private var bounds: [String: CGRect] = [:]
+    @State private var motionStart = Date.distantPast
+    @State private var motionDistance: CGFloat = 0
+    @State private var moving = false
+    @State private var motionEpoch = UUID()
     let title: String?
     let choices: [Choice]
     @Binding var selection: String
@@ -478,20 +448,71 @@ private struct ChoiceStrip: View {
                 HStack(spacing: 8) {
                     ForEach(choices) { choice in
                         Button {
-                            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { selection = choice.id }
+                            selection = choice.id
                         } label: {
                             Text(choice.title)
-                                .font(.subheadline.weight(selection == choice.id ? .semibold : .regular))
+                                // Stable metrics: selected weight must not move the measured targets.
+                                .font(.subheadline.weight(.medium))
                                 .padding(.horizontal, 13).frame(minHeight: 44)
-                                .foregroundStyle(selection == choice.id ? Color.black : Color.primary)
-                                .background(selection == choice.id ? BrowseTheme.green : Color.clear, in: Capsule())
+                                .foregroundStyle(selection == choice.id ? BrowseTheme.accent : Color.primary)
+                                .contentShape(Capsule())
+                                .background {
+                                    GeometryReader { proxy in
+                                        Color.clear.preference(key: ChoiceBoundsPreference.self,
+                                            value: [choice.id: proxy.frame(in: .named(indicatorNamespace))])
+                                    }
+                                }
+                                .background {
+                                    if selection == choice.id {
+                                        if reduceMotion {
+                                            LiquidChoiceCapsule(start: .distantPast, distance: 0, moving: false)
+                                                .transition(.opacity)
+                                        } else {
+                                            LiquidChoiceCapsule(start: motionStart, distance: motionDistance, moving: moving)
+                                                .matchedGeometryEffect(id: "selection", in: indicatorNamespace)
+                                        }
+                                    }
+                                }
                         }.buttonStyle(BrowsePressStyle())
                             .accessibilityAddTraits(selection == choice.id ? .isSelected : [])
                     }
-                }.padding(.horizontal, 8)
+                }
+                .coordinateSpace(name: indicatorNamespace)
+                .onPreferenceChange(ChoiceBoundsPreference.self) {
+                    bounds = $0
+                    if !moving { lastSelectedCenter = $0[selection]?.midX ?? lastSelectedCenter }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .animation(reduceMotion ? .easeInOut(duration: 0.18) : .easeOut(duration: LiquidSelectionMotion.duration * LiquidSelectionMotion.travelEnd), value: selection)
+                .onChange(of: selection) { newValue in
+                    let target = bounds[newValue]
+                    motionDistance = (target?.midX ?? 0) - lastSelectedCenter
+                    lastSelectedCenter = target?.midX ?? lastSelectedCenter
+                    motionStart = Date()
+                    motionEpoch = UUID()
+                    moving = !reduceMotion && abs(motionDistance) > 0.5
+                }
+                .onAppear { lastSelectedCenter = bounds[selection]?.midX ?? 0 }
+                .task(id: motionEpoch) {
+                    let epoch = motionEpoch
+                    guard moving else { return }
+                    do { try await Task.sleep(nanoseconds: UInt64(LiquidSelectionMotion.duration * 1_000_000_000)) }
+                    catch { return }
+                    guard !Task.isCancelled, epoch == motionEpoch else { return }
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) { moving = false }
+                }
+                .onChange(of: reduceMotion) { if $0 { motionEpoch = UUID(); moving = false } }
             }
         }
+        .background {
+            if reduceTransparency { Capsule().fill(BrowseTheme.surface) }
+            else { Capsule().fill(.ultraThinMaterial) }
+        }
     }
+    @State private var lastSelectedCenter: CGFloat = 0
 }
 
 private struct BrowseMessage: View {
@@ -567,9 +588,22 @@ private struct VideoGrid: View {
     let columns: Int
     var anchorPrefix = "video."
     var body: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: columns), spacing: 18) {
-            ForEach(videos) { video in
-                VideoTile(video: video).modifier(BrowseAnchor(id: anchorPrefix + video.id))
+        // Eager rows have actual heights, not lazy offscreen estimates that change
+        // when the navigation destination detaches and reattaches the viewport.
+        VStack(spacing: 18) {
+            ForEach(0..<((videos.count + columns - 1) / columns), id: \.self) { row in
+                HStack(alignment: .top, spacing: 10) {
+                    ForEach(0..<columns, id: \.self) { column in
+                        let index = row * columns + column
+                        if index < videos.count {
+                            VideoTile(video: videos[index])
+                                .modifier(BrowseAnchor(id: anchorPrefix + videos[index].id))
+                                .frame(maxWidth: .infinity)
+                        } else {
+                            Color.clear.frame(maxWidth: .infinity).frame(height: 0)
+                        }
+                    }
+                }
             }
         }.padding(.horizontal)
     }
@@ -631,28 +665,14 @@ private struct SearchFooterFrameKey: PreferenceKey {
     static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) { value = nextValue() ?? value }
 }
 
-private struct SearchVideoFramesKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
-private struct SearchScrollPosition {
-    let videoID: String
-    let minY: CGFloat
-    let height: CGFloat
-}
-
-/// iOS 16 has no scrollPosition. Stable row IDs plus their viewport geometry
-/// preserve the partially clipped top row, without inspecting private UIKit views.
+/// Let the retained native scroll own its offset; only a changed query or an
+/// explicit refresh resets it. Visibility geometry is used solely for pagination.
 @MainActor
 private struct SearchResultsScroll: View {
     @ObservedObject var store: VideoPageStore
     let query: String
-    @Binding var position: SearchScrollPosition?
-    @Binding var restoreOnReturn: Bool
-    let rememberOnDisappear: () -> Bool
+    let resetKey: String
+    let resetRevision: Int
     let load: () -> Void
     let refresh: () async -> Void
     @State private var tracking = false
@@ -666,17 +686,7 @@ private struct SearchResultsScroll: View {
                         Color.clear.frame(height: 1).id("search.top")
                         Text("“\(query)”的搜索结果").font(.footnote).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
-                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3), spacing: 18) {
-                            ForEach(store.videos) { video in
-                                VideoTile(video: video).id(video.id)
-                                    .background {
-                                        GeometryReader { geometry in
-                                            Color.clear.preference(key: SearchVideoFramesKey.self,
-                                                value: [video.id: geometry.frame(in: .named("search.results"))])
-                                        }
-                                    }
-                            }
-                        }.padding(.horizontal)
+                        VideoGrid(videos: store.videos, columns: 3)
                         PagingFooter(store: store, automatic: true, viewportHeight: viewport.size.height,
                                      automaticEnabled: tracking, load: load)
                         Button {
@@ -692,32 +702,10 @@ private struct SearchResultsScroll: View {
                 }
                 .coordinateSpace(name: "search.results")
                 .refreshable { await refresh() }
-                .onPreferenceChange(SearchVideoFramesKey.self) { frames in
-                    guard tracking else { return }
-                    let visible = frames.filter { $0.value.maxY > 0 && $0.value.minY < viewport.size.height }
-                    guard let first = visible.sorted(by: {
-                        $0.value.minY == $1.value.minY ? $0.key < $1.key : $0.value.minY < $1.value.minY
-                    }).first else { return }
-                    position = SearchScrollPosition(videoID: first.key, minY: first.value.minY,
-                                                    height: first.value.height)
-                }
-                .task {
-                    if restoreOnReturn, let saved = position,
-                       store.videos.contains(where: { $0.id == saved.videoID }) {
-                        // Allow the retained grid to lay out before a single restoration.
-                        await Task.yield()
-                        guard !Task.isCancelled else { return }
-                        let available = viewport.size.height - saved.height
-                        let y = available > 0 ? saved.minY / available : 0
-                        proxy.scrollTo(saved.videoID, anchor: UnitPoint(x: 0, y: y))
-                    }
-                    restoreOnReturn = false
-                    tracking = true
-                }
-                .onDisappear {
-                    tracking = false
-                    if rememberOnDisappear() { restoreOnReturn = position != nil }
-                }
+                .onChange(of: resetKey) { _ in proxy.scrollTo("search.top", anchor: .top) }
+                .onChange(of: resetRevision) { _ in proxy.scrollTo("search.top", anchor: .top) }
+                .onAppear { tracking = true }
+                .onDisappear { tracking = false }
             }
         }
     }
@@ -758,7 +746,8 @@ struct HomeView: View {
             }
         }
         .background(BrowseTheme.background)
-        .navigationTitle("牛牛视频").navigationBarTitleDisplayMode(.large)
+        .navigationTitle("牛牛视频").navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
         .toolbarBackground(BrowseTheme.background, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -799,15 +788,14 @@ private struct RecommendationsView: View {
     @State private var visibleGroups = 4
     @State private var lastRequestKey: String?
     @State private var completed = false
-    @State private var scrollPosition: SearchScrollPosition?
-    @State private var restoreOnReturn = false
+    @State private var scrollResetRevision = 0
     private var requestKey: String {
         "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|" + catalog.categories.map(\.id).joined(separator: "|")
     }
 
     var body: some View {
-        BrowseScroll(position: $scrollPosition, restoreOnReturn: $restoreOnReturn, resetKey: requestKey) {
-            LazyVStack(alignment: .leading, spacing: 22) {
+        BrowseScroll(resetKey: requestKey, resetRevision: scrollResetRevision) {
+            VStack(alignment: .leading, spacing: 22) {
                 if lastRequestKey == requestKey, let video = blocks.first?.videos.first {
                     NavigationLink { DetailView(videoID: video.id) } label: {
                         HStack(spacing: 18) {
@@ -865,8 +853,6 @@ private struct RecommendationsView: View {
                 blocks = []
                 visibleGroups = 4
                 completed = false
-                scrollPosition = nil
-                restoreOnReturn = false
                 error = nil
             }
             while loading {
@@ -876,8 +862,7 @@ private struct RecommendationsView: View {
             await load()
         }
         .refreshable {
-            scrollPosition = nil
-            restoreOnReturn = false
+            scrollResetRevision += 1
             visibleGroups = 4
             await load()
         }
@@ -920,8 +905,7 @@ struct CategoryVideosView: View {
     @AppStorage("niuniu.gridColumns") private var columnCount = 3
     @State private var showFilters = false
     @State private var lastRequestKey: String?
-    @State private var scrollPosition: SearchScrollPosition?
-    @State private var restoreOnReturn = false
+    @State private var scrollResetRevision = 0
 
     private var requestKey: String {
         "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|" + category.id + filters.keys.sorted().map { "|\($0)=\(filters[$0] ?? "")" }.joined()
@@ -940,7 +924,7 @@ struct CategoryVideosView: View {
     }
 
     var body: some View {
-        BrowseScroll(position: $scrollPosition, restoreOnReturn: $restoreOnReturn, resetKey: requestKey) {
+        BrowseScroll(resetKey: requestKey, resetRevision: scrollResetRevision) {
             VStack(spacing: 12) {
                 ChoiceStrip(title: "排序", choices: [Choice(id: "time", title: "最新"), Choice(id: "hits", title: "最热"), Choice(id: "score", title: "评分")], selection: binding("by"))
                     .padding(.horizontal, 8)
@@ -975,8 +959,13 @@ struct CategoryVideosView: View {
                 await load(reset: false)
             }
         }
-        .refreshable { await load(reset: true) }
+        .refreshable {
+            scrollResetRevision += 1
+            await load(reset: true)
+        }
         .background(BrowseTheme.background)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
         .sheet(isPresented: $showFilters) {
             NavigationStack {
                 ScrollView {
@@ -1002,7 +991,6 @@ struct CategoryVideosView: View {
 
     private func load(reset: Bool) async {
         guard reset || lastRequestKey == requestKey else { return }
-        if reset { scrollPosition = nil; restoreOnReturn = false }
         await store.load(reset: reset, category: category.id, filters: filters.filter { !$0.value.isEmpty })
     }
 }
@@ -1015,8 +1003,7 @@ struct RankingView: View {
     @State private var categoryID = ""
     @State private var order = ""
     @State private var lastRequestKey: String?
-    @State private var scrollPosition: SearchScrollPosition?
-    @State private var restoreOnReturn = false
+    @State private var scrollResetRevision = 0
     private var requestKey: String {
         "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|\(selectedID)|\(selectedOrder)"
     }
@@ -1047,8 +1034,8 @@ struct RankingView: View {
             ChoiceStrip(title: "榜单", choices: rankChoices,
                         selection: Binding(get: { selectedOrder }, set: { order = $0 }))
                 .padding(.horizontal).padding(.bottom, 8)
-             BrowseScroll(position: $scrollPosition, restoreOnReturn: $restoreOnReturn, resetKey: requestKey) {
-                 LazyVStack(spacing: 14) {
+             BrowseScroll(resetKey: requestKey, resetRevision: scrollResetRevision) {
+                 VStack(spacing: 14) {
                      HStack(alignment: .bottom) {
                          VStack(alignment: .leading, spacing: 6) {
                              Text("THE WATCH LIST").font(.caption2.bold()).tracking(2).foregroundStyle(BrowseTheme.accent)
@@ -1097,10 +1084,14 @@ struct RankingView: View {
                         }
                     }
                 }.padding()
-            }.refreshable { await load() }
+            }.refreshable {
+                scrollResetRevision += 1
+                await load()
+            }
         }
         .background(BrowseTheme.background)
-        .navigationTitle("榜单").navigationBarTitleDisplayMode(.large)
+        .navigationTitle("榜单").navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
         .toolbarBackground(BrowseTheme.background, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .task(id: requestKey) {
@@ -1118,8 +1109,6 @@ struct RankingView: View {
     }
 
     private func load() async {
-        scrollPosition = nil
-        restoreOnReturn = false
         await store.loadRank(category: selectedID, order: selectedOrder)
     }
 }
@@ -1135,8 +1124,7 @@ struct SearchView: View {
     @State private var categoryID = ""
     @State private var submission = 0
     @State private var requestKey: String?
-    @State private var scrollPosition: SearchScrollPosition?
-    @State private var restoreOnReturn = false
+    @State private var scrollResetRevision = 0
     @State private var suggestions: [String] = []
     @State private var hotWords: [String] = []
     @State private var suggestLoading = false
@@ -1241,28 +1229,27 @@ struct SearchView: View {
                     }.padding()
                 }
             } else {
-                let identity = searchRequestKey
                 ChoiceStrip(title: nil, choices: [Choice(id: "", title: "全部")] + catalog.categories.map { Choice(id: $0.id, title: BrowseCatalog.family($0.name) ?? $0.name) }, selection: Binding(get: { selectedID }, set: { categoryID = $0 }))
                     .padding(.vertical, 8)
-                SearchResultsScroll(store: store, query: submitted, position: $scrollPosition,
-                                    restoreOnReturn: $restoreOnReturn,
-                                    rememberOnDisappear: { searchRequestKey == identity && !focused },
+                SearchResultsScroll(store: store, query: submitted,
+                                     resetKey: searchRequestKey, resetRevision: scrollResetRevision,
                                     load: { Task { await load(reset: false) } },
-                                    refresh: { await load(reset: true) })
-                    .id(searchRequestKey)
+                                     refresh: {
+                                         scrollResetRevision += 1
+                                         await load(reset: true)
+                                     })
                     .opacity(requestKey == searchRequestKey ? 1 : 0)
             }
         }
         .background(BrowseTheme.background)
         .navigationTitle("搜索").navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
         .task(id: "\(trimmedText)|\(suggestionRetry)") { await loadSuggestions() }
         .task { await loadHot() }
         .task(id: searchRequestKey) {
             guard !submitted.isEmpty else { requestKey = nil; return }
             if requestKey != searchRequestKey {
                 requestKey = searchRequestKey
-                scrollPosition = nil
-                restoreOnReturn = false
                 await load(reset: true)
             } else if store.needsFirstPage {
                 // The navigation lifetime can cancel page one before it commits.
@@ -1289,10 +1276,6 @@ struct SearchView: View {
     private func load(reset: Bool) async {
         guard !submitted.isEmpty else { return }
         guard reset || requestKey == searchRequestKey else { return }
-        if reset {
-            scrollPosition = nil
-            restoreOnReturn = false
-        }
         await store.load(reset: reset, category: selectedID, query: submitted)
     }
 

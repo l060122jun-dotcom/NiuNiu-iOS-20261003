@@ -65,7 +65,11 @@ import MediaPlayer
     @State private var scrubbing = false
     @State private var scrubTime: Double = 0
     @State private var openMenu: ControlMenu?
+    @State private var menuExpanded = false
+    @State private var menuContentHeight: CGFloat = 686
+    @State private var menuClosing = false
     private enum ControlMenu: Equatable { case more, rate }
+    private let menuAnimation = Animation.spring(response: 0.28, dampingFraction: 1)
 
     var body: some View {
         ZStack {
@@ -100,17 +104,16 @@ import MediaPlayer
                     .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 8))
                     .allowsHitTesting(false)
             }
-            if let openMenu, !locked {
-                menuOverlay(openMenu)
-            }
+        }
+        .overlayPreferenceValue(PlayerControlBoundsKey.self) { anchors in
+            if let openMenu, !locked { menuOverlay(openMenu, anchors: anchors) }
         }
         .foregroundStyle(.white).buttonStyle(.plain)
         .onAppear { interaction.show() }
-        .onDisappear { closeMenu(); interaction.cancel() }
-        .onChange(of: sessionID) { _ in closeMenu(); scrubbing = false; scrubTime = 0; interaction.cancel() }
-        .onChange(of: locked) { _ in closeMenu() }
-        .onChange(of: fullScreen) { _ in closeMenu() }
-        .onChange(of: interaction.menuOpen) { open in if !open { openMenu = nil } }
+        .onDisappear { resetMenu(); interaction.cancel() }
+        .onChange(of: sessionID) { _ in resetMenu(); scrubbing = false; scrubTime = 0; interaction.cancel() }
+        .onChange(of: locked) { value in if value { resetMenu(); interaction.setMenuOpen(false) } }
+        .onChange(of: interaction.menuOpen) { open in if !open { resetMenu() } }
         .onChange(of: duration) { _ in scrubTime = safePosition(scrubTime) }
     }
 
@@ -124,6 +127,7 @@ import MediaPlayer
             icon("播放设置", "gearshape", action: onSettings)
             Button { toggleMenu(.more) } label: { Image(systemName: "ellipsis").frame(width: 40, height: 40) }
                 .accessibilityLabel("更多播放功能")
+                .anchorPreference(key: PlayerControlBoundsKey.self, value: .bounds) { [.more: $0] }
         }
         .padding(.horizontal, wide ? 16 : 4).padding(.top, 4)
         .background(LinearGradient(colors: [.black.opacity(0.8), .clear], startPoint: .top, endPoint: .bottom))
@@ -156,36 +160,69 @@ import MediaPlayer
         }
         .padding(.horizontal, wide ? 16 : 4).padding(.bottom, 4)
         .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
+        .anchorPreference(key: PlayerControlBoundsKey.self, value: .bounds) { [.bottomBar: $0] }
     }
     private var rateMenu: some View {
         Button { toggleMenu(.rate) } label: { Text(String(format: "%g×", rate)).font(.system(size: 14)).frame(minWidth: 44, minHeight: 40) }
             .accessibilityLabel("播放倍速")
+            .anchorPreference(key: PlayerControlBoundsKey.self, value: .bounds) { [.rate: $0] }
     }
     private func toggleMenu(_ menu: ControlMenu) {
-        if openMenu == menu { closeMenu() }
-        else { openMenu = menu; interaction.setMenuOpen(true) }
+        if openMenu == menu, menuExpanded { closeMenu() }
+        else {
+            menuClosing = false
+            menuContentHeight = menu == .more ? 686 : CGFloat(rates.count) * 49
+            menuExpanded = false
+            openMenu = menu
+            interaction.setMenuOpen(true)
+            // Wait for the anchored surface to mount before animating it.
+            Task { @MainActor in
+                await Task.yield()
+                guard openMenu == menu, interaction.menuOpen, !menuClosing else { return }
+                withAnimation(menuAnimation) { menuExpanded = true }
+            }
+        }
     }
     private func closeMenu() {
-        guard openMenu != nil else { return }
+        guard openMenu != nil, !menuClosing else { return }
+        let wasExpanded = menuExpanded
+        menuClosing = true
+        withAnimation(menuAnimation) { menuExpanded = false }
+        // A second tap can arrive before the opening animation mounts.
+        if !wasExpanded { finishMenuClose() }
+    }
+    private func finishMenuClose() {
+        guard menuClosing, !menuExpanded else { return }
         openMenu = nil
+        menuClosing = false
         interaction.setMenuOpen(false)
     }
-    private func menuOverlay(_ menu: ControlMenu) -> some View {
+    private func resetMenu() {
+        menuClosing = false
+        menuExpanded = false
+        openMenu = nil
+    }
+    private func menuOverlay(_ menu: ControlMenu, anchors: [PlayerControlAnchor: Anchor<CGRect>]) -> some View {
         GeometryReader { geometry in
-            ZStack(alignment: .topTrailing) {
+            if let anchor = anchors[menu == .more ? .more : .rate] {
+                let button = geometry[anchor]
+                let bottom = anchors[.bottomBar].map { geometry[$0].minY } ?? geometry.size.height
+                let width = min(280, max(1, geometry.size.width - 16))
+                let x = min(max(8, button.maxX - width), max(8, geometry.size.width - width - 8))
+                let top = menu == .more ? min(button.maxY + 4, max(8, bottom - 49)) : 8
+                let availableHeight = max(1, bottom - top - 6)
+                let height = min(max(49, menuContentHeight), availableHeight)
+                let y = menu == .more ? top : max(8, button.minY - height - 4)
+                // The usual origin is topTrailing, adjusted to the actual
+                // ellipsis centre after clamping (also survives rotation).
+                let origin = UnitPoint(x: (button.midX - x) / width, y: (button.midY - y) / height)
+                ZStack(alignment: .topLeading) {
                 // Only consume an outside tap while a menu is open. No pan/hold or
                 // high-priority recognizers: system navigation edge gestures remain free.
                 Color.clear.contentShape(Rectangle()).onTapGesture { closeMenu() }
-                    .padding(.horizontal, 20).padding(.vertical, 12)
+                    .frame(width: geometry.size.width, height: max(0, bottom))
                 VStack(spacing: 0) {
-                    HStack {
-                        Text(menu == .more ? "更多播放功能" : "播放倍速").font(.system(size: 14, weight: .semibold))
-                        Spacer()
-                        Button(action: closeMenu) { Image(systemName: "xmark").frame(width: 40, height: 40) }
-                            .accessibilityLabel("关闭播放菜单")
-                    }.padding(.leading, 12)
-                    Divider().overlay(Color.white.opacity(0.2))
-                    ScrollView {
+                    ScrollView(.vertical, showsIndicators: false) {
                         VStack(alignment: .leading, spacing: 0) {
                             if menu == .more {
                                 more()
@@ -197,12 +234,14 @@ import MediaPlayer
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .buttonStyle(PlayerMenuActionStyle(close: closeMenu))
-                        .padding(.vertical, 4)
+                        .background(GeometryReader { content in
+                            Color.clear.preference(key: PlayerMenuHeightKey.self, value: content.size.height)
+                        })
                     }
                 }
-                .foregroundStyle(.white).tint(.white)
-                .frame(width: min(280, max(160, geometry.size.width - 24)))
-                .frame(maxHeight: max(80, geometry.size.height - 56))
+                .foregroundStyle(Color.white.opacity(0.8)).tint(Color.white.opacity(0.8))
+                .frame(width: width, height: height)
+                .background(Color.gray.opacity(0.18), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: 26, style: .continuous)
@@ -211,7 +250,13 @@ import MediaPlayer
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
                 .shadow(color: .black.opacity(0.2), radius: 16, y: 6)
-                .padding(.top, 44).padding(.trailing, 8)
+                .scaleEffect(menuExpanded ? 1 : 0.001, anchor: origin)
+                .opacity(menuExpanded ? 1 : 0)
+                .modifier(PlayerMenuAnimationCompletion(progress: menuExpanded ? 1 : 0, closing: menuClosing, completion: finishMenuClose))
+                .offset(x: x, y: y)
+                .allowsHitTesting(menuExpanded)
+                .onPreferenceChange(PlayerMenuHeightKey.self) { menuContentHeight = $0 }
+                }
             }
         }
     }
@@ -233,22 +278,76 @@ import MediaPlayer
 // Explicit plain style on expandable submenus keeps their rows open for selection.
 private struct PlayerMenuActionStyle: PrimitiveButtonStyle {
     let close: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
     func makeBody(configuration: Configuration) -> some View {
         Button {
             close()
             configuration.trigger()
         } label: {
             configuration.label
-                .font(.system(size: 15))
-                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                .padding(.horizontal, 12)
+                .font(.system(size: 17))
+                .opacity(isEnabled ? 1 : 0.35)
+                .frame(maxWidth: .infinity, minHeight: 49, alignment: .leading)
+                .padding(.leading, 34).padding(.trailing, 18)
                 .contentShape(Rectangle())
+                .overlay(alignment: .bottom) { Rectangle().fill(Color.white.opacity(0.14)).frame(height: 0.5).allowsHitTesting(false) }
         }.buttonStyle(.plain)
     }
 }
 
-// Also renders nested Menu values from unchanged adapters (offline playback)
-// inline rather than presenting a second UIKit menu with an opaque lifetime.
+private enum PlayerControlAnchor: Hashable { case more, rate, bottomBar }
+private struct PlayerControlBoundsKey: PreferenceKey {
+    static var defaultValue: [PlayerControlAnchor: Anchor<CGRect>] = [:]
+    static func reduce(value: inout [PlayerControlAnchor: Anchor<CGRect>], nextValue: () -> [PlayerControlAnchor: Anchor<CGRect>]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+private struct PlayerMenuHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+// Observe the animatable value rather than using iOS 17's completion API or
+// a fixed timer, so the auto-hide lock is released only after the reverse path.
+private struct PlayerMenuAnimationCompletion: AnimatableModifier {
+    var progress: Double
+    let closing: Bool
+    let completion: () -> Void
+    var animatableData: Double {
+        get { progress }
+        set {
+            progress = newValue
+            if closing, newValue == 0 { DispatchQueue.main.async(execute: completion) }
+        }
+    }
+    func body(content: Content) -> some View { content }
+}
+
+// Only the disclosure header bypasses the action style. Selecting a child
+// still invokes its original action and closes the owning popover.
+struct PlayerMenuDisclosure<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: () -> Content
+    @State private var expanded = false
+    var body: some View {
+        VStack(spacing: 0) {
+            Button { withAnimation(.spring(response: 0.28, dampingFraction: 1)) { expanded.toggle() } } label: {
+                HStack {
+                    Text(title)
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold))
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                }
+                .font(.system(size: 17))
+                .frame(maxWidth: .infinity, minHeight: 49, alignment: .leading)
+                .padding(.leading, 34).padding(.trailing, 18)
+                .contentShape(Rectangle())
+                .overlay(alignment: .bottom) { Rectangle().fill(Color.white.opacity(0.14)).frame(height: 0.5).allowsHitTesting(false) }
+            }.buttonStyle(.plain).accessibilityValue(expanded ? "已展开" : "已收起")
+            if expanded { content() }
+        }
+    }
+}
 
 // This surface sits BELOW interactive danmaku and control buttons, not above them.
 // UIKit recognizers arbitrate tap/hold/pan so a slider never also starts a seek gesture.

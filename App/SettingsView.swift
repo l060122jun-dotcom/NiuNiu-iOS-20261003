@@ -87,8 +87,8 @@ struct SettingsView: View {
         .toolbar(.hidden, for: .tabBar)
         .task {
             teenMode = APIClient.shared.isTeenModeEnabled
-            await loadConfig()
             await refreshCaches()
+            await loadConfig()
         }
         .sheet(isPresented: $showLogin) {
             NavigationStack { LoginView().toolbar { ToolbarItem(placement: .cancellationAction) {
@@ -182,14 +182,10 @@ struct SettingsView: View {
 
     private func refreshCaches() async {
         cacheBytes = Int64(URLCache.shared.currentDiskUsage + URLCache.shared.currentMemoryUsage)
-        guard configLoaded else {
-            for source in sources { sourceStatus[source.0] = "配置未加载" }
-            return
-        }
         for source in sources {
             do {
-                sourceStatus[source.0] = try SpecialSourceResolver.shared.cacheStatus(source: source.0, config: serverConfig)
-            } catch { sourceStatus[source.0] = "读取失败" }
+                sourceStatus[source.0] = try SpecialSourceResolver.shared.cacheStatus(source: source.0)
+            } catch { sourceStatus[source.0] = "读取失败：\(error.localizedDescription)" }
         }
     }
 
@@ -206,13 +202,13 @@ struct SettingsView: View {
         busy = true
         defer { busy = false }
         do {
-            // Configuration is required to resolve the real Keychain namespace.
-            serverConfig = try await APIClient.shared.configuration()
-            configLoaded = true
-            try SpecialSourceResolver.shared.clearCache(source: source, config: serverConfig)
+            try SpecialSourceResolver.shared.clearCache(source: source)
             await refreshCaches()
             notice = "播放器缓存已清除"
-        } catch { notice = error.localizedDescription }
+        } catch {
+            await refreshCaches()
+            notice = error.localizedDescription
+        }
     }
 
     private func contact() {

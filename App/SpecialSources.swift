@@ -53,27 +53,50 @@ final class SpecialSourceResolver {
         downloadProxies.values.forEach { $0.stop() }; downloadProxies.removeAll()
     }
 
-    func cacheStatus(source: String, config: [String: Any]) throws -> String {
-        let settings = try SpecialSettings(source: source, config: config)
-        let credentials = SpecialCredentials(namespace: settings.namespace)
-        let hasToken = !(try credentials.get("token") ?? "").isEmpty
-        return hasToken ? "已缓存授权" : "未缓存"
+    // config remains source-compatible, but cache maintenance never validates playback settings.
+    func cacheStatus(source: String, config: [String: Any] = [:]) throws -> String {
+        let records = try SpecialCredentials.records(source: source)
+        guard !records.isEmpty else { return "缓存为空" }
+        let hasToken = records.contains { $0.key == "token" && !$0.value.isEmpty }
+        let hasDevice = records.contains { $0.key == "device" && !$0.value.isEmpty }
+        if hasToken { return hasDevice ? "已缓存授权与设备" : "已缓存授权" }
+        if hasDevice { return "仅设备缓存（未授权）" }
+        return records.contains { $0.key == "timestamp" && !$0.value.isEmpty } ? "仅时间记录（未授权）" : "未缓存授权"
     }
 
-    func clearCache(source: String, config: [String: Any]) throws {
-        let settings = try SpecialSettings(source: source, config: config)
-        namespaceGenerations[settings.namespace, default: 0] &+= 1
-        initialization[settings.namespace]?.task.cancel()
-        initialization.removeValue(forKey: settings.namespace)
-        hemaClock.removeValue(forKey: settings.namespace)
-        let credentials = SpecialCredentials(namespace: settings.namespace)
-        try credentials.remove("token")
-        try credentials.remove("device")
+    func clearCache(source: String, config: [String: Any] = [:]) throws {
+        // Enumerate before mutating runtime state: a Keychain read failure preserves everything.
+        let records = try SpecialCredentials.records(source: source)
+        let prefix = source + "."
+        var namespaces = Set(records.map(\.namespace))
+        namespaces.formUnion(namespaceGenerations.keys.filter { $0.hasPrefix(prefix) })
+        namespaces.formUnion(initialization.keys.filter { $0.hasPrefix(prefix) })
+        namespaces.formUnion(hemaClock.keys.filter { $0.hasPrefix(prefix) })
+        if let proxy = activeProxy, proxy.namespace.hasPrefix(prefix) { namespaces.insert(proxy.namespace) }
+        namespaces.formUnion(downloadProxies.values.filter { $0.namespace.hasPrefix(prefix) }.map(\.namespace))
+        for namespace in namespaces {
+            namespaceGenerations[namespace, default: 0] &+= 1
+            initialization.removeValue(forKey: namespace)?.task.cancel()
+            hemaClock.removeValue(forKey: namespace)
+        }
+        // Do not advance the global playback generation or stop another source's player.
+        if let proxy = activeProxy, namespaces.contains(proxy.namespace) { proxy.stop(); activeProxy = nil }
+        let downloads = downloadProxies.filter { namespaces.contains($0.value.namespace) }.map(\.key)
+        for url in downloads { downloadProxies.removeValue(forKey: url)?.stop() }
+        var removed = 0
+        for record in records {
+            do { try SpecialCredentials.remove(record); removed += 1 }
+            catch {
+                // Keychain has no multi-item transaction. Never claim an unperformed rollback.
+                throw SpecialSourceError.response("缓存清理未完成（已处理 \(removed)/\(records.count) 条）；剩余记录保留。\(error.localizedDescription)")
+            }
+        }
     }
 
     func resolve(episode: Episode, source: String, config: [String: Any], purpose: SpecialResolvePurpose = .playback) async throws -> ResolvedVideo {
         try Task.checkCancellation()
         let settings = try SpecialSettings(source: source, config: config)
+        if namespaceGenerations[settings.namespace] == nil { namespaceGenerations[settings.namespace] = 0 }
         let context = contextGeneration
         let generation = namespaceGenerations[settings.namespace, default: 0]
         if purpose == .playback { playbackGeneration &+= 1 }
@@ -324,8 +347,53 @@ private struct SpecialSettings {
 
 private struct SpecialCredentials {
     let namespace: String
+    private static let service = "NiuNiu.SpecialSources"
+    struct Record {
+        let namespace: String
+        let key: String
+        let value: String
+        let reference: Data
+    }
+
+    static func records(source: String) throws -> [Record] {
+        guard ["xm3u8", "xiaocao", "hema"].contains(source) else {
+            throw SpecialSourceError.configuration("未知特殊源")
+        }
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                   kSecAttrService as String: service,
+                                   kSecReturnAttributes as String: true,
+                                   kSecReturnData as String: true,
+                                   kSecReturnPersistentRef as String: true,
+                                   kSecMatchLimit as String: kSecMatchLimitAll]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return [] }
+        guard status == errSecSuccess else { throw SpecialSourceError.keychain(status) }
+        guard let items = result as? [[String: Any]] else { throw SpecialSourceError.keychain(errSecDecode) }
+        return try items.compactMap { item in
+            guard let account = item[kSecAttrAccount as String] as? String,
+                  account.hasPrefix(source + ".") else { return nil }
+            let parts = account.components(separatedBy: ".")
+            // Only the exact account format written by this App; never account-store tokens.
+            guard parts.count == 3, parts[1].count == 32,
+                  parts[1].allSatisfy({ $0.isASCII && "0123456789abcdef".contains($0) }),
+                  ["token", "device", "timestamp"].contains(parts[2]) else { return nil }
+            guard let data = item[kSecValueData as String] as? Data,
+                  let value = String(data: data, encoding: .utf8),
+                  let reference = item[kSecValuePersistentRef as String] as? Data else {
+                throw SpecialSourceError.keychain(errSecDecode)
+            }
+            return Record(namespace: source + "." + parts[1], key: parts[2], value: value, reference: reference)
+        }
+    }
+
+    static func remove(_ record: Record) throws {
+        // Persistent references target precisely the enumerated item, not a service-wide delete.
+        let status = SecItemDelete([kSecValuePersistentRef as String: record.reference] as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw SpecialSourceError.keychain(status) }
+    }
     private func query(_ key: String) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "NiuNiu.SpecialSources",
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: Self.service,
          kSecAttrAccount as String: namespace + "." + key]
     }
     func get(_ key: String) throws -> String? {
@@ -370,6 +438,7 @@ private final class SpecialTransport: NSObject, URLSessionTaskDelegate {
 @MainActor
 private final class SpecialHLSProxy {
     private let settings: SpecialSettings
+    var namespace: String { settings.namespace }
     private let ck: String
     private let root: URL
     private let directory: String

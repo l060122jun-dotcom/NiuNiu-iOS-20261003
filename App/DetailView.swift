@@ -230,12 +230,11 @@ import UIKit
         Button("上一集") { startEpisode(episodeIndex - 1) }.disabled(episodeIndex == 0 || resolving)
         Button("后退15秒") { seek(time - 15) }
         Button("前进15秒") { seek(time + 15) }
-        DisclosureGroup("倍速") {
+        PlayerMenuDisclosure(title: "倍速") {
             ForEach(PlaybackPreferences.rates, id: \.self) { value in
                 Button(String(format: "%g×", value)) { applyRate(value) }
-                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
             }
-        }.buttonStyle(.plain).padding(.horizontal, 12).padding(.vertical, 10)
+        }
         Button("选集 / 换源") { sheet = .episodes }
         Button(danmaku.show ? "关闭弹幕" : "打开弹幕") { danmaku.show.toggle() }
         Button("发送弹幕") { sheet = .composer }
@@ -246,13 +245,16 @@ import UIKit
             Button(landscape ? "切换竖屏" : "切换横屏") { manualLandscape = !landscape }
             if manualLandscape != nil { Button("按视频比例自动方向") { manualLandscape = nil } }
         }
-        DisclosureGroup("播放方式") {
-            Button("连续播放") { settings.mode = "continuous" }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-            Button("单集停止") { settings.mode = "single" }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-            Button("单集循环") { settings.mode = "loop" }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-        }.buttonStyle(.plain).padding(.horizontal, 12).padding(.vertical, 10)
+        PlayerMenuDisclosure(title: "播放方式") {
+            Button("连续播放") { settings.mode = "continuous" }
+            Button("单集停止") { settings.mode = "single" }
+            Button("单集循环") { settings.mode = "loop" }
+        }
         Button("AirPlay / 系统投屏") { sheet = .cast }
-        Button("画中画") { sheet = .pip }
+        Button("画中画") {
+            playback.requestPictureInPicture()
+            if let message = playback.capabilityMessage { notice = message }
+        }
     }
     private func temporaryRate(_ active: Bool) {
         if active {
