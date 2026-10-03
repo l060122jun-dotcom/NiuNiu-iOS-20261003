@@ -177,7 +177,7 @@ final class PlaybackController: ObservableObject {
     }
 
     private func observe(_ candidate: IJKFFMoviePlayerController) {
-        let names: [String] = [
+        let names: [Notification.Name] = [
             IJKMPMediaPlaybackIsPreparedToPlayDidChangeNotification,
             IJKMPMoviePlayerPlaybackStateDidChangeNotification,
             IJKMPMoviePlayerLoadStateDidChangeNotification,
@@ -190,7 +190,7 @@ final class PlaybackController: ObservableObject {
         ]
         for name in names {
             observers.append(NotificationCenter.default.addObserver(
-                forName: Notification.Name(name), object: candidate, queue: .main
+                forName: name, object: candidate, queue: .main
             ) { [weak self, weak candidate] note in
                 Task { @MainActor [weak self, weak candidate] in
                     guard let self, let candidate, self.core === candidate,
@@ -203,7 +203,7 @@ final class PlaybackController: ObservableObject {
     }
 
     private func handle(_ note: Notification, core candidate: IJKFFMoviePlayerController) {
-        switch note.name.rawValue {
+        switch note.name {
         case IJKMPMediaPlaybackIsPreparedToPlayDidChangeNotification:
             guard candidate.isPreparedToPlay, error == nil else { return }
             isReady = true
@@ -349,14 +349,8 @@ final class PlaybackController: ObservableObject {
     deinit {
         timer?.invalidate()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
-        // The controller is main-actor owned, but deinit is not actor-isolated in Swift 5.
-        // Dispatch only the native teardown; never retain self in a teardown closure.
-        if let remaining = core {
-            DispatchQueue.main.async {
-                remaining.stop()
-                remaining.shutdown()
-            }
-        }
+        // Native teardown is performed explicitly by stop()/releaseCore() while
+        // still MainActor-owned. Nonisolated deinit must not read published core.
     }
 }
 
