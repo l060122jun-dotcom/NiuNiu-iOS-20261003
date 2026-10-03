@@ -17,7 +17,7 @@ WORK="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ijk-source.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 on_error() {
     if [[ -n "${FF:-}" ]]; then
-        for file in config.h config.log ffbuild/config.mak; do
+        for file in config.h config.log ffbuild/config.log ffbuild/config.mak; do
             if [[ -f "$FF/$file" ]]; then cp "$FF/$file" "$LOGS/"; fi
         done
     fi
@@ -156,7 +156,10 @@ replace(controller, 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ij
 PY
 cd "$IJK/ios"
 run_logged ffmpeg-build bash ./compile-ffmpeg.sh arm64
-cp "$FF/config.h" "$FF/config.log" "$FF/ffbuild/config.mak" "$LOGS/"
+cp "$FF/config.h" "$FF/ffbuild/config.mak" "$LOGS/"
+for file in "$FF/config.log" "$FF/ffbuild/config.log"; do
+    if [[ -f "$file" ]]; then cp "$file" "$LOGS/config.log"; fi
+done
 for feature in SECURETRANSPORT HTTPS_PROTOCOL TLS_PROTOCOL CRYPTO_PROTOCOL HLS_DEMUXER; do
     grep -q "#define CONFIG_${feature} 1" "$FF/config.h" || { echo "Missing $feature" >&2; exit 1; }
 done
