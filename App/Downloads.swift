@@ -387,6 +387,11 @@ final class DownloadsStore: NSObject, ObservableObject {
         task.taskDescription.flatMap(UUID.init(uuidString:))
     }
 
+    private func taskMediaURL(_ task: URLSessionTask) -> URL? {
+        if let assetTask = task as? AVAssetDownloadTask { return assetTask.urlAsset.url }
+        return task.originalRequest?.url
+    }
+
     private func resolvedLocation(_ item: OfflineDownload) -> URL? {
         guard let relative = item.localRelativePath, !relative.hasPrefix("/"),
               !relative.split(separator: "/").contains("..") else { return nil }
@@ -417,12 +422,12 @@ final class DownloadsStore: NSObject, ObservableObject {
     }
 
     private func quarantine(_ task: URLSessionTask, location: URL? = nil) -> UUID {
-        if let url = task.originalRequest?.url { releaseProxy(url) }
+        if let url = taskMediaURL(task) { releaseProxy(url) }
         if let asset = task as? AVAssetDownloadTask { releaseProxy(asset.urlAsset.url) }
         let id = taskID(task) ?? UUID()
         task.taskDescription = id.uuidString
         if index(id) == nil {
-            let url = (task as? AVAssetDownloadTask)?.urlAsset.url ?? task.originalRequest?.url
+            let url = taskMediaURL(task)
                 ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             var item = OfflineDownload(id: id, title: "隔离下载 · " + url.lastPathComponent,
                 sourceURL: url, headers: [:], format: task is AVAssetDownloadTask ? .hls : .mp4, createdAt: Date())
@@ -464,7 +469,7 @@ final class DownloadsStore: NSObject, ObservableObject {
                     for task in tasks {
                         guard let id = self.taskID(task), let index = self.index(id),
                               [.queued, .downloading].contains(self.items[index].state) else {
-                            if let url = task.originalRequest?.url { self.releaseProxy(url) }
+                            if let url = self.taskMediaURL(task) { self.releaseProxy(url) }
                             task.cancel()
                             continue
                         }
@@ -916,7 +921,7 @@ extension DownloadsStore: @preconcurrency URLSessionDownloadDelegate, @preconcur
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let id = taskID(task), let index = index(id) { releaseProxy(items[index].sourceURL) }
-        else if let url = task.originalRequest?.url { releaseProxy(url) }
+        else if let url = taskMediaURL(task) { releaseProxy(url) }
         guard manifestReadable else {
             let id = quarantine(task)
             if let error = error, let index = index(id) { items[index].errorMessage = error.localizedDescription }
@@ -932,7 +937,9 @@ extension DownloadsStore: @preconcurrency URLSessionDownloadDelegate, @preconcur
             return
         }
         var failure = recordedError ?? error.map { "\(($0 as NSError).domain) (\(($0 as NSError).code))：\($0.localizedDescription)" }
-        if let response = task.response as? HTTPURLResponse, !(200..<300).contains(response.statusCode) {
+        // AVAssetDownloadTask throws Objective-C exceptions for inherited
+        // response/currentRequest accessors on the connected iPhone (crash IPS).
+        if !(task is AVAssetDownloadTask), let response = task.response as? HTTPURLResponse, !(200..<300).contains(response.statusCode) {
             failure = "服务器返回 HTTP \(response.statusCode)。" + (failure.map { " \($0)" } ?? "")
         }
         let url = pendingLocations[id] ?? resolvedLocation(items[index])

@@ -7,21 +7,29 @@ import MediaPlayer
     @Published var visible = true
     @Published var feedback: String?
     @Published var interacting = false
+    @Published private(set) var menuOpen = false
     private var hideTask: Task<Void, Never>?
     func show() { visible = true; scheduleHide() }
-    func toggle() { visible.toggle(); if visible { scheduleHide() } else { hideTask?.cancel() } }
+    func toggle() { guard !menuOpen else { return }; visible.toggle(); if visible { scheduleHide() } else { hideTask?.cancel() } }
     func begin() { interacting = true; hideTask?.cancel() }
     func end() { interacting = false; feedback = nil; scheduleHide() }
+    // Menu ownership is independent of slider/gesture begin/end callbacks.
+    func setMenuOpen(_ open: Bool) {
+        menuOpen = open
+        if open { visible = true; hideTask?.cancel() }
+        else { scheduleHide() }
+    }
     func scheduleHide() {
         hideTask?.cancel()
-        guard visible, !interacting else { return }
+        guard visible, !interacting, !menuOpen else { return }
         hideTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             guard !Task.isCancelled else { return }
-            self?.visible = false
+            guard let self, !self.interacting, !self.menuOpen else { return }
+            self.visible = false
         }
     }
-    func cancel() { hideTask?.cancel(); feedback = nil; interacting = false }
+    func cancel() { hideTask?.cancel(); feedback = nil; interacting = false; menuOpen = false }
     deinit { hideTask?.cancel() }
 }
 
@@ -56,6 +64,8 @@ import MediaPlayer
     @ViewBuilder var more: () -> More
     @State private var scrubbing = false
     @State private var scrubTime: Double = 0
+    @State private var openMenu: ControlMenu?
+    private enum ControlMenu: Equatable { case more, rate }
 
     var body: some View {
         ZStack {
@@ -90,11 +100,17 @@ import MediaPlayer
                     .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 8))
                     .allowsHitTesting(false)
             }
+            if let openMenu, !locked {
+                menuOverlay(openMenu)
+            }
         }
         .foregroundStyle(.white).buttonStyle(.plain)
         .onAppear { interaction.show() }
-        .onDisappear { interaction.cancel() }
-        .onChange(of: sessionID) { _ in scrubbing = false; scrubTime = 0; interaction.cancel() }
+        .onDisappear { closeMenu(); interaction.cancel() }
+        .onChange(of: sessionID) { _ in closeMenu(); scrubbing = false; scrubTime = 0; interaction.cancel() }
+        .onChange(of: locked) { _ in closeMenu() }
+        .onChange(of: fullScreen) { _ in closeMenu() }
+        .onChange(of: interaction.menuOpen) { open in if !open { openMenu = nil } }
         .onChange(of: duration) { _ in scrubTime = safePosition(scrubTime) }
     }
 
@@ -106,9 +122,8 @@ import MediaPlayer
             icon("电视投屏", "tv", action: onCast)
             if let onPictureInPicture { icon("画中画", "pip", action: onPictureInPicture) }
             icon("播放设置", "gearshape", action: onSettings)
-            Menu { more() } label: { Image(systemName: "ellipsis").frame(width: 40, height: 40) }
+            Button { toggleMenu(.more) } label: { Image(systemName: "ellipsis").frame(width: 40, height: 40) }
                 .accessibilityLabel("更多播放功能")
-                .simultaneousGesture(TapGesture().onEnded { interaction.show() })
         }
         .padding(.horizontal, wide ? 16 : 4).padding(.top, 4)
         .background(LinearGradient(colors: [.black.opacity(0.8), .clear], startPoint: .top, endPoint: .bottom))
@@ -143,16 +158,61 @@ import MediaPlayer
         .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
     }
     private var rateMenu: some View {
-        Menu {
-            ForEach(rates, id: \.self) { value in
-                Button(String(format: "%g×", value)) { interaction.show(); onRate(value) }
-            }
-        } label: { Text(String(format: "%g×", rate)).font(.system(size: 14)).frame(minWidth: 44, minHeight: 40) }
+        Button { toggleMenu(.rate) } label: { Text(String(format: "%g×", rate)).font(.system(size: 14)).frame(minWidth: 44, minHeight: 40) }
             .accessibilityLabel("播放倍速")
-            .simultaneousGesture(TapGesture().onEnded { interaction.show() })
+    }
+    private func toggleMenu(_ menu: ControlMenu) {
+        if openMenu == menu { closeMenu() }
+        else { openMenu = menu; interaction.setMenuOpen(true) }
+    }
+    private func closeMenu() {
+        guard openMenu != nil else { return }
+        openMenu = nil
+        interaction.setMenuOpen(false)
+    }
+    private func menuOverlay(_ menu: ControlMenu) -> some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .topTrailing) {
+                // Only consume an outside tap while a menu is open. No pan/hold or
+                // high-priority recognizers: system navigation edge gestures remain free.
+                Color.clear.contentShape(Rectangle()).onTapGesture { closeMenu() }
+                    .padding(.horizontal, 20).padding(.vertical, 12)
+                VStack(spacing: 0) {
+                    HStack {
+                        Text(menu == .more ? "更多播放功能" : "播放倍速").font(.system(size: 14, weight: .semibold))
+                        Spacer()
+                        Button(action: closeMenu) { Image(systemName: "xmark").frame(width: 40, height: 40) }
+                            .accessibilityLabel("关闭播放菜单")
+                    }.padding(.leading, 12)
+                    Divider().overlay(Color.white.opacity(0.2))
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            if menu == .more {
+                                more()
+                            } else {
+                                ForEach(rates, id: \.self) { value in
+                                    Button(String(format: "%g×", value)) { onRate(value) }
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .buttonStyle(PlayerMenuActionStyle(close: closeMenu))
+                        .menuStyle(PlayerExpandableMenuStyle())
+                        .padding(.vertical, 4)
+                    }
+                }
+                .foregroundStyle(.white).tint(.white)
+                .frame(width: min(280, max(160, geometry.size.width - 24)))
+                .frame(maxHeight: max(80, geometry.size.height - 56))
+                .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 12))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .shadow(color: .black.opacity(0.4), radius: 8)
+                .padding(.top, 44).padding(.trailing, 8)
+            }
+        }
     }
     private func icon(_ title: String, _ symbol: String, action: @escaping () -> Void) -> some View {
-        Button { interaction.show(); action() } label: {
+        Button { closeMenu(); interaction.show(); action() } label: {
             Image(systemName: symbol).font(.system(size: 17)).frame(width: 40, height: 40)
         }.accessibilityLabel(title)
     }
@@ -163,6 +223,38 @@ import MediaPlayer
     }
     private var safeDuration: Double { duration.isFinite ? min(86_400_000, max(1, duration)) : 1 }
     private func safePosition(_ value: Double) -> Double { value.isFinite ? min(safeDuration, max(0, value)) : 0 }
+}
+
+// Executes the original generic more() action, then releases menu ownership.
+// Explicit plain style on expandable submenus keeps their rows open for selection.
+private struct PlayerMenuActionStyle: PrimitiveButtonStyle {
+    let close: () -> Void
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            close()
+            configuration.trigger()
+        } label: {
+            configuration.label
+                .font(.system(size: 15))
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .padding(.horizontal, 12)
+                .contentShape(Rectangle())
+        }.buttonStyle(.plain)
+    }
+}
+
+// Also renders nested Menu values from unchanged adapters (offline playback)
+// inline rather than presenting a second UIKit menu with an opaque lifetime.
+private struct PlayerExpandableMenuStyle: MenuStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        DisclosureGroup {
+            configuration.content
+        } label: {
+            configuration.label
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 12).padding(.vertical, 10)
+    }
 }
 
 // This surface sits BELOW interactive danmaku and control buttons, not above them.
