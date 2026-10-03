@@ -11,6 +11,7 @@ if [[ "${1:-}" == --print-lock ]]; then
     exit 0
 fi
 [[ "$(uname -s)" == Darwin ]] || { echo 'Requires macOS and Xcode.' >&2; exit 1; }
+[[ "$(xcodebuild -version | head -n 1)" == 'Xcode 16.4' ]] || { echo 'Requires Xcode 16.4; select DEVELOPER_DIR explicitly.' >&2; exit 1; }
 LOGS="$ROOT/build/ijk-logs"
 mkdir -p "$LOGS" "$ROOT/Vendor"
 WORK="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ijk-source.XXXXXX")"
@@ -153,6 +154,32 @@ char * av_dict_ptrtostr(uintptr_t value) {
 }''', 1)
 controller = ijk/'ios/IJKMediaPlayer/IJKMediaPlayer/IJKFFMoviePlayerController.m'
 replace(controller, 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ijk0.8.8--20201130--001";', 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ijk0.8.8--20210426--001";', 1)
+# Return the actual AVAudioSession result on every BOOL path; keep the
+# upstream deactivation exception handler rather than silencing return-type.
+replace(ijk/'ios/IJKMediaPlayer/IJKMediaPlayer/IJKAudioKit.m', '''- (BOOL)setActive:(BOOL)active
+{
+    if (active != NO) {
+        [[AVAudioSession sharedInstance] setActive:YES error:nil];
+    } else {
+        @try {
+            [[AVAudioSession sharedInstance] setActive:NO error:nil];
+        } @catch (NSException *exception) {
+            NSLog(@"failed to inactive AVAudioSession\\n");
+        }
+    }
+}''', '''- (BOOL)setActive:(BOOL)active
+{
+    if (active != NO) {
+        return [[AVAudioSession sharedInstance] setActive:YES error:nil];
+    } else {
+        @try {
+            return [[AVAudioSession sharedInstance] setActive:NO error:nil];
+        } @catch (NSException *exception) {
+            NSLog(@"failed to inactive AVAudioSession\\n");
+            return NO;
+        }
+    }
+}''', 1)
 PY
 cd "$IJK/ios"
 run_logged ffmpeg-build bash ./compile-ffmpeg.sh arm64
@@ -178,18 +205,10 @@ run_logged framework-build xcodebuild \
     MACH_O_TYPE=mh_dylib DEFINES_MODULE=YES CLANG_ENABLE_MODULES=YES \
     ENABLE_USER_SCRIPT_SANDBOXING=NO \
     'OTHER_CFLAGS=$(inherited) -Wno-error=implicit-function-declaration -Wno-error=incompatible-function-pointer-types' \
-    'OTHER_LDFLAGS=$(inherited) -lbz2 -lz -framework Security -framework CoreFoundation -framework Foundation -framework UIKit -framework AudioToolbox -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework OpenGLES -framework QuartzCore' \
+    'OTHER_LDFLAGS=$(inherited) -lbz2 -lz -framework Security -framework CoreFoundation -framework Foundation -framework UIKit -framework MediaPlayer -framework AudioToolbox -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework OpenGLES -framework QuartzCore' \
     build
 FRAMEWORK="$WORK/products/IJKMediaFramework.framework"
-[[ "$(xcrun lipo -archs "$FRAMEWORK/IJKMediaFramework")" == arm64 ]]
-xcrun otool -hv "$FRAMEWORK/IJKMediaFramework" >"$LOGS/framework-mach-o.txt"
-grep -q DYLIB "$LOGS/framework-mach-o.txt"
-test -f "$FRAMEWORK/Modules/module.modulemap"
-# Compile an actual Swift import, not merely a header existence check.
-printf 'import IJKMediaFramework\nlet controller: IJKFFMoviePlayerController? = nil\n' >"$WORK/import.swift"
-run_logged swift-module-check xcrun --sdk iphoneos swiftc -typecheck \
-    -target arm64-apple-ios16.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
-    -F "$WORK/products" "$WORK/import.swift"
+run_logged framework-check bash "$ROOT/tools/verify-ijk.sh" --framework "$FRAMEWORK"
 ditto "$FRAMEWORK" "$ROOT/Vendor/IJKMediaFramework.framework"
 # Keep exact original sources PLUS applied patches/config for redistribution.
 mkdir -p "$WORK/compliance" "$ROOT/Vendor/IJK-Licenses"
@@ -200,6 +219,7 @@ git -C "$IJK" diff --binary >"$WORK/compliance/ijk-modern-apple.patch"
 git -C "$FF" diff --binary >"$WORK/compliance/ffmpeg-source.patch"
 cp "$IJK/config/module.sh" "$WORK/compliance/module.sh"
 cp "$ROOT/tools/build-ijk.sh" "$WORK/compliance/"
+cp "$ROOT/tools/verify-ijk.sh" "$WORK/compliance/"
 cp "$ROOT/LICENSES/IJK.md" "$WORK/compliance/NOTICE.md"
 cp "$IJK/COPYING.LGPLv2.1" "$ROOT/Vendor/IJK-Licenses/IJK-LGPL-2.1.txt"
 cp "$FF/COPYING.LGPLv2.1" "$ROOT/Vendor/IJK-Licenses/FFmpeg-LGPL-2.1.txt"
@@ -209,6 +229,70 @@ cp "$LOGS/config.h" "$LOGS/config.mak" "$WORK/compliance/"
 printf 'ijk=%s\nffmpeg-tag=%s\nffmpeg=%s\ngas-preprocessor=%s\n' "$IJK_SHA" "$FF_TAG" "$FF_SHA" "$GAS_SHA" >"$WORK/compliance/source-lock.txt"
 xcodebuild -version >>"$WORK/compliance/source-lock.txt"
 xcrun --sdk iphoneos --show-sdk-version >>"$WORK/compliance/source-lock.txt"
+# Hash precisely the tracked source inputs (not generated objects or .git).
+# The restored original archives + patches must reproduce every such input.
+export COMPLIANCE="$WORK/compliance" GAS_SOURCE="$IJK/extra/gas-preprocessor"
+python3 <<'PY'
+import hashlib, json, os, subprocess
+from pathlib import Path
+out = {}
+for name, env in [('ijk', 'IJK_SOURCE'), ('ffmpeg', 'FF_SOURCE'), ('gas', 'GAS_SOURCE')]:
+    root = Path(os.environ[env])
+    paths = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-z']).decode().split('\0')
+    entries = {}
+    for rel in sorted(p for p in paths if p):
+        p = root / rel
+        data = ('symlink:' + os.readlink(p)).encode() if p.is_symlink() else p.read_bytes()
+        entries[rel] = hashlib.sha256(data).hexdigest()
+    out[name] = entries
+Path(os.environ['COMPLIANCE'], 'source-tree-sha256.json').write_text(json.dumps(out, sort_keys=True, indent=2) + '\n')
+PY
+cat >"$WORK/compliance/REBUILD.md" <<'DOC'
+# Restore and rebuild the exact patched sources (macOS / Xcode 16.4)
+
+Extract IJK-corresponding-source.tar.gz into a new directory. From compliance/:
+
+```sh
+export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+test -d "$DEVELOPER_DIR"
+bash verify-ijk.sh --restore-source ./restored
+cd restored/ijk/ios
+bash compile-ffmpeg.sh arm64
+xcodebuild -project IJKMediaPlayer/IJKMediaPlayer.xcodeproj -target IJKMediaFramework \
+  -configuration Release -sdk iphoneos -arch arm64 \
+  CONFIGURATION_BUILD_DIR="$PWD/products" IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+  ARCHS=arm64 VALID_ARCHS=arm64 SUPPORTED_PLATFORMS=iphoneos ONLY_ACTIVE_ARCH=NO \
+  ENABLE_BITCODE=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
+  MACH_O_TYPE=mh_dylib DEFINES_MODULE=YES CLANG_ENABLE_MODULES=YES \
+  ENABLE_USER_SCRIPT_SANDBOXING=NO \
+  'OTHER_CFLAGS=$(inherited) -Wno-error=implicit-function-declaration -Wno-error=incompatible-function-pointer-types' \
+  'OTHER_LDFLAGS=$(inherited) -lbz2 -lz -framework Security -framework CoreFoundation -framework Foundation -framework UIKit -framework MediaPlayer -framework AudioToolbox -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework OpenGLES -framework QuartzCore' build
+```
+
+Restore checks archive/patch hashes, runs git apply --check before applying both
+patches, and checks the restored tracked source trees against the build inputs.
+The FFmpeg tag is recreated locally for av_version_info(). No network fetch or
+third-party binary is needed. config.h/config.mak record the original build;
+FFmpeg reconfigures for the local SDK rather than reusing temporary prefix paths.
+Copy products/IJKMediaFramework.framework into the App checkout's Vendor/, and
+run its tools/verify-ijk.sh before xcodegen and after the complete App build.
+The App source (including App/Player.swift), project.yml and workflow must also
+be distributed to rebuild the App; they are not contained in this library pack.
+Compare configuration and versions, not bit-identical binaries: timestamps and
+build paths may differ. Static CI checks do not replace signed-device TLS/HLS
+tests (valid/expired/untrusted/wrong-host certificates, playlist/segment/key).
+For an independent IJK checkout version marker, use the archived RELEASE/VERSION
+files; the restored git repositories are local reconstruction metadata, not the
+original commit history. source-lock.txt records the original commit identities.
+DOC
+python3 <<'PY'
+import hashlib, json, os
+from pathlib import Path
+root = Path(os.environ['COMPLIANCE'])
+hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.iterdir()) if p.is_file()}
+(root / 'package-sha256.json').write_text(json.dumps(hashes, sort_keys=True, indent=2) + '\n')
+PY
 tar -czf "$ROOT/Vendor/IJK-corresponding-source.tar.gz" -C "$WORK" compliance
 cp "$ROOT/LICENSES/IJK.md" "$ROOT/Vendor/IJK-Licenses/NOTICE.md"
+run_logged distribution-check bash "$ROOT/tools/verify-ijk.sh"
 echo 'IJK: official arm64 device framework and corresponding sources ready.'

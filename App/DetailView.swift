@@ -2,7 +2,7 @@ import SwiftUI
 import Combine
 import UIKit
 
-public struct DetailView: View {
+@MainActor public struct DetailView: View {
     public let videoID: String
     @EnvironmentObject private var library: LibraryStore
     @Environment(\.dismiss) private var dismiss
@@ -38,7 +38,8 @@ public struct DetailView: View {
     @State private var resolveTask: Task<Void, Never>?
     @State private var resolutionGeneration = 0
     @State private var handledEnd = false
-    @State private var loopSeekPending = false
+    @State private var suspended = false
+    @State private var resumeAfterNavigation = false
     @State private var savedHistorySecond = -1
     @State private var sheet: DetailSheet?
     @State private var shareItems: [Any] = []
@@ -80,7 +81,19 @@ public struct DetailView: View {
             }
         }
         .navigationTitle(video?.name ?? "影片详情").navigationBarTitleDisplayMode(.inline)
-        .task { configureCallbacks(); await loadDetail() }
+        .task {
+            configureCallbacks()
+            if video == nil { suspended = false; await loadDetail() }
+            else if suspended {
+                suspended = false
+                danmaku.retry()
+                if let resolved {
+                    playback.load(resolved.url, headers: resolved.headers, resume: time)
+                    playback.setRate(settings.rate)
+                    if !resumeAfterNavigation { playback.pause() }
+                } else { startEpisode(episodeIndex, resume: time) }
+            }
+        }
         .onReceive(clock) { _ in tickTimer() }
         .onChange(of: scenePhase) { phase in backgroundChanged(phase) }
         .onChange(of: fill) { playback.setFill($0) }
@@ -88,8 +101,7 @@ public struct DetailView: View {
         .onChange(of: account.isLoggedIn) { _ in Task { await loadFavoriteStatus() } }
         .onDisappear {
             if !fullScreen && !playback.isPictureInPicture {
-                recordHistory(); resolveTask?.cancel(); resolutionGeneration += 1; resolving = false
-                playback.pause(); playing = false
+                closeDetail()
             }
         }
         .sheet(item: Binding(get: { fullScreen ? nil : sheet }, set: { sheet = $0 })) { value in sheetContent(value) }
@@ -112,6 +124,7 @@ public struct DetailView: View {
                 PlaybackSurface(controller: playback, fill: fill)
                     .allowsHitTesting(false)
                 AndroidPlayerGestureSurface(
+                    sessionID: "\(sourceIndex)|\(episodeIndex)|\(resolutionGeneration)",
                     enabled: resolved != nil && !resolving && errorText == nil,
                     locked: locked, time: time, duration: duration, holdRate: settings.holdRate,
                     interaction: playerInteraction, onPlay: togglePlay, onSeek: seek,
@@ -119,12 +132,13 @@ public struct DetailView: View {
                 if !locked { DanmakuOverlay(store: danmaku) }
                 AndroidPlayerControls(
                     interaction: playerInteraction, locked: $locked,
+                    sessionID: "\(sourceIndex)|\(episodeIndex)|\(resolutionGeneration)",
                     title: [video?.name, episode?.name].compactMap { $0 }.joined(separator: " · "),
                     time: time, duration: duration, playing: playing, fullScreen: fullScreen,
                     wide: fullScreen && geometry.size.width > geometry.size.height, fill: fill,
                     canNext: episodeIndex + 1 < episodes.count && !resolving,
                     rate: settings.rate, rates: PlaybackPreferences.rates, danmakuShown: danmaku.show,
-                    onBack: { if fullScreen { fullScreen = false } else { dismiss() } },
+                    onBack: { if fullScreen { fullScreen = false } else { closeDetail(); dismiss() } },
                     onPlay: togglePlay, onNext: { startEpisode(episodeIndex + 1) }, onSeek: seek,
                     onFullScreen: { fullScreen.toggle() }, onFill: { fill.toggle() },
                     onSettings: { sheet = .settings }, onEpisodes: { sheet = .episodes },
@@ -138,7 +152,7 @@ public struct DetailView: View {
                     VStack(spacing: 12) {
                         Text(errorText).multilineTextAlignment(.center)
                         HStack {
-                            Button("返回") { if fullScreen { fullScreen = false } else { dismiss() } }
+                            Button("返回") { if fullScreen { fullScreen = false } else { closeDetail(); dismiss() } }
                             Button("重试") { startEpisode(episodeIndex, resume: time) }
                             Menu("换源") { sourceButtons }
                             Button("报错") { Task { await report(update: false) } }.disabled(reportBusy || source == nil)
@@ -357,50 +371,71 @@ public struct DetailView: View {
                 if Task.isCancelled { break }
                 do {
                     let item = source.episodes[index]
-                    let result = try await APIClient.shared.resolve(episode: item, source: source.id)
-                    try Task.checkCancellation()
                     let title = "\(video.name) · \(source.id) · \(item.name)"
+                    if downloads.items.contains(where: { $0.title == title && [.queued, .downloading, .completed].contains($0.state) }) {
+                        selectedDownloads.remove(index)
+                        continue
+                    }
+                    let result = try await APIClient.shared.resolve(episode: item, source: source.id, purpose: .download)
+                    defer { SpecialSourceResolver.shared.releaseDownload(url: result.url) }
+                    try Task.checkCancellation()
                     if !downloads.items.contains(where: { $0.title == title && [.queued, .downloading, .completed].contains($0.state) }) {
-                        downloads.add(title: title, url: result.url, headers: result.headers); queued += 1
+                        let id = downloads.add(title: title, url: result.url, headers: result.headers)
+                        guard let added = downloads.items.first(where: { $0.id == id }) else {
+                            throw NSError(domain: "OfflineDownloads", code: 1, userInfo: [NSLocalizedDescriptionKey: downloads.storageError ?? "下载入队失败，未创建任务"])
+                        }
+                        guard [.queued, .downloading, .completed].contains(added.state) else {
+                            throw NSError(domain: "OfflineDownloads", code: 2, userInfo: [NSLocalizedDescriptionKey: added.errorMessage ?? "下载入队失败"])
+                        }
+                        queued += 1
                     }
                     selectedDownloads.remove(index)
                 } catch is CancellationError { break }
-                catch { notice = "已加入 \(queued) 集；第 \(index + 1) 集失败：\(error.localizedDescription)"; return }
+                catch { guard !Task.isCancelled, !suspended else { return }; notice = "已加入 \(queued) 集；第 \(index + 1) 集失败：\(error.localizedDescription)"; return }
             }
+            guard !Task.isCancelled, !suspended else { return }
             notice = "已加入 \(queued) 个下载任务；缓存是否完成以下载列表为准"
         }
     }
 
     private func configureCallbacks() {
         playback.onTime = { seconds in
-            guard resolved != nil, !resolving, seconds.isFinite, seconds >= 0 else { return }
+            guard !suspended, !playback.isSeeking, resolved != nil, !resolving, seconds.isFinite, seconds >= 0 else { return }
             let position = playback.position
             guard position.isFinite, position >= 0 else { return }
             time = position
             let rawDuration = playback.duration
             duration = rawDuration.isFinite ? max(0, rawDuration) : 0
-            if loopSeekPending {
-                // IJK seek is asynchronous: ignore old tail samples until the loop seek lands.
-                let boundary = duration - max(settings.outro, 0.5)
-                guard duration > 0 ? time < max(0, boundary) : time <= 1 else { return }
-                loopSeekPending = false; handledEnd = false
-            }
             if introPending, duration > 0 {
                 introPending = false
-                if duration > settings.intro + settings.outro + 1, time < settings.intro { seek(settings.intro) }
+                if duration > settings.intro + settings.outro + 1, time < settings.intro { seek(settings.intro); return }
             }
             playing = playback.isPlaying
             danmaku.updatePlayback(episode: String(episodeIndex), time: time)
             if duration > settings.intro + settings.outro + 1, settings.outro > 0, time >= duration - settings.outro, !handledEnd { finishEpisode() }
         }
         playback.onProgress = { seconds in
-            guard seconds.isFinite, seconds >= 0, resolved != nil, !resolving else { return }
+            guard !suspended, !playback.isSeeking, seconds.isFinite, seconds >= 0, resolved != nil, !resolving else { return }
             recordHistory()
         }
-        playback.onEnd = { guard resolved != nil, !resolving else { return }; finishEpisode() }
+        playback.onEnd = { guard !suspended, !playback.isSeeking, resolved != nil, !resolving else { return }; finishEpisode() }
+    }
+    private func closeDetail() {
+        guard !suspended else { return }
+        recordHistory()
+        if playback.core != nil { time = playback.position.isFinite ? max(0, playback.position) : time }
+        resumeAfterNavigation = playback.isPlaying
+        suspended = true
+        resolveTask?.cancel(); resolveTask = nil; resolutionGeneration += 1; resolving = false
+        downloadTask?.cancel(); downloadTask = nil
+        backgroundPauseTask?.cancel(); backgroundPauseTask = nil
+        temporaryRate(false)
+        playerInteraction.cancel()
+        playback.onTime = nil; playback.onProgress = nil; playback.onEnd = nil
+        playback.stop(); danmaku.stop(); playing = false
     }
     private func loadDetail() async {
-        guard !loading else { return }
+        guard !loading, !suspended else { return }
         loading = true; failure = nil
         defer { loading = false }
         do {
@@ -440,7 +475,7 @@ public struct DetailView: View {
         episodeIndex = index; group = (reversed ? episodes.count - 1 - index : index) / 50
         let episode = source.episodes[index]
         temporaryRate(false)
-        playback.stop(); playback.error = nil; playing = false; handledEnd = false; loopSeekPending = false; failure = nil; resolved = nil; resolving = true
+        playback.stop(); playback.error = nil; playing = false; handledEnd = false; failure = nil; resolved = nil; resolving = true
         time = 0; duration = 0; savedHistorySecond = -1
         danmaku.updatePlayback(episode: String(index), time: 0)
         resolveTask = Task { @MainActor in
@@ -465,7 +500,6 @@ public struct DetailView: View {
         let limit = rawDuration.isFinite ? max(0, rawDuration) : 0
         let target = max(0, limit > 0 ? min(seconds, limit) : seconds)
         handledEnd = false
-        loopSeekPending = false
         playback.seek(seconds: target); time = target
         danmaku.updatePlayback(episode: String(episodeIndex), time: target)
     }
@@ -479,14 +513,13 @@ public struct DetailView: View {
         settings.rate = value; playback.setRate(value); playing = playback.isPlaying
     }
     private func finishEpisode() {
-        guard !handledEnd, !loopSeekPending, resolved != nil, !resolving else { return }
+        guard !suspended, !handledEnd, !playback.isSeeking, resolved != nil, !resolving else { return }
         handledEnd = true; recordHistory()
         if settings.timerMode == -1 { settings.deadline = Date().addingTimeInterval(10); settings.countdown = 10; playback.pause(); playing = false; return }
         switch settings.mode {
         case "loop":
             let target = duration > settings.intro + settings.outro + 1 ? settings.intro : 0
-            loopSeekPending = true
-            playback.seek(seconds: target)
+            seek(target)
             playback.setRate(settings.rate); playback.play(); playing = playback.isPlaying
         case "continuous" where episodeIndex + 1 < episodes.count: startEpisode(episodeIndex + 1)
         default: playback.pause(); playing = false
@@ -496,15 +529,20 @@ public struct DetailView: View {
         let position = playback.position
         guard var saved = video?.saved, resolved != nil, !resolving, position.isFinite, position >= 0, position < Double(Int.max) else { return }
         let second = Int(position)
-        guard second != savedHistorySecond else { return }
+        let actualDuration = playback.duration
+        let validDuration: Double? = actualDuration.isFinite && actualDuration > 0 ? actualDuration : nil
+        guard second != savedHistorySecond || (validDuration != nil && library.history.first(where: { $0.id == saved.id })?.duration != validDuration) else { return }
         savedHistorySecond = second
         saved.source = source?.id ?? ""; saved.episode = String(episodeIndex); saved.position = position
         saved.playbackURL = resolved?.url.absoluteString ?? ""
+        saved.duration = validDuration
         library.record(saved)
     }
     private func tickTimer() {
         guard let deadline = settings.deadline else { return }
-        let remaining = Int(ceil(deadline.timeIntervalSinceNow))
+        let interval = deadline.timeIntervalSinceNow
+        guard interval.isFinite else { settings.cancelTimer(); return }
+        let remaining = Int(min(86_400_000, max(-86_400_000, ceil(interval))))
         if remaining <= 10 { settings.countdown = max(0, remaining) }
         if remaining <= 0 { playback.pause(); playing = false; settings.cancelTimer(); notice = "定时停止已生效" }
     }
@@ -575,7 +613,7 @@ public struct DetailView: View {
             Task { @MainActor in notice = "系统未允许此屏幕方向：\(error.localizedDescription)" }
         }
     }
-    private func formatTime(_ value: Double) -> String { let seconds = value.isFinite ? Int(max(0, value)) : 0; return String(format: "%02d:%02d", seconds / 60, seconds % 60) }
+    private func formatTime(_ value: Double) -> String { let seconds = value.isFinite ? Int(min(86_400_000, max(0, value))) : 0; return String(format: "%02d:%02d", seconds / 60, seconds % 60) }
 }
 
 private enum DetailSheet: String, Identifiable { case settings, composer, danmaku, episodes, downloads, share, dlna, cast, pip; var id: String { rawValue } }

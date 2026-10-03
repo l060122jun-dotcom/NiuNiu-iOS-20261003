@@ -23,14 +23,15 @@ import Combine
         rate = Self.rates.contains(savedRate) ? savedRate : 1
         let savedHold = Float(d.double(forKey: "playback.holdRate"))
         holdRate = Self.holdRates.contains(savedHold) ? savedHold : 2
-        intro = min(300, max(0, d.double(forKey: "playback.\(videoID).intro")))
-        outro = min(300, max(0, d.double(forKey: "playback.\(videoID).outro")))
+        intro = Self.skipValue(d.double(forKey: "playback.\(videoID).intro"))
+        outro = Self.skipValue(d.double(forKey: "playback.\(videoID).outro"))
         let savedMode = d.string(forKey: "playback.mode") ?? "continuous"
         mode = ["continuous", "single", "loop"].contains(savedMode) ? savedMode : "continuous"
     }
     private func save(_ value: Double, _ key: String, perVideo: Bool = true) {
         UserDefaults.standard.set(value, forKey: perVideo ? "playback.\(videoID).\(key)" : "playback.\(key)")
     }
+    static func skipValue(_ value: Double) -> Double { value.isFinite ? min(300, max(0, value)) : 0 }
     func setTimer(_ mode: Int) {
         timerMode = mode; countdown = nil; timerCancelledForSession = false
         deadline = mode > 0 ? Date().addingTimeInterval(Double(mode * 60)) : nil
@@ -38,7 +39,7 @@ import Combine
     func cancelTimer() { timerMode = 0; deadline = nil; countdown = nil; timerCancelledForSession = true }
 }
 
-struct PlaybackSettingsView: View {
+@MainActor struct PlaybackSettingsView: View {
     @ObservedObject var settings: PlaybackPreferences
     let rateChanged: (Float) -> Void
     var hardwareDecodeChanged: (Bool) -> Void = { _ in }
@@ -95,9 +96,10 @@ struct PlaybackSettingsView: View {
         }
     }
     private func skip(_ title: String, value: Binding<Double>) -> some View {
-        VStack(alignment: .leading) {
-            Stepper("跳过\(title) \(Int(value.wrappedValue)) 秒", value: value, in: 0...300, step: 1)
-            Slider(value: value, in: 0...300, step: 1)
+        let safeValue = Binding(get: { PlaybackPreferences.skipValue(value.wrappedValue) }, set: { value.wrappedValue = PlaybackPreferences.skipValue($0) })
+        return VStack(alignment: .leading) {
+            Stepper("跳过\(title) \(Int(safeValue.wrappedValue)) 秒", value: safeValue, in: 0...300, step: 1)
+            Slider(value: safeValue, in: 0...300, step: 1)
         }
     }
 }

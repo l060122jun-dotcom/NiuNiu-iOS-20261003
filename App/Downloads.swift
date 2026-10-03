@@ -49,6 +49,9 @@ final class DownloadsStore: NSObject, ObservableObject {
 
     private let rootURL: URL
     private let manifestURL: URL
+    private let quarantineURL: URL
+    private var manifestFailure: String?
+    private var quarantineReadable = true
     private var activeTasks: [UUID: URLSessionTask] = [:]
     private var pendingLocations: [UUID: URL] = [:]
     private var transferErrors: [UUID: String] = [:]
@@ -84,6 +87,7 @@ final class DownloadsStore: NSObject, ObservableObject {
                                                 in: .userDomainMask)[0]
         rootURL = support.appendingPathComponent("OfflineDownloads", isDirectory: true)
         manifestURL = rootURL.appendingPathComponent("tasks.json")
+        quarantineURL = rootURL.appendingPathComponent("quarantine-tasks.json")
         super.init()
         do {
             try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
@@ -97,7 +101,15 @@ final class DownloadsStore: NSObject, ObservableObject {
             }
         } catch {
             manifestReadable = false
-            storageError = "读取下载记录失败：\(error.localizedDescription)"
+            manifestFailure = "读取下载记录失败：\(error.localizedDescription)。原清单已保留；后台任务已停止，隔离文件可在此删除。"
+            storageError = manifestFailure
+            if FileManager.default.fileExists(atPath: quarantineURL.path) {
+                do { items = try JSONDecoder().decode([OfflineDownload].self, from: Data(contentsOf: quarantineURL)) }
+                catch {
+                    quarantineReadable = false
+                    storageError = (manifestFailure ?? "") + "\n隔离索引读取失败：\(error.localizedDescription)。索引未覆盖。"
+                }
+            }
         }
         restoreSessions()
     }
@@ -118,7 +130,12 @@ final class DownloadsStore: NSObject, ObservableObject {
         let id = UUID()
         var item = OfflineDownload(id: id, title: title.isEmpty ? url.lastPathComponent : title,
                                    sourceURL: url, headers: headers, format: format, createdAt: Date())
-        guard manifestReadable else { return id }
+        guard manifestReadable else { releaseProxy(url); return id }
+        if isLoopback(url) {
+            releaseProxy(url)
+            item.state = .failed
+            item.errorMessage = "当前不支持特殊源本地代理的后台离线下载；下载代理已释放，不会标记完成。"
+        }
         if !["https", "http"].contains(url.scheme?.lowercased() ?? "") || url.host == nil {
             item.state = .failed
             item.errorMessage = "仅支持有效的 HTTP / HTTPS 视频地址。"
@@ -132,6 +149,7 @@ final class DownloadsStore: NSObject, ObservableObject {
     func cancel(_ id: UUID) {
         precondition(Thread.isMainThread)
         guard let index = index(id), [.queued, .downloading].contains(items[index].state) else { return }
+        releaseProxy(items[index].sourceURL)
         items[index].state = .cancelled
         items[index].errorMessage = nil
         validations.removeValue(forKey: id)
@@ -146,6 +164,7 @@ final class DownloadsStore: NSObject, ObservableObject {
         precondition(Thread.isMainThread)
         guard let index = index(id) else { return }
         cancel(id)
+        releaseProxy(items[index].sourceURL)
         validations.removeValue(forKey: id)
         verifiedItems.remove(id)
         cleanPendingLocation(id)
@@ -211,6 +230,16 @@ final class DownloadsStore: NSObject, ObservableObject {
 
     private func index(_ id: UUID) -> Int? { items.firstIndex { $0.id == id } }
 
+    private func isLoopback(_ url: URL) -> Bool {
+        let host = (url.host ?? "").lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        return host == "localhost" || host == "::1" || host.hasPrefix("127.") || host == "0.0.0.0"
+    }
+
+    private func releaseProxy(_ url: URL) {
+        guard isLoopback(url) else { return }
+        Task { @MainActor in SpecialSourceResolver.shared.releaseDownload(url: url) }
+    }
+
     private func taskID(_ task: URLSessionTask) -> UUID? {
         task.taskDescription.flatMap(UUID.init(uuidString:))
     }
@@ -218,8 +247,47 @@ final class DownloadsStore: NSObject, ObservableObject {
     private func resolvedLocation(_ item: OfflineDownload) -> URL? {
         guard let relative = item.localRelativePath, !relative.hasPrefix("/"),
               !relative.split(separator: "/").contains("..") else { return nil }
-        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        let url = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent(relative)
+        return ownedLocation(url) ? url : nil
+    }
+
+    /// Only our UUID MP4 directory or Apple's sandbox-local HLS packages may be deleted.
+    private func ownedLocation(_ url: URL) -> Bool {
+        guard url.isFileURL else { return false }
+        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        let root = rootURL.standardizedFileURL.resolvingSymlinksInPath().path + "/"
+        if path.hasPrefix(root), url.pathExtension.lowercased() == "mp4",
+           UUID(uuidString: url.deletingPathExtension().lastPathComponent) != nil { return true }
+        let library = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library")
+            .standardizedFileURL.resolvingSymlinksInPath().path + "/"
+        return path.hasPrefix(library) && url.pathExtension.lowercased() == "movpkg"
+    }
+
+    private func quarantine(_ task: URLSessionTask, location: URL? = nil) -> UUID {
+        if let url = task.originalRequest?.url { releaseProxy(url) }
+        if let asset = task as? AVAssetDownloadTask { releaseProxy(asset.urlAsset.url) }
+        let id = taskID(task) ?? UUID()
+        task.taskDescription = id.uuidString
+        if index(id) == nil {
+            let url = (task as? AVAssetDownloadTask)?.urlAsset.url ?? task.originalRequest?.url
+                ?? URL(string: "https://invalid.invalid/")!
+            var item = OfflineDownload(id: id, title: "隔离下载 · " + url.lastPathComponent,
+                sourceURL: url, headers: [:], format: task is AVAssetDownloadTask ? .hls : .mp4, createdAt: Date())
+            item.state = .failed
+            item.errorMessage = "原下载清单不可读，任务已停止；未猜测原下载信息。"
+            items.append(item)
+        }
+        if let location = location, let index = index(id) {
+            if ownedLocation(location), let relative = relativePath(location) {
+                items[index].localRelativePath = relative
+                items[index].state = .failed
+            } else {
+                items[index].errorMessage = "隔离文件不在本 App 可管理的离线目录内，未删除该文件。"
+            }
+        }
+        persist()
+        return id
     }
 
     private func relativePath(_ url: URL) -> String? {
@@ -237,14 +305,26 @@ final class DownloadsStore: NSObject, ObservableObject {
                 DispatchQueue.main.async {
                     defer { group.leave() }
                     guard let self = self else { return }
-                    guard self.manifestReadable else { return }
+                    guard self.manifestReadable else {
+                        for task in tasks { _ = self.quarantine(task); task.cancel() }
+                        return
+                    }
                     for task in tasks {
                         guard let id = self.taskID(task), let index = self.index(id),
                               [.queued, .downloading].contains(self.items[index].state) else {
+                            if let url = task.originalRequest?.url { self.releaseProxy(url) }
                             task.cancel()
                             continue
                         }
                         self.activeTasks[id] = task
+                        if self.isLoopback(self.items[index].sourceURL) {
+                            self.releaseProxy(self.items[index].sourceURL)
+                            self.items[index].state = .failed
+                            self.items[index].errorMessage = "当前不支持本地代理后台下载；已停止旧任务。"
+                            self.activeTasks[id] = nil
+                            task.cancel()
+                            continue
+                        }
                         self.items[index].state = .downloading
                         if task.state == .suspended { task.resume() }
                     }
@@ -264,6 +344,11 @@ final class DownloadsStore: NSObject, ObservableObject {
                 if item.state == .downloading && self.activeTasks[item.id] == nil {
                     // A delegate may already be validating this task's completed file.
                     if self.validations[item.id] != nil { continue }
+                    if let url = self.resolvedLocation(item) {
+                        checks.enter()
+                        self.recoverPersistedFile(item.id, url: url) { checks.leave() }
+                        continue
+                    }
                     self.items[index].state = .failed
                     self.items[index].errorMessage = "系统中已找不到该下载任务，请重新下载。"
                     self.cleanPendingLocation(item.id)
@@ -271,7 +356,10 @@ final class DownloadsStore: NSObject, ObservableObject {
                     checks.enter()
                     self.preparePlayback(item.id) { _ in checks.leave() }
                 } else if item.state == .failed || item.state == .cancelled {
-                    self.cleanPendingLocation(item.id)
+                    // A failed verification retains its persisted file for explicit deletion.
+                    if item.state == .cancelled || item.localRelativePath == nil {
+                        self.cleanPendingLocation(item.id)
+                    }
                 }
             }
             checks.notify(queue: .main) {
@@ -287,6 +375,13 @@ final class DownloadsStore: NSObject, ObservableObject {
         guard manifestReadable else { return }
         guard let index = index(id), items[index].state == .queued else { return }
         let item = items[index]
+        if isLoopback(item.sourceURL) {
+            releaseProxy(item.sourceURL)
+            items[index].state = .failed
+            items[index].errorMessage = "当前不支持特殊源本地代理的后台离线下载；下载代理已释放。"
+            persist()
+            return
+        }
         let task: URLSessionTask
         switch item.format {
         case .mp4:
@@ -315,7 +410,7 @@ final class DownloadsStore: NSObject, ObservableObject {
     }
 
     private func persist(throttled: Bool = false) {
-        guard manifestReadable else { return }
+        guard manifestReadable || quarantineReadable else { return }
         if throttled {
             guard pendingSave == nil else { return }
             let work = DispatchWorkItem { [weak self] in
@@ -330,20 +425,23 @@ final class DownloadsStore: NSObject, ObservableObject {
         pendingSave = nil
         do {
             let data = try JSONEncoder().encode(items)
-            try data.write(to: manifestURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-            storageError = nil
+            try data.write(to: manifestReadable ? manifestURL : quarantineURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            storageError = manifestReadable ? nil : manifestFailure
         } catch {
             storageError = "保存下载记录失败：\(error.localizedDescription)"
         }
     }
 
     private func cleanPendingLocation(_ id: UUID) {
-        guard manifestReadable else { return }
         let itemIndex = index(id)
         let recordedURL = itemIndex.flatMap { resolvedLocation(items[$0]) }
         let urls = Set([pendingLocations[id], recordedURL].compactMap { $0 })
         do {
             for url in urls {
+                guard ownedLocation(url) else {
+                    throw NSError(domain: "OfflineDownloads", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "文件不属于本 App 离线目录，未删除。"])
+                }
                 if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
             }
             pendingLocations.removeValue(forKey: id)
@@ -380,6 +478,30 @@ final class DownloadsStore: NSObject, ObservableObject {
         }
     }
 
+    private func recoverPersistedFile(_ id: UUID, url: URL, completion: @escaping () -> Void) {
+        guard let index = index(id) else { completion(); return }
+        let token = UUID()
+        validations[id] = token
+        validate(url, format: items[index].format) { [weak self] failure in
+            defer { completion() }
+            guard let self = self, self.validations[id] == token else { return }
+            self.validations[id] = nil
+            guard let index = self.index(id), self.items[index].state == .downloading,
+                  self.resolvedLocation(self.items[index]) == url else { return }
+            if let failure = failure {
+                self.items[index].state = .failed
+                self.items[index].errorMessage = failure
+                // Retain the failed file for an explicit user delete, not startup destruction.
+            } else {
+                self.items[index].state = .completed
+                self.items[index].progress = 1
+                self.items[index].errorMessage = nil
+                self.verifiedItems.insert(id)
+            }
+            self.persist()
+        }
+    }
+
     private func finishBackgroundEventsIfReady(_ identifier: String) {
         guard !isRestoring, finishedEventSessions.contains(identifier),
               validationCounts[identifier, default: 0] == 0,
@@ -408,6 +530,15 @@ extension DownloadsStore: URLSessionDownloadDelegate, AVAssetDownloadDelegate {
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didFinishDownloadingTo location: URL) {
+        if !manifestReadable {
+            let id = quarantine(downloadTask)
+            do {
+                let destination = rootURL.appendingPathComponent(id.uuidString + ".mp4")
+                try FileManager.default.moveItem(at: location, to: destination)
+                _ = quarantine(downloadTask, location: destination)
+            } catch { storageError = (manifestFailure ?? "") + "\n隔离文件保存失败：\(error.localizedDescription)" }
+            return
+        }
         guard let id = taskID(downloadTask), let index = index(id), items[index].state == .downloading else { return }
         guard let response = downloadTask.response as? HTTPURLResponse else {
             transferErrors[id] = "下载未返回有效的 HTTP 响应。"
@@ -464,7 +595,7 @@ extension DownloadsStore: URLSessionDownloadDelegate, AVAssetDownloadDelegate {
 
     func urlSession(_ session: URLSession, assetDownloadTask: AVAssetDownloadTask,
                     didFinishDownloadingTo location: URL) {
-        guard manifestReadable else { return }
+        guard manifestReadable else { _ = quarantine(assetDownloadTask, location: location); return }
         guard let id = taskID(assetDownloadTask) else { return }
         // Apple owns the package location: store it in place, never move an HLS package.
         pendingLocations[id] = location
@@ -481,7 +612,14 @@ extension DownloadsStore: URLSessionDownloadDelegate, AVAssetDownloadDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard manifestReadable else { return }
+        if let id = taskID(task), let index = index(id) { releaseProxy(items[index].sourceURL) }
+        else if let url = task.originalRequest?.url { releaseProxy(url) }
+        guard manifestReadable else {
+            let id = quarantine(task)
+            if let error = error, let index = index(id) { items[index].errorMessage = error.localizedDescription }
+            persist()
+            return
+        }
         guard let id = taskID(task) else { return }
         activeTasks.removeValue(forKey: id)
         let recordedError = transferErrors.removeValue(forKey: id)

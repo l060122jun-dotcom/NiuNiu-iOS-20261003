@@ -10,6 +10,8 @@ struct SavedVideo: Codable, Identifiable, Hashable {
     var episode: String = ""
     var playbackURL: String = ""
     var position: Double = 0
+    /// Actual player duration in seconds; absent in older records and never inferred.
+    var duration: Double? = nil
     var updated: Date = Date()
 }
 

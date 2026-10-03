@@ -28,6 +28,7 @@ import MediaPlayer
 @MainActor struct AndroidPlayerControls<More: View>: View {
     @ObservedObject var interaction: AndroidPlayerInteraction
     @Binding var locked: Bool
+    let sessionID: String
     let title: String
     let time: Double
     let duration: Double
@@ -93,6 +94,8 @@ import MediaPlayer
         .foregroundStyle(.white).buttonStyle(.plain)
         .onAppear { interaction.show() }
         .onDisappear { interaction.cancel() }
+        .onChange(of: sessionID) { _ in scrubbing = false; scrubTime = 0; interaction.cancel() }
+        .onChange(of: duration) { _ in scrubTime = safePosition(scrubTime) }
     }
 
     private var topBar: some View {
@@ -128,10 +131,10 @@ import MediaPlayer
                 icon("下一集", "forward.end.fill", action: onNext).disabled(!canNext)
                 Text(Self.format(scrubbing ? scrubTime : time)).font(.system(size: 11)).monospacedDigit()
                     .allowsHitTesting(false)
-                Slider(value: Binding(get: { scrubbing ? scrubTime : min(max(0, time), max(1, duration)) }, set: { scrubTime = $0 }), in: 0...max(1, duration), onEditingChanged: { active in
-                    if active { scrubTime = min(max(0, time), max(1, duration)); scrubbing = true; interaction.begin() }
-                    else { onSeek(scrubTime); scrubbing = false; interaction.end() }
-                }).tint(.green).disabled(duration <= 0).accessibilityLabel("播放进度")
+                Slider(value: Binding(get: { safePosition(scrubbing ? scrubTime : time) }, set: { scrubTime = safePosition($0) }), in: 0...safeDuration, onEditingChanged: { active in
+                    if active { scrubTime = safePosition(time); scrubbing = true; interaction.begin() }
+                    else if scrubbing { onSeek(safePosition(scrubTime)); scrubbing = false; interaction.end() }
+                }).tint(.green).disabled(!duration.isFinite || duration <= 0).accessibilityLabel("播放进度")
                 Text(Self.format(duration)).font(.system(size: 11)).monospacedDigit().allowsHitTesting(false)
                 icon(fullScreen ? "退出全屏" : "全屏", fullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right", action: onFullScreen)
             }
@@ -154,15 +157,18 @@ import MediaPlayer
         }.accessibilityLabel(title)
     }
     static func format(_ value: Double) -> String {
-        let seconds = value.isFinite ? Int(max(0, value)) : 0
+        let seconds = value.isFinite ? Int(min(86_400_000, max(0, value))) : 0
         if seconds >= 3600 { return String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60) }
         return String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
+    private var safeDuration: Double { duration.isFinite ? min(86_400_000, max(1, duration)) : 1 }
+    private func safePosition(_ value: Double) -> Double { value.isFinite ? min(safeDuration, max(0, value)) : 0 }
 }
 
 // This surface sits BELOW interactive danmaku and control buttons, not above them.
 // UIKit recognizers arbitrate tap/hold/pan so a slider never also starts a seek gesture.
 @MainActor struct AndroidPlayerGestureSurface: UIViewRepresentable {
+    let sessionID: String
     let enabled: Bool
     let locked: Bool
     let time: Double
@@ -174,6 +180,7 @@ import MediaPlayer
     let onHold: (Bool) -> Void
     func makeUIView(context: Context) -> GestureView { GestureView() }
     func updateUIView(_ view: GestureView, context: Context) {
+        if view.configuration?.sessionID != sessionID { view.cancelInteraction() }
         view.configuration = self
         if !enabled || locked { view.cancelInteraction() }
     }
@@ -224,7 +231,7 @@ import MediaPlayer
                 // Leave system navigation/home edge gestures alone.
                 let point = recognizer.location(in: self)
                 guard point.x > 20, point.x < bounds.width - 20, point.y > 12, point.y < bounds.height - 12 else { mode = 0; return }
-                originTime = config.time; originBrightness = UIScreen.main.brightness
+                originTime = config.time.isFinite ? max(0, config.time) : 0; originBrightness = UIScreen.main.brightness
                 originVolume = volumeSlider?.value ?? 0.5
                 let velocity = recognizer.velocity(in: self)
                 mode = abs(velocity.x) >= abs(velocity.y) ? 1 : (point.x < bounds.width / 2 ? 2 : 3)
@@ -232,7 +239,7 @@ import MediaPlayer
             }
             if recognizer.state == .changed {
                 switch mode {
-                case 1 where config.duration > 0:
+                case 1 where config.duration.isFinite && config.duration > 0:
                     let span = min(180, max(60, config.duration / 5))
                     let target = min(config.duration, max(0, originTime + Double(translation.x / max(1, bounds.width)) * span))
                     seekTarget = target

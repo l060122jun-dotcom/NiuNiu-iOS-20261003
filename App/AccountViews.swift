@@ -143,6 +143,7 @@ public final class AccountStore: ObservableObject {
         if authenticated { try requireLogin() }
         let session = token
         let result = try await APIClient.shared.request(path: path, params: params, method: method, body: body)
+        if method.uppercased() == "GET" { try Task.checkCancellation() }
         guard session == token else { throw AccountFailure.message("账号已发生变化，请重新加载") }
         // Current APIClient returns an envelope; also support the agreed payload-only
         // contract without mistaking a business model's ordinary fields for an envelope.
@@ -222,6 +223,15 @@ public final class AccountStore: ObservableObject {
 private final class AccountAction: ObservableObject {
     @Published var busy = false
     @Published var notice: String?
+    /// Reads wait for the previous operation; cancelled tab/account tasks never take the lock.
+    @discardableResult
+    func read(_ action: () async throws -> Void) async -> Bool {
+        do {
+            while busy { try await Task.sleep(nanoseconds: 50_000_000) }
+            try Task.checkCancellation()
+        } catch { return false }
+        return await run(action)
+    }
     @discardableResult
     func run(success: String? = nil, _ action: () async throws -> Void) async -> Bool {
         guard !busy else { return false }
@@ -319,7 +329,7 @@ public struct AccountCenterView: View {
         .confirmationDialog("退出此账号？本地游客资料不会删除。", isPresented: $confirmLogout, titleVisibility: .visible) {
             Button("退出登录", role: .destructive) { Task { await action.run { try account.logout() } } }
         }
-        .task(id: account.token) { if account.isLoggedIn { await action.run { try await account.refreshProfile() } } }
+        .task(id: account.token) { if account.isLoggedIn { await action.read { try await account.refreshProfile() } } }
     }
 }
 
@@ -376,7 +386,7 @@ public struct LoginView: View {
             .task { await loadQuestions() }
     }
     private func loadQuestions() async {
-        await action.run {
+        await action.read {
             let data = try AccountJSON.object(await account.request("config", authenticated: false))
             questions = (data["question_list"] as? [String] ?? []).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
             if questions.isEmpty { throw AccountFailure.message("服务器没有提供密保问题，无法注册；请重试或反馈") }
@@ -522,7 +532,7 @@ public struct AccountProfileView: View {
     }
     private func canEdit(_ key: String) -> Bool { (AccountJSON.integer(info ?? [:], key) ?? 0) > 0 }
     private func load() async {
-        await action.run {
+        await action.read {
             try await account.refreshProfile()
             info = nil
             let data = try AccountJSON.object(await account.request("profile/info"))
@@ -536,7 +546,7 @@ public struct AccountProfileView: View {
         }
     }
     private func loadAvatars() async {
-        await action.run {
+        await action.read {
             let data = try AccountJSON.object(await account.request("profile/avatar-urls"))
             avatars = (data["avatar_url_list"] as? [String] ?? []).reduce(into: [String]()) {
                 if !$1.isEmpty && !$0.contains($1) { $0.append($1) }
@@ -616,7 +626,7 @@ private struct AccountQuestionView: View {
             }
     }
     private func load() async {
-        await action.run {
+        await action.read {
             let data = try AccountJSON.object(await AccountStore.shared.request("config", authenticated: false))
             questions = (data["question_list"] as? [String] ?? []).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
             guard !questions.isEmpty else { throw AccountFailure.message("服务器没有提供密保问题") }
@@ -763,7 +773,7 @@ public struct MemberCenterView: View {
         } else { web = AccountWebDestination(url: url) }
     }
     private func load() async {
-        await action.run {
+        await action.read {
             var errors: [String] = []
             do {
                 let config = try AccountJSON.object(await account.request("config", authenticated: false))
@@ -823,7 +833,7 @@ private struct AccountRecordsView: View {
             .refreshable { await load(reset: true) }
     }
     private func load(reset: Bool) async {
-        await action.run {
+        await action.read {
             let next = reset ? 1 : page + 1
             let data = try AccountJSON.object(await account.request(kind == .cards ? "card/records" : "reward/points/records",
                 params: ["page": String(next), "pageSize": "20"]))
@@ -1056,7 +1066,8 @@ public struct MessagesView: View {
     }
     private func load(reset: Bool) async {
         let current = tab
-        await action.run {
+        await action.read {
+            guard current == tab else { return }
             let next = reset ? 1 : page + 1
             var params = ["page": String(next)]
             if current == .comments || current == .notifications { params["count"] = "20" }
@@ -1118,7 +1129,7 @@ private struct AccountMessageDetailView: View {
             }
     }
     private func loadDetail() async {
-        await action.run {
+        await action.read {
             guard let id = AccountJSON.integer(message.raw, "id"), id > 0 else { throw AccountFailure.message("公告缺少有效 ID") }
             detail = try AccountJSON.object(await AccountStore.shared.request("sysnotification/detail", params: ["id": String(id)], authenticated: false))
         }
@@ -1232,11 +1243,11 @@ public struct AccountLibraryView: View {
             .task(id: "\(account.token)|\(category)|\(historyMode)") {
                 selected = []; favorites = []; cloud = []; page = 0; more = true
                 if account.isLoggedIn {
-                    await action.run { try await account.refreshProfile(); try loadSnapshot() }
+                    await action.read { try await account.refreshProfile(); try Task.checkCancellation(); try loadSnapshot() }
                     if !historyMode { await loadFavorites(reset: true) }
                 } else { cloud = []; categories = [] }
             }
-            .refreshable { if !historyMode { await loadFavorites(reset: true) } else { await action.run { try loadSnapshot() } } }
+            .refreshable { if !historyMode { await loadFavorites(reset: true) } else { await action.read { try loadSnapshot() } } }
             .confirmationDialog("从服务器删除 \(selected.count) 条账号收藏？游客本地收藏不受影响。", isPresented: $confirmDelete, titleVisibility: .visible) {
                 Button("确认删除", role: .destructive) {
                     Task { await action.run(success: "服务器已删除所选收藏") {
@@ -1282,7 +1293,8 @@ public struct AccountLibraryView: View {
     }
     private func loadFavorites(reset: Bool) async {
         let current = category
-        await action.run {
+        await action.read {
+            guard current == category, !historyMode else { return }
             if reset {
                 categories = try AccountJSON.list(await account.request("types", authenticated: false))
                     .filter { !AccountJSON.text($0, "type_id").isEmpty && !AccountJSON.text($0, "type_name").isEmpty }
@@ -1335,12 +1347,29 @@ public struct AccountLibraryView: View {
                 if !saved.source.isEmpty && !saved.episode.isEmpty {
                     let sources = detail["sources"] as? [[String: Any]] ?? []
                     guard let videoSource = sources.first(where: { AccountJSON.text($0, "player_id") == saved.source }),
-                          let episodes = videoSource["episodes"] as? [[String: Any]],
-                          let episode = episodes.first(where: { AccountJSON.text($0, "name") == saved.episode }),
-                          let index = AccountJSON.integer(episode, "index") else {
+                          let episodes = videoSource["episodes"] as? [[String: Any]] else {
                         throw AccountFailure.message("《\(saved.title)》的播放线路或真实 episode index 不可确认，未上传任何条目")
                     }
-                    row["playerId"] = saved.source; row["episodeName"] = saved.episode; row["episodeIndex"] = index
+                    // Android assigns index from array order, not a server `index` field.
+                    let index: Int
+                    if let numeric = Int(saved.episode), episodes.indices.contains(numeric) {
+                        index = numeric
+                    } else {
+                        let matches = episodes.indices.filter { AccountJSON.text(episodes[$0], "name") == saved.episode }
+                        guard matches.count == 1, let match = matches.first else {
+                            throw AccountFailure.message("《\(saved.title)》的旧集名无法唯一匹配，未上传任何条目")
+                        }
+                        index = match
+                    }
+                    row["playerId"] = saved.source
+                    row["episodeName"] = AccountJSON.text(episodes[index], "name")
+                    row["episodeIndex"] = index
+                    if let duration = saved.duration {
+                        guard duration.isFinite, duration > 0, duration * 1000 <= Double(Int32.max) else {
+                            throw AccountFailure.message("《\(saved.title)》的真实时长无效，未上传任何条目")
+                        }
+                        row["duration"] = Int(duration * 1000)
+                    }
                 }
                 list.append(row)
             }

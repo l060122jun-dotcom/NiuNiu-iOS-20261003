@@ -36,6 +36,23 @@ final class APIClient {
     private var baseURL: URL
     private let deviceID: String
     private var token = ""
+    private var contextRevision: UInt64 = 0
+
+    private func checkContext(_ revision: UInt64) throws {
+        try Task.checkCancellation()
+        guard revision == contextRevision else { throw CancellationError() }
+    }
+
+    private func invalidateContext() {
+        contextRevision &+= 1
+        runtimeConfig = nil
+        configLoadedAt = .distantPast
+        categoryCache = nil
+        adultCategories = []
+        knownVideoCategories = [:]
+        episodeCategories = [:]
+        SpecialSourceResolver.shared.invalidateContext()
+    }
     private var categoryCache: [VideoCategory]?
     private var adultCategories = Set<String>()
     private var knownVideoCategories: [String: String] = [:]
@@ -67,11 +84,7 @@ final class APIClient {
 
     func setToken(_ value: String) {
         token = value
-        runtimeConfig = nil
-        categoryCache = nil
-        adultCategories = []
-        knownVideoCategories = [:]
-        episodeCategories = [:]
+        invalidateContext()
     }
 
     /// Source-equivalent mode state, without adding a UI control. Default is enabled.
@@ -79,8 +92,7 @@ final class APIClient {
         guard isTeenModeEnabled != enabled else { return }
         isTeenModeEnabled = enabled
         defaults.set(enabled, forKey: "api.teenMode")
-        runtimeConfig = nil
-        categoryCache = nil
+        invalidateContext()
     }
 
     private var protocolHeaders: [String: String] {
@@ -90,16 +102,22 @@ final class APIClient {
 
     /// Public contract: status is validated internally; only the `data` member is returned.
     func request(path: String, params: [String: String] = [:], method: String = "GET", body: [String: Any]? = nil) async throws -> Any {
+        var revision = contextRevision
+        try checkContext(revision)
         let url = try makeURL(path: path, params: params)
         let data = try body.map { try JSONSerialization.data(withJSONObject: $0) }
         let envelope: [String: Any]
         do {
             envelope = try await businessRequest(url: url, method: method, body: data)
         } catch let error as URLError where method.uppercased() == "GET" && [.timedOut, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost, .dnsLookupFailed].contains(error.code) {
+            try checkContext(revision)
             // Never repeat mutations or switch domains in response to an access challenge/business error.
-            try await discoverDomain()
+            revision = try await discoverDomain()
+            // Only the discovery owner can retry in the newly committed domain context.
+            try checkContext(revision)
             envelope = try await businessRequest(url: makeURL(path: path, params: params), method: method, body: data)
         }
+        try checkContext(revision)
         return envelope["data"] ?? NSNull()
     }
 
@@ -118,7 +136,9 @@ final class APIClient {
     }
 
     private func businessRequest(url: URL, method: String, body: Data?) async throws -> [String: Any] {
+        let revision = contextRevision
         let data = try await fetch(url, method: method, headers: protocolHeaders, body: body, contentType: body == nil ? nil : "application/json; charset=UTF-8")
+        try checkContext(revision)
         let object = try decodeJSON(data, url: url)
         guard let envelope = object as? [String: Any], let status = integer(envelope["status"]) else { throw APIError.invalidResponse }
         guard status == 0 else { throw APIError.business(status, envelope.text("msg")) }
@@ -130,8 +150,11 @@ final class APIClient {
     }
 
     func categories() async throws -> [VideoCategory] {
+        let revision = contextRevision
+        try checkContext(revision)
         if let categoryCache = categoryCache { return categoryCache }
         guard let rows = try await payload("types") as? [[String: Any]] else { throw APIError.invalidResponse }
+        try checkContext(revision)
         // Preserve every server row, name and ordering. Visibility is a separate mode policy.
         let catalog = rows.map { row in
             var row = row
@@ -174,8 +197,11 @@ final class APIClient {
     }
 
     func recommendations() async throws -> [Recommendation] {
+        let revision = contextRevision
         _ = try await categories()
+        try checkContext(revision)
         guard let rows = try await payload("main") as? [[String: Any]] else { throw APIError.invalidResponse }
+        try checkContext(revision)
         return rows.filter { acceptsCategory($0.text("type_id")) }.map {
             Recommendation(id: $0.text("type_id"), title: $0.text("title"), videos: safeVideos($0["list"] as? [[String: Any]] ?? [], contextCategory: $0.text("type_id")))
         }
@@ -191,12 +217,15 @@ final class APIClient {
     }
 
     func videos(category: String, page: Int = 1, filters: [String: String] = [:]) async throws -> [Video] {
+        let revision = contextRevision
         _ = try await categories()
+        try checkContext(revision)
         if !acceptsCategory(category) { return [] }
         let params = ["class": filters["class"] ?? "", "order": listOrder(filters["by"] ?? filters["order"] ?? "time"),
                       "type_id": category, "area": filters["area"] ?? "", "year": filters["year"] ?? "",
                       "state": filters["state"] ?? "", "wd": filters["wd"] ?? "", "page": String(max(1, page))]
         guard let rows = try await payload("list", params) as? [[String: Any]] else { throw APIError.invalidResponse }
+        try checkContext(revision)
         return safeVideos(rows, contextCategory: category)
     }
 
@@ -206,13 +235,17 @@ final class APIClient {
     }
 
     func detail(id: String) async throws -> Video {
+        let revision = contextRevision
         guard !id.isEmpty else { throw APIError.invalidResponse }
         _ = try await categories()
+        try checkContext(revision)
         guard let row = try await payload("detail", ["vod_id": id]) as? [String: Any], row.text("vod_id") == id else { throw APIError.invalidResponse }
+        try checkContext(revision)
         guard var video = safeVideos([row], contextCategory: knownVideoCategories[id]).first else { throw APIError.unsafeCategory }
         // Match VideoParser.filterVideoBeanSource: disabled/missing parser entries
         // must not be offered as selectable playback lines.
         let config = try await configuration()
+        try checkContext(revision)
         video.sources.removeAll { !sourceEnabled($0.id, config: config) }
         return video
     }
@@ -228,10 +261,13 @@ final class APIClient {
     }
 
     func rank(category: String, order: String) async throws -> [Video] {
+        let revision = contextRevision
         guard !category.isEmpty else { throw APIError.invalidResponse }
         _ = try await categories()
+        try checkContext(revision)
         if !acceptsCategory(category) { return [] }
         guard let rows = try await payload("rank", ["type_id": category, "order": order]) as? [[String: Any]] else { throw APIError.invalidResponse }
+        try checkContext(revision)
         return safeVideos(rows, contextCategory: category)
     }
 
@@ -241,35 +277,48 @@ final class APIClient {
     }
 
     func related(id: String) async throws -> [Video] {
+        let revision = contextRevision
         guard !id.isEmpty else { throw APIError.invalidResponse }
         _ = try await categories()
+        try checkContext(revision)
         if !acceptsCategory(knownVideoCategories[id]) { return [] }
         guard let rows = try await payload("recommend", ["vod_id": id]) as? [[String: Any]] else { throw APIError.invalidResponse }
+        try checkContext(revision)
         return safeVideos(rows)
     }
 
     /// No bundled fallback: sensitive configuration remains in memory and comes only from /config.
     func configuration() async throws -> [String: Any] {
+        let revision = contextRevision
+        try checkContext(revision)
         if let runtimeConfig = runtimeConfig, Date().timeIntervalSince(configLoadedAt) < 300 { return runtimeConfig }
         guard let result = try await payload("config") as? [String: Any] else { throw APIError.configurationUnavailable }
+        try checkContext(revision)
         runtimeConfig = result
         configLoadedAt = Date()
         return result
     }
 
-    func resolve(episode: Episode, source: String) async throws -> ResolvedVideo {
+    func resolve(episode: Episode, source: String, purpose: SpecialResolvePurpose = .playback) async throws -> ResolvedVideo {
+        let revision = contextRevision
         guard !episode.url.isEmpty else { throw APIError.parseFailed("原始地址为空") }
         _ = try await categories()
+        try checkContext(revision)
         let contexts = episodeCategories[source + "|" + episode.id] ?? []
         if !contexts.isEmpty && !contexts.contains(where: { acceptsCategory($0) }) { throw APIError.unsafeCategory }
         let config = try await configuration()
+        try checkContext(revision)
         if ["xm3u8", "hema", "xiaocao"].contains(source) {
-            return try await SpecialSourceResolver.shared.resolve(episode: episode, source: source, config: config)
+            let result = try await SpecialSourceResolver.shared.resolve(episode: episode, source: source, config: config, purpose: purpose)
+            try checkContext(revision)
+            return result
         }
         if let configKey = threeStepSources[source] {
             guard let settings = config[configKey] as? [String: Any] else { throw APIError.configurationUnavailable }
             guard (integer(settings["enable"]) ?? 0) != 0 else { throw APIError.parserDisabled }
-            return try await resolveThreeStep(original: episode.url, source: source, settings: settings)
+            let result = try await resolveThreeStep(original: episode.url, source: source, settings: settings)
+            try checkContext(revision)
+            return result
         }
         let parser = (config["parser"] as? [[String: Any]] ?? []).first { $0.text("player_id") == source }
         guard let parser = parser else { return try resolved(episode.url) }
@@ -289,6 +338,7 @@ final class APIClient {
                 var headers = protocolHeaders
                 headers.merge(headerModels(parser[headerKey])) { _, parserValue in parserValue }
                 let data = try await fetch(url, headers: headers)
+                try checkContext(revision)
                 guard let object = try decodeJSON(data, url: url) as? [String: Any] else { throw APIError.invalidResponse }
                 return try resolved(object.text("url"), headers: headerString(object.text("headers")))
             } catch is CancellationError { throw CancellationError() }
@@ -302,12 +352,16 @@ final class APIClient {
     }
 
     private func resolveThreeStep(original: String, source: String, settings: [String: Any]) async throws -> ResolvedVideo {
+        let revision = contextRevision
+        try checkContext(revision)
         let first = settings.text("yUrl")
         guard !first.isEmpty else { throw APIError.configurationUnavailable }
         let firstModel = try await parserJSON(first + original)
+        try checkContext(revision)
         if isForPlay(firstModel) { return try modelResolved(firstModel) }
         let binary = source == "ningmeng"
         let remote = try await remoteRequest(firstModel, binary: binary)
+        try checkContext(revision)
         let second = settings.text("eUrl")
         guard !second.isEmpty else { return try defaultResolved(settings) }
         var fields: [String: Any]
@@ -319,10 +373,12 @@ final class APIClient {
             fields = ["nndata": trimmed, "nnid": original]
         }
         let secondModel = try await parserJSON(second, body: base64JSON(fields))
+        try checkContext(revision)
         if binary {
             if secondModel.text("url").isEmpty { return try defaultResolved(settings) }
             if isForPlay(secondModel) { return try modelResolved(secondModel) }
             let data = try await remoteRequest(secondModel, binary: true)
+            try checkContext(revision)
             let encoded = data.base64EncodedString()
             return try await thirdStep(settings, fields: ["nndata": encoded, "nnid": Data(original.utf8).base64EncodedString(), "nndz": encoded])
         }
@@ -332,6 +388,7 @@ final class APIClient {
         if secondModel.text("type").lowercased() == "m3u8" {
             let headers = headerString(secondModel.text("headers"), lowercase: true)
             let data = try await fetch(validatedURL(stepURL), headers: headers)
+            try checkContext(revision)
             guard let text = String(data: try Crypto.gunzipIfNeeded(data), encoding: .utf8) else { throw Crypto.Failure.invalidUTF8 }
             content = text
             if let line = text.replacingOccurrences(of: "\r", with: "").components(separatedBy: "\n").first(where: { $0.contains(".m3u8") }) {
@@ -341,6 +398,7 @@ final class APIClient {
                 if !filename.isEmpty, let range = stepURL.range(of: filename) {
                     stepURL.replaceSubrange(range, with: line)
                     let child = try await fetch(validatedURL(stepURL), headers: headers)
+                    try checkContext(revision)
                     guard let childText = String(data: try Crypto.gunzipIfNeeded(child), encoding: .utf8) else { throw Crypto.Failure.invalidUTF8 }
                     content = childText
                 }
@@ -350,9 +408,12 @@ final class APIClient {
     }
 
     private func thirdStep(_ settings: [String: Any], fields: [String: Any]) async throws -> ResolvedVideo {
+        let revision = contextRevision
+        try checkContext(revision)
         let target = settings.text("sUrl")
         guard !target.isEmpty else { return try defaultResolved(settings) }
         let model = try await parserJSON(target, body: base64JSON(fields))
+        try checkContext(revision)
         guard model.text("code") == "200" else { return try defaultResolved(settings) }
         return try modelResolved(model)
     }
@@ -372,9 +433,11 @@ final class APIClient {
     }
 
     private func parserJSON(_ target: String, body: Data? = nil) async throws -> [String: Any] {
+        let revision = contextRevision
         let url = try validatedURL(target)
         // g3.e/g3.f have no Android business headers and use the encoded query for their AES key.
         let data = try await fetch(url, method: body == nil ? "GET" : "POST", body: body, contentType: body == nil ? nil : "text/plain; charset=UTF-8")
+        try checkContext(revision)
         guard let model = try decodeJSON(data, url: url, encodedQuery: true) as? [String: Any] else { throw APIError.invalidResponse }
         return model
     }
@@ -430,6 +493,8 @@ final class APIClient {
     }
 
     private func fetch(_ url: URL, method: String = "GET", headers: [String: String] = [:], body: Data? = nil, contentType: String? = nil) async throws -> Data {
+        let revision = contextRevision
+        try checkContext(revision)
         var request = URLRequest(url: url)
         request.httpMethod = method.uppercased()
         request.httpBody = body
@@ -439,17 +504,21 @@ final class APIClient {
         }
         if let contentType = contentType, request.value(forHTTPHeaderField: "Content-Type") == nil { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }
         let (data, response) = try await session.data(for: request)
+        try checkContext(revision)
         guard let response = response as? HTTPURLResponse else { throw APIError.invalidResponse }
         guard (200..<300).contains(response.statusCode) else { throw APIError.http(response.statusCode) }
         guard data.count <= 16 * 1024 * 1024 else { throw APIError.invalidResponse }
         return data
     }
 
-    private func discoverDomain() async throws {
+    private func discoverDomain() async throws -> UInt64 {
+        let revision = contextRevision
+        try checkContext(revision)
         for discovery in discoveries {
             let plain: String
             do {
                 let data = try await fetch(validatedURL(discovery), headers: protocolHeaders)
+                try checkContext(revision)
                 guard let text = String(data: data, encoding: .utf8) else { throw Crypto.Failure.invalidUTF8 }
                 if text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("http") { plain = text }
                 else {
@@ -469,11 +538,11 @@ final class APIClient {
                       url.query == nil, url.fragment == nil, let probe = URL(string: "tik", relativeTo: url)?.absoluteURL else { continue }
                 do {
                     _ = try await businessRequest(url: probe, method: "GET", body: nil)
+                    try checkContext(revision)
                     baseURL = url
                     defaults.set(url.absoluteString, forKey: "api.baseURL")
-                    categoryCache = nil
-                    runtimeConfig = nil
-                    return
+                    invalidateContext()
+                    return contextRevision
                 } catch let error as APIError {
                     if case .http(let code) = error, (400..<500).contains(code) { throw error }
                 } catch is CancellationError { throw CancellationError() }

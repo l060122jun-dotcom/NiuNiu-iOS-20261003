@@ -84,6 +84,7 @@ struct SettingsView: View {
         .background(BrowseTheme.background)
         .navigationTitle("设置")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .tabBar)
         .task {
             teenMode = APIClient.shared.isTeenModeEnabled
             await loadConfig()

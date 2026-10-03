@@ -15,6 +15,7 @@ final class PlaybackController: ObservableObject {
     @Published private(set) var rate: Float = 1
     @Published var error: String?
     @Published private(set) var isReady = false
+    @Published private(set) var isSeeking = false
     @Published private(set) var stage = "idle"
     @Published private(set) var videoToolboxEnabled = true
     @Published private(set) var capabilityMessage: String?
@@ -33,6 +34,8 @@ final class PlaybackController: ObservableObject {
     private var observers: [NSObjectProtocol] = []
     private var timer: Timer?
     private var pendingSeek: Double?
+    private var seekTarget: Double?
+    private var seekCompleted = false
     private var wantsToPlay = true
     private var didFinish = false
     private var fill = false
@@ -62,6 +65,9 @@ final class PlaybackController: ObservableObject {
         stage = "configure"
         videoToolboxEnabled = UserDefaults.standard.object(forKey: "niuniu.hardwareDecode") as? Bool ?? true
         pendingSeek = resume.isFinite && resume > 0 ? resume : nil
+        seekTarget = nil
+        seekCompleted = false
+        isSeeking = pendingSeek != nil
         lastProgressTime = -Double.infinity
 
         guard let headerOptions = Self.validatedHeaders(headers) else {
@@ -120,9 +126,13 @@ final class PlaybackController: ObservableObject {
         let target = duration > 0 ? min(max(0, seconds), duration) : max(0, seconds)
         if !isReady {
             pendingSeek = target
+            isSeeking = true
             return
         }
         didFinish = false
+        seekTarget = target
+        seekCompleted = false
+        isSeeking = true
         stage = "seek"
         core.currentPlaybackTime = target
         // Do not publish the requested target as actual progress; the timer reads IJK's clock.
@@ -159,6 +169,9 @@ final class PlaybackController: ObservableObject {
         position = 0
         duration = 0
         pendingSeek = nil
+        seekTarget = nil
+        seekCompleted = false
+        isSeeking = false
         stage = "stopped"
         if progress.isFinite && progress > 0 { onProgress?(progress) }
     }
@@ -211,13 +224,21 @@ final class PlaybackController: ObservableObject {
         case IJKMPMoviePlayerFirstVideoFrameRenderedNotification:
             stage = "render"
         case IJKMPMoviePlayerDidSeekCompleteNotification:
+            guard isSeeking, let target = seekTarget else { return }
+            if let reported = (note.userInfo?[IJKMPMoviePlayerDidSeekCompleteTargetKey] as? NSNumber)?.doubleValue,
+               abs(reported / 1000 - target) > 1 { return }
             let code = (note.userInfo?[IJKMPMoviePlayerDidSeekCompleteErrorKey] as? NSNumber)?.intValue ?? 0
             if code != 0 {
+                isSeeking = false; seekTarget = nil
                 error = Self.describe(stage: "seek", code: code, core: candidate)
             } else {
+                seekCompleted = true
                 stage = "playback"
             }
         case IJKMPMoviePlayerPlaybackDidFinishNotification:
+            // Suppress only natural completion; decoder/network failures remain visible.
+            let finishReason = (note.userInfo?[IJKMPMoviePlayerPlaybackDidFinishReasonUserInfoKey] as? NSNumber)?.intValue
+            if isSeeking && finishReason == IJKMPMovieFinishReason.playbackEnded.rawValue { return }
             guard !didFinish else { return }
             didFinish = true
             wantsToPlay = false
@@ -263,9 +284,14 @@ final class PlaybackController: ObservableObject {
         isPlaying = !didFinish && candidate.isPlaying()
         let seconds = candidate.currentPlaybackTime
         guard seconds.isFinite, seconds >= 0 else { return }
+        if isSeeking {
+            guard isReady, seekCompleted, let target = seekTarget, abs(seconds - target) <= 1 else { return }
+            seekTarget = nil
+            isSeeking = false
+        }
         position = seconds
         onTime?(seconds)
-        guard core === candidate else { return }
+        guard core === candidate, !isSeeking else { return }
         if isReady && abs(seconds - lastProgressTime) >= 5 {
             lastProgressTime = seconds
             onProgress?(seconds)
@@ -335,7 +361,7 @@ final class PlaybackController: ObservableObject {
 }
 
 /// Video only. The SwiftUI controls are a transparent overlay owned by DetailView.
-struct PlaybackSurface: UIViewRepresentable {
+@MainActor struct PlaybackSurface: UIViewRepresentable {
     @ObservedObject var controller: PlaybackController
     var fill: Bool = false
 

@@ -881,6 +881,21 @@ struct ProfileView: View {
     @ObservedObject private var account = AccountStore.shared
     @State private var showLogin = false
     @State private var profileError: String?
+    @State private var configuration: [String: Any] = [:]
+    @State private var configurationError: String?
+
+    private var memberConfiguration: [String: Any] {
+        configuration["member_module_config"] as? [String: Any] ?? [:]
+    }
+
+    private var showsMemberCard: Bool {
+        ["1", "2"].contains(memberConfiguration.text("member_style").trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func memberText(_ key: String, fallback: String) -> String {
+        let value = memberConfiguration.text(key).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? fallback : value
+    }
 
     private func profileText(_ keys: [String]) -> String {
         for key in keys {
@@ -892,7 +907,7 @@ struct ProfileView: View {
 
     private var nickname: String {
         let value = profileText(["nickname", "nick_name", "user_nick_name", "user_name", "username"])
-        return account.isLoggedIn ? (value.isEmpty ? "牛牛用户" : value) : "欢迎来到牛牛"
+        return account.isLoggedIn ? (value.isEmpty ? "牛牛用户" : value) : "点击登录"
     }
 
     private var membership: String {
@@ -914,84 +929,76 @@ struct ProfileView: View {
     }
 
     private var profileHeader: some View {
-        HStack(spacing: 16) {
-            AsyncImage(url: URL(string: profileText(["avatar", "avatar_url", "user_portrait", "portrait"]))) { phase in
+        VStack(spacing: 10) {
+            AsyncImage(url: URL(string: account.isLoggedIn
+                                 ? profileText(["user_portrait", "avatar", "avatar_url", "portrait"])
+                                 : configuration.text("default_avatar"))) { phase in
                 if let image = phase.image { image.resizable().scaledToFill() }
-                else {
-                    ZStack {
-                        BrowseTheme.green.opacity(0.18)
-                        Image(systemName: "person.fill").font(.system(size: 28)).foregroundStyle(BrowseTheme.green)
-                    }
+                else { Image("ProfileAvatarDefault").resizable().scaledToFill() }
+            }.frame(width: 64, height: 64).clipShape(Circle())
+            VStack(spacing: 6) {
+                Text(nickname).font(.system(size: 18, weight: .bold)).foregroundStyle(.primary).lineLimit(1)
+                if account.isLoggedIn {
+                    let phone = profileText(["user_phone", "phone"])
+                    Text(phone.isEmpty ? "手机号未绑定" : "手机号：\(phone)")
+                        .font(.system(size: 13)).foregroundStyle(.secondary).lineLimit(1)
                 }
-            }.frame(width: 66, height: 66).clipShape(Circle())
-            VStack(alignment: .leading, spacing: 7) {
-                Text(nickname).font(.title2.bold()).foregroundStyle(.primary)
-                Text(account.isLoggedIn ? "账号资料与个人中心" : "登录 / 注册，管理账号收藏")
-                    .font(.caption).foregroundStyle(.secondary)
             }
-            Spacer(minLength: 0)
-            Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-        }.padding(.vertical, 12)
+        }.frame(maxWidth: .infinity).padding(.top, 50).padding(.bottom, 11)
+            .contentShape(Rectangle())
     }
 
     var body: some View {
-        List {
-            Section {
+        ScrollView {
+            VStack(spacing: 11) {
                 if account.isLoggedIn {
-                    NavigationLink { AccountProfileView() } label: { profileHeader }
+                    NavigationLink { AccountProfileView().toolbar(.visible, for: .navigationBar) } label: { profileHeader }
                 } else {
                     Button { showLogin = true } label: { profileHeader }.buttonStyle(BrowsePressStyle())
                 }
-                NavigationLink { MemberCenterView() } label: {
-                    HStack {
-                        Label("会员中心", systemImage: "crown.fill").foregroundStyle(.primary)
-                        Spacer()
-                        Text(membership).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                    }.padding(.vertical, 6)
+                if showsMemberCard {
+                    NavigationLink { MemberCenterView().toolbar(.visible, for: .navigationBar) } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "crown.fill").font(.system(size: 28)).foregroundStyle(Color(red: 0.94, green: 0.78, blue: 0.48))
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("VIP会员中心").font(.system(size: 16, weight: .bold))
+                                Text(account.isLoggedIn ? membership : memberText("member_text", fallback: "开通VIP享受专属特权，海量视频抢先看"))
+                                    .font(.system(size: 10)).lineLimit(1)
+                            }
+                            Spacer(minLength: 0)
+                            Text(memberText("open", fallback: "立即开通"))
+                                .font(.system(size: 14)).foregroundStyle(.white).padding(.horizontal, 10).padding(.vertical, 6)
+                                .background(Color(red: 0.96, green: 0.75, blue: 0.42), in: Capsule())
+                        }.foregroundStyle(Color(red: 0.94, green: 0.82, blue: 0.61)).padding(.horizontal, 14).frame(height: 70)
+                            .background(Color(red: 0.18, green: 0.17, blue: 0.15), in: RoundedRectangle(cornerRadius: 10))
+                    }
                 }
-            }
-            Section("我的内容") {
-                NavigationLink { SavedLibraryView(kind: .favorites) } label: {
-                    Label("游客收藏（\(library.favorites.count)）", systemImage: "heart")
-                }
-                NavigationLink { AccountLibraryView() } label: {
-                    Label("账号收藏", systemImage: "heart.text.square")
-                }
-                NavigationLink { SavedLibraryView(kind: .history) } label: {
-                    Label("观看历史（\(library.history.count)）", systemImage: "clock")
-                }
-                NavigationLink { DownloadsView() } label: { Label("我的下载", systemImage: "arrow.down.circle") }
-                NavigationLink { MessagesView() } label: {
-                    Label("我的评论", systemImage: "text.bubble")
-                }
-            }
-            Section("账号与服务") {
-                NavigationLink { AccountCenterView() } label: { Label("账号中心", systemImage: "person.crop.circle") }
-                NavigationLink { MessagesView() } label: { Label("消息通知", systemImage: "bell") }
-                NavigationLink { FeedbackView() } label: { Label("意见反馈", systemImage: "square.and.pencil") }
-                ShareLink(item: URL(string: "https://www.xinniuniushipin.com/")!,
-                          subject: Text("牛牛视频"), message: Text("快来牛牛视频发现喜欢的影片")) {
-                    Label("分享 APP", systemImage: "square.and.arrow.up").foregroundStyle(.primary)
-                }
-                NavigationLink { SettingsView() } label: { Label("设置", systemImage: "gearshape") }
-            }
-            Section {
-                Text("游客收藏与观看历史保存在本机；账号收藏和评论来自登录账号。")
-                    .font(.caption).foregroundStyle(.secondary)
+                historyCard
+                functionCard
                 if let error = account.credentialError {
                     Text(error).font(.footnote).foregroundStyle(.red)
                 }
                 if let error = profileError {
                     BrowseMessage(title: "账号资料加载失败", detail: error) { Task { await refreshProfile() } }
                 }
-            }
+                if let error = configurationError {
+                    Button { Task { await loadConfiguration() } } label: {
+                        Text("配置加载失败：\(error) · 点击重试").font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+            }.padding(.horizontal, 15).padding(.bottom, 11)
         }
-        .scrollContentBackground(.hidden)
-        .listRowBackground(BrowseTheme.surface)
-        .background(BrowseTheme.background)
-        .navigationTitle("我").navigationBarTitleDisplayMode(.large)
-        .toolbarBackground(BrowseTheme.background, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
+        .buttonStyle(BrowsePressStyle())
+        .background {
+            GeometryReader { geometry in
+                VStack(spacing: 0) {
+                    Image("ProfileTopBackground").resizable().frame(height: geometry.size.width * 0.576)
+                    Spacer(minLength: 0)
+                }.ignoresSafeArea(edges: .top)
+            }.background(Color(uiColor: .systemGroupedBackground))
+        }
+        .navigationTitle("我").navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .navigationBar)
         .sheet(isPresented: $showLogin) {
             NavigationStack {
                 LoginView()
@@ -999,8 +1006,64 @@ struct ProfileView: View {
             }.presentationDetents([.large]).presentationDragIndicator(.visible)
         }
         .onChange(of: account.isLoggedIn) { loggedIn in if loggedIn { showLogin = false } }
-        .task(id: account.isLoggedIn) { await refreshProfile() }
-        .refreshable { await refreshProfile() }
+        .task(id: account.token) { await refreshProfile() }
+        .task { await loadConfiguration() }
+        .refreshable { await refreshProfile(); await loadConfiguration() }
+    }
+
+    private var historyCard: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("播放历史").font(.system(size: 16, weight: .bold))
+                Spacer()
+                NavigationLink { ProfileHistoryView() } label: {
+                    HStack(spacing: 4) {
+                        Text("查看更多")
+                        Image(systemName: "chevron.right").font(.system(size: 10))
+                    }.font(.system(size: 12)).foregroundStyle(.secondary).frame(minHeight: 32)
+                }
+            }
+            if !library.history.isEmpty {
+                GeometryReader { geometry in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(Array(library.history.prefix(9))) { video in
+                                ProfileHistoryTile(video: video).frame(width: max(1, (geometry.size.width - 20) / 3))
+                            }
+                        }
+                    }
+                }.frame(height: 90)
+            }
+        }.padding(.horizontal, 12).padding(.top, 10).padding(.bottom, library.history.isEmpty ? 10 : 16)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var functionCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("常用功能").font(.system(size: 16, weight: .bold)).padding(.horizontal, 16).padding(.vertical, 10)
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: 4), spacing: 10) {
+                NavigationLink { ProfileFavoritesView() } label: { ProfileFunctionLabel(title: "我的收藏", image: "ProfileFavorite") }
+                NavigationLink { DownloadsView().toolbar(.visible, for: .navigationBar) } label: { ProfileFunctionLabel(title: "我的下载", image: "ProfileDownload") }
+                ShareLink(item: URL(string: "https://www.xinniuniushipin.com/")!, subject: Text("牛牛视频"), message: Text("快来牛牛视频发现喜欢的影片")) {
+                    ProfileFunctionLabel(title: "分享APP", image: "ProfileShare")
+                }
+                NavigationLink { MessagesView().toolbar(.visible, for: .navigationBar) } label: { ProfileFunctionLabel(title: "消息评论", image: "ProfileMessage") }
+                NavigationLink { FeedbackView().toolbar(.visible, for: .navigationBar) } label: { ProfileFunctionLabel(title: "意见反馈", image: "ProfileFeedback") }
+                NavigationLink { SettingsView().toolbar(.visible, for: .navigationBar) } label: { ProfileFunctionLabel(title: "设置", image: "ProfileSettings") }
+                Color.clear.frame(height: 64).accessibilityHidden(true)
+                Color.clear.frame(height: 64).accessibilityHidden(true)
+            }.padding(.horizontal, 13).padding(.bottom, 6)
+        }.background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func loadConfiguration() async {
+        configurationError = nil
+        do {
+            let response = try await account.request("config", authenticated: false)
+            try Task.checkCancellation()
+            configuration = response as? [String: Any] ?? [:]
+        } catch is CancellationError { }
+        catch { configurationError = error.localizedDescription }
     }
 
     private func refreshProfile() async {
@@ -1009,6 +1072,77 @@ struct ProfileView: View {
         do { try await account.refreshProfile() }
         catch is CancellationError { }
         catch { profileError = error.localizedDescription }
+    }
+}
+
+private struct ProfileFunctionLabel: View {
+    let title: String
+    let image: String
+    var body: some View {
+        VStack(spacing: 5) {
+            Image(image).resizable().scaledToFit().frame(width: 24, height: 24)
+            Text(title).font(.system(size: 14)).lineLimit(1).minimumScaleFactor(0.8)
+        }.foregroundStyle(.primary).frame(maxWidth: .infinity).frame(height: 64).contentShape(Rectangle())
+    }
+}
+
+@MainActor
+private struct ProfileHistoryTile: View {
+    let video: SavedVideo
+    private var time: String {
+        let seconds = video.position.isFinite ? Int(max(0, min(video.position, 86_400_000))) : 0
+        return seconds >= 3600 ? String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+            : String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+    var body: some View {
+        NavigationLink { DetailView(videoID: video.id).toolbar(.visible, for: .navigationBar) } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                GeometryReader { geometry in
+                    AsyncImage(url: URL(string: video.poster)) { phase in
+                        if let image = phase.image { image.resizable().scaledToFill() }
+                        else { Color(uiColor: .tertiarySystemFill) }
+                    }.frame(width: geometry.size.width, height: 64).clipped()
+                }.frame(height: 64).clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(alignment: .bottomTrailing) {
+                        Text(time).font(.system(size: 11)).foregroundStyle(.white).padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 3)).padding(5)
+                    }
+                Text([video.title, video.episode].filter { !$0.isEmpty }.joined(separator: " "))
+                    .font(.system(size: 14)).foregroundStyle(.primary).lineLimit(1)
+            }
+        }.buttonStyle(BrowsePressStyle())
+    }
+}
+
+@MainActor
+private struct ProfileFavoritesView: View {
+    @State private var local = false
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("收藏来源", selection: $local) {
+                Text("账号收藏").tag(false)
+                Text("游客收藏（本机）").tag(true)
+            }.pickerStyle(.segmented).padding(12)
+            if local { SavedLibraryView(kind: .favorites) }
+            else { AccountLibraryView() }
+        }.navigationTitle("我的收藏").navigationBarTitleDisplayMode(.inline)
+            .toolbar(.visible, for: .navigationBar)
+    }
+}
+
+@MainActor
+private struct ProfileHistoryView: View {
+    var body: some View {
+        SavedLibraryView(kind: .history)
+            .navigationTitle("播放历史").navigationBarTitleDisplayMode(.inline)
+            .toolbar(.visible, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    NavigationLink { AccountLibraryView().toolbar(.visible, for: .navigationBar) } label: {
+                        Text("云历史")
+                    }
+                }
+            }
     }
 }
 
