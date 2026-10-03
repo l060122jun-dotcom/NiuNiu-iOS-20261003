@@ -1,0 +1,34 @@
+name: Build unsigned iOS application
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install xcodegen
+      - run: xcodegen generate
+      - name: Build iPhone application
+        run: >-
+          xcodebuild -project NiuNiu.xcodeproj -scheme NiuNiu
+          -configuration Release -sdk iphoneos
+          -destination 'generic/platform=iOS'
+          -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Package
+        run: |
+          mkdir -p package/Payload
+          cp -R build/Build/Products/Release-iphoneos/NiuNiu.app package/Payload/
+          cd package
+          zip -qry ../NiuNiu-unsigned.ipa Payload
+          cd ..
+          shasum -a 256 NiuNiu-unsigned.ipa > NiuNiu-unsigned.ipa.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NiuNiu-unsigned
+          path: |
+            NiuNiu-unsigned.ipa
+            NiuNiu-unsigned.ipa.sha256

@@ -1,0 +1,470 @@
+import Foundation
+import UIKit
+
+enum APIError: LocalizedError {
+    case invalidURL, http(Int), business(Int, String), invalidResponse, unsafeCategory
+    case unsupportedSource(String), parserDisabled, parseFailed(String), configurationUnavailable
+    var errorDescription: String? {
+        switch self {
+        case .invalidURL: return "请求地址无效"
+        case .http(let code): return "服务器请求失败（HTTP \(code)）；不会绕过访问验证"
+        case .business(let code, let message): return message.isEmpty ? "业务请求失败（\(code)）" : message
+        case .invalidResponse: return "服务器返回的数据结构无效"
+        case .unsafeCategory: return "该内容不属于当前允许的青少年分类"
+        case .unsupportedSource(let source): return "\(source) 需要专用分段签名与验证流程，当前播放器尚未接入；请切换其他线路"
+        case .parserDisabled: return "该播放线路已被服务器停用"
+        case .parseFailed(let stage): return "播放地址解析失败：\(stage)"
+        case .configurationUnavailable: return "动态播放配置不可用，请稍后重试；不会使用内置密钥或绕过验证"
+        }
+    }
+}
+
+@MainActor
+final class APIClient {
+    static let shared = APIClient()
+    private let defaults = UserDefaults.standard
+    private let session: URLSession
+    private var baseURL: URL
+    private let deviceID: String
+    private var token = ""
+    private var categoryCache: [VideoCategory]?
+    private var allowedCategories = Set<String>()
+    private var knownSafeVideoIDs = Set<String>()
+    private var knownVideoCategories: [String: String] = [:]
+    private var approvedEpisodes = Set<String>()
+    private var runtimeConfig: [String: Any]?
+    private var configLoadedAt = Date.distantPast
+    private let discoveries = ["https://nnal.oss-cn-beijing.aliyuncs.com/nn.php", "https://nn-1352193558.cos.ap-guangzhou.myqcloud.com/nn.php"]
+    private let threeStepSources = ["pp": "src3", "madou": "src4", "douban": "src5", "juzi": "src6", "shanju": "src8", "ningmeng": "src9", "shizi": "src10", "paopao": "src11", "leidian": "src12"]
+
+    private init() {
+        let saved = defaults.string(forKey: "api.baseURL") ?? "https://nn.123xiangshang.com:35620/"
+        baseURL = URL(string: saved) ?? URL(string: "https://nn.123xiangshang.com:35620/")!
+        if let stored = defaults.string(forKey: "api.deviceUUID"), UUID(uuidString: stored) != nil {
+            deviceID = stored
+        } else {
+            deviceID = UUID().uuidString.lowercased()
+            defaults.set(deviceID, forKey: "api.deviceUUID")
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 45
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpShouldSetCookies = false
+        session = URLSession(configuration: configuration)
+    }
+
+    func setToken(_ value: String) {
+        token = value
+        runtimeConfig = nil
+        categoryCache = nil
+        allowedCategories = []
+        knownSafeVideoIDs = []
+        knownVideoCategories = [:]
+        approvedEpisodes = []
+    }
+
+    private var protocolHeaders: [String: String] {
+        ["p": "android", "pkg": "com.qingbian.jz", "v": "1.6.2", "y": "1", "d": deviceID,
+         "t": token, "product": UIDevice.current.model, "os": UIDevice.current.systemVersion]
+    }
+
+    /// Public contract: status is validated internally; only the `data` member is returned.
+    func request(path: String, params: [String: String] = [:], method: String = "GET", body: [String: Any]? = nil) async throws -> Any {
+        let url = try makeURL(path: path, params: params)
+        let data = try body.map { try JSONSerialization.data(withJSONObject: $0) }
+        let envelope: [String: Any]
+        do {
+            envelope = try await businessRequest(url: url, method: method, body: data)
+        } catch let error as URLError where method.uppercased() == "GET" && [.timedOut, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost, .dnsLookupFailed].contains(error.code) {
+            // Never repeat mutations or switch domains in response to an access challenge/business error.
+            try await discoverDomain()
+            envelope = try await businessRequest(url: makeURL(path: path, params: params), method: method, body: data)
+        }
+        return envelope["data"] ?? NSNull()
+    }
+
+    private func makeURL(path: String, params: [String: String]) throws -> URL {
+        guard !path.contains("://"), let url = URL(string: path, relativeTo: baseURL)?.absoluteURL,
+              url.host == baseURL.host, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { throw APIError.invalidURL }
+        let order = ["class", "order", "type_id", "area", "year", "state", "wd", "page"]
+        let keys = params.keys.sorted { (order.firstIndex(of: $0) ?? 99, $0) < (order.firstIndex(of: $1) ?? 99, $1) }
+        if !keys.isEmpty {
+            components.percentEncodedQuery = keys.map {
+                Crypto.androidURIEncode($0) + "=" + Crypto.androidURIEncode(params[$0] ?? "")
+            }.joined(separator: "&")
+        }
+        guard let result = components.url else { throw APIError.invalidURL }
+        return result
+    }
+
+    private func businessRequest(url: URL, method: String, body: Data?) async throws -> [String: Any] {
+        let data = try await fetch(url, method: method, headers: protocolHeaders, body: body, contentType: body == nil ? nil : "application/json; charset=UTF-8")
+        let object = try decodeJSON(data, url: url)
+        guard let envelope = object as? [String: Any], let status = integer(envelope["status"]) else { throw APIError.invalidResponse }
+        guard status == 0 else { throw APIError.business(status, envelope.text("msg")) }
+        return envelope
+    }
+
+    private func payload(_ path: String, _ params: [String: String] = [:]) async throws -> Any {
+        try await request(path: path, params: params)
+    }
+
+    func categories() async throws -> [VideoCategory] {
+        if let categoryCache = categoryCache { return categoryCache }
+        guard let rows = try await payload("types") as? [[String: Any]] else { throw APIError.invalidResponse }
+        let names: Set<String> = ["电影", "电影片", "剧集", "电视剧", "连续剧", "综艺", "综艺片", "动漫", "动画", "动漫片", "短剧", "短剧片", "AI短剧", "直播", "电视直播"]
+        var seen = Set<String>()
+        let safe = rows.filter {
+            names.contains($0.text("type_name")) && ($0["type_extend"] as? [String: Any])?.text("version") != "adult"
+        }.map { row -> VideoCategory in
+            var category = VideoCategory(row)
+            if category.name == "AI短剧" { category.name = "短剧" }
+            return category
+        }.filter { !$0.id.isEmpty && seen.insert($0.id).inserted }
+        allowedCategories = Set(safe.map(\.id))
+        categoryCache = safe
+        return safe
+    }
+
+    private func requireCategory(_ category: String) async throws {
+        _ = try await categories()
+        guard allowedCategories.contains(category) else { throw APIError.unsafeCategory }
+    }
+
+    private func safeVideos(_ rows: [[String: Any]], contextCategory: String? = nil) -> [Video] {
+        // /list and /main cards omit type_id. Trust only the already-approved request/block
+        // category; explicit unknown or adult categories are still rejected.
+        rows.filter {
+            let category = $0.text("type_id")
+            return allowedCategories.contains(category.isEmpty ? (contextCategory ?? "") : category)
+        }.map { row in
+            var row = row
+            if row.text("type_id").isEmpty, let contextCategory = contextCategory { row["type_id"] = contextCategory }
+            let video = Video(row)
+            knownSafeVideoIDs.insert(video.id)
+            knownVideoCategories[video.id] = row.text("type_id")
+            for source in video.sources {
+                for episode in source.episodes { approvedEpisodes.insert(source.id + "|" + episode.id) }
+            }
+            return video
+        }
+    }
+
+    func recommendations() async throws -> [Recommendation] {
+        _ = try await categories()
+        guard let rows = try await payload("main") as? [[String: Any]] else { throw APIError.invalidResponse }
+        return rows.filter { allowedCategories.contains($0.text("type_id")) }.map {
+            Recommendation(id: $0.text("type_id"), title: $0.text("title"), videos: safeVideos($0["list"] as? [[String: Any]] ?? [], contextCategory: $0.text("type_id")))
+        }
+    }
+
+    private func listOrder(_ order: String) -> String {
+        switch order {
+        case "time", "最新", "": return "最新"
+        case "hits", "最热": return "最热"
+        case "score", "评分": return "评分"
+        default: return "最新"
+        }
+    }
+
+    func videos(category: String, page: Int = 1, filters: [String: String] = [:]) async throws -> [Video] {
+        try await requireCategory(category)
+        let params = ["class": filters["class"] ?? "", "order": listOrder(filters["by"] ?? filters["order"] ?? "time"),
+                      "type_id": category, "area": filters["area"] ?? "", "year": filters["year"] ?? "",
+                      "state": filters["state"] ?? "", "wd": filters["wd"] ?? "", "page": String(max(1, page))]
+        guard let rows = try await payload("list", params) as? [[String: Any]] else { throw APIError.invalidResponse }
+        return safeVideos(rows, contextCategory: category)
+    }
+
+    func search(query: String, category: String, page: Int = 1) async throws -> [Video] {
+        if !category.isEmpty { return try await videos(category: category, page: page, filters: ["wd": query]) }
+        // Global search = one scoped page per allowed family (at most six requests),
+        // aggregated in catalog order and deduplicated. Ten aggregate pages maximum.
+        guard page <= 10 else { return [] }
+        let catalog = try await categories()
+        var result: [Video] = []
+        var seen = Set<String>()
+        for category in catalog.prefix(6) {
+            try Task.checkCancellation()
+            let rows = try await videos(category: category.id, page: page, filters: ["wd": query])
+            result += rows.filter { seen.insert($0.id).inserted }
+        }
+        return result
+    }
+
+    func detail(id: String) async throws -> Video {
+        _ = try await categories()
+        guard let row = try await payload("detail", ["vod_id": id]) as? [String: Any], row.text("vod_id") == id else { throw APIError.invalidResponse }
+        guard let video = safeVideos([row], contextCategory: knownVideoCategories[id]).first else { throw APIError.unsafeCategory }
+        return video
+    }
+
+    func rank(category: String, order: String) async throws -> [Video] {
+        try await requireCategory(category)
+        guard let rows = try await payload("rank", ["type_id": category, "order": order]) as? [[String: Any]] else { throw APIError.invalidResponse }
+        return safeVideos(rows, contextCategory: category)
+    }
+
+    func suggest(keyword: String) async throws -> [String] {
+        guard let values = try await payload("suggest", ["keyword": keyword]) as? [String] else { throw APIError.invalidResponse }
+        return values
+    }
+
+    func related(id: String) async throws -> [Video] {
+        if !knownSafeVideoIDs.contains(id) { _ = try await detail(id: id) }
+        guard let rows = try await payload("recommend", ["vod_id": id]) as? [[String: Any]] else { throw APIError.invalidResponse }
+        return try await verifiedUnscopedVideos(rows)
+    }
+
+    private func verifiedUnscopedVideos(_ rows: [[String: Any]]) async throws -> [Video] {
+        var result: [Video] = []
+        for row in rows {
+            try Task.checkCancellation()
+            if !row.text("type_id").isEmpty {
+                result += safeVideos([row])
+            } else if knownSafeVideoIDs.contains(row.text("vod_id")) {
+                result += safeVideos([row], contextCategory: knownVideoCategories[row.text("vod_id")])
+            } else if !row.text("vod_id").isEmpty {
+                do { result.append(try await detail(id: row.text("vod_id"))) }
+                catch APIError.unsafeCategory { continue }
+            }
+        }
+        return result
+    }
+
+    /// No bundled fallback: sensitive configuration remains in memory and comes only from /config.
+    func configuration() async throws -> [String: Any] {
+        if let runtimeConfig = runtimeConfig, Date().timeIntervalSince(configLoadedAt) < 300 { return runtimeConfig }
+        guard let result = try await payload("config") as? [String: Any] else { throw APIError.configurationUnavailable }
+        runtimeConfig = result
+        configLoadedAt = Date()
+        return result
+    }
+
+    func resolve(episode: Episode, source: String) async throws -> ResolvedVideo {
+        guard approvedEpisodes.contains(source + "|" + episode.id) else { throw APIError.unsafeCategory }
+        guard !episode.url.isEmpty else { throw APIError.parseFailed("原始地址为空") }
+        let config = try await configuration()
+        if ["xm3u8", "hema", "xiaocao"].contains(source) {
+            return try await SpecialSourceResolver.shared.resolve(episode: episode, source: source, config: config)
+        }
+        if let configKey = threeStepSources[source] {
+            guard let settings = config[configKey] as? [String: Any] else { throw APIError.configurationUnavailable }
+            guard (integer(settings["enable"]) ?? 0) != 0 else { throw APIError.parserDisabled }
+            return try await resolveThreeStep(original: episode.url, source: source, settings: settings)
+        }
+        let parser = (config["parser"] as? [[String: Any]] ?? []).first { $0.text("player_id") == source }
+        guard let parser = parser else { return try resolved(episode.url) }
+        guard (integer(parser["enable"]) ?? 1) == 1 else { throw APIError.parserDisabled }
+        let rules = parser.text("no_parse_rule").split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        if rules.contains(where: { episode.url.contains($0) }) {
+            return try resolved(episode.url, headers: headerModels(parser["headers"]))
+        }
+        var lastError: Error = APIError.parseFailed("主备解析地址为空")
+        for (urlKey, headerKey) in [("url", "headers"), ("url2", "headers2")] {
+            let format = parser.text(urlKey)
+            guard !format.isEmpty else { continue }
+            do {
+                // Java String.format passes the original URL verbatim, not form-encoded.
+                let target = format.replacingOccurrences(of: "%s", with: episode.url)
+                let url = try validatedURL(target)
+                var headers = protocolHeaders
+                headers.merge(headerModels(parser[headerKey])) { _, parserValue in parserValue }
+                let data = try await fetch(url, headers: headers)
+                guard let object = try decodeJSON(data, url: url) as? [String: Any] else { throw APIError.invalidResponse }
+                return try resolved(object.text("url"), headers: headerString(object.text("headers")))
+            } catch is CancellationError { throw CancellationError() }
+            catch let error as URLError where error.code == .cancelled { throw error }
+            catch let error as APIError {
+                if case .http(let code) = error, (400..<500).contains(code) { throw error }
+                lastError = error
+            } catch { lastError = error }
+        }
+        throw lastError
+    }
+
+    private func resolveThreeStep(original: String, source: String, settings: [String: Any]) async throws -> ResolvedVideo {
+        let first = settings.text("yUrl")
+        guard !first.isEmpty else { throw APIError.configurationUnavailable }
+        let firstModel = try await parserJSON(first + original)
+        if isForPlay(firstModel) { return try modelResolved(firstModel) }
+        let binary = source == "ningmeng"
+        let remote = try await remoteRequest(firstModel, binary: binary)
+        let second = settings.text("eUrl")
+        guard !second.isEmpty else { return try defaultResolved(settings) }
+        var fields: [String: Any]
+        if binary {
+            fields = ["nndata": remote.base64EncodedString(), "nnid": Data(original.utf8).base64EncodedString()]
+        } else {
+            guard let text = String(data: try Crypto.gunzipIfNeeded(remote), encoding: .utf8) else { throw Crypto.Failure.invalidUTF8 }
+            guard let trimmed = clip(text, fore: settings.text("qSubstr"), tail: settings.text("hSubstr")) else { return try defaultResolved(settings) }
+            fields = ["nndata": trimmed, "nnid": original]
+        }
+        let secondModel = try await parserJSON(second, body: base64JSON(fields))
+        if binary {
+            if secondModel.text("url").isEmpty { return try defaultResolved(settings) }
+            if isForPlay(secondModel) { return try modelResolved(secondModel) }
+            let data = try await remoteRequest(secondModel, binary: true)
+            let encoded = data.base64EncodedString()
+            return try await thirdStep(settings, fields: ["nndata": encoded, "nnid": Data(original.utf8).base64EncodedString(), "nndz": encoded])
+        }
+        guard secondModel.text("code") == "200" else { return try defaultResolved(settings) }
+        var stepURL = secondModel.text("url")
+        var content = stepURL
+        if secondModel.text("type").lowercased() == "m3u8" {
+            let headers = headerString(secondModel.text("headers"), lowercase: true)
+            let data = try await fetch(validatedURL(stepURL), headers: headers)
+            guard let text = String(data: try Crypto.gunzipIfNeeded(data), encoding: .utf8) else { throw Crypto.Failure.invalidUTF8 }
+            content = text
+            if let line = text.replacingOccurrences(of: "\r", with: "").components(separatedBy: "\n").first(where: { $0.contains(".m3u8") }) {
+                // Mirrors Android's filename replacement, including preserving the original query.
+                let noQuery = stepURL.components(separatedBy: "?")[0]
+                let filename = (noQuery as NSString).lastPathComponent
+                if !filename.isEmpty, let range = stepURL.range(of: filename) {
+                    stepURL.replaceSubrange(range, with: line)
+                    let child = try await fetch(validatedURL(stepURL), headers: headers)
+                    guard let childText = String(data: try Crypto.gunzipIfNeeded(child), encoding: .utf8) else { throw Crypto.Failure.invalidUTF8 }
+                    content = childText
+                }
+            }
+        }
+        return try await thirdStep(settings, fields: ["nndata": content, "nnid": original, "nndz": stepURL])
+    }
+
+    private func thirdStep(_ settings: [String: Any], fields: [String: Any]) async throws -> ResolvedVideo {
+        let target = settings.text("sUrl")
+        guard !target.isEmpty else { return try defaultResolved(settings) }
+        let model = try await parserJSON(target, body: base64JSON(fields))
+        guard model.text("code") == "200" else { return try defaultResolved(settings) }
+        return try modelResolved(model)
+    }
+
+    private func remoteRequest(_ model: [String: Any], binary: Bool) async throws -> Data {
+        let get = model.text("get") == "1"
+        var body: Data?
+        if !get {
+            if binary {
+                let compact = model.text("body").components(separatedBy: .whitespacesAndNewlines).joined()
+                guard let decoded = Data(base64Encoded: compact) else { throw Crypto.Failure.invalidBase64 }
+                body = decoded
+            } else { body = Data(model.text("body").utf8) }
+        }
+        return try await fetch(validatedURL(model.text("url")), method: get ? "GET" : "POST", headers: headerString(model.text("headers"), lowercase: true), body: body,
+                               contentType: get ? nil : (binary ? "application/octet-stream" : "text/plain; charset=UTF-8"))
+    }
+
+    private func parserJSON(_ target: String, body: Data? = nil) async throws -> [String: Any] {
+        let url = try validatedURL(target)
+        // g3.e/g3.f have no Android business headers and use the encoded query for their AES key.
+        let data = try await fetch(url, method: body == nil ? "GET" : "POST", body: body, contentType: body == nil ? nil : "text/plain; charset=UTF-8")
+        guard let model = try decodeJSON(data, url: url, encodedQuery: true) as? [String: Any] else { throw APIError.invalidResponse }
+        return model
+    }
+
+    private func base64JSON(_ fields: [String: Any]) throws -> Data {
+        Data(try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys, .withoutEscapingSlashes]).base64EncodedString().utf8)
+    }
+    private func defaultResolved(_ settings: [String: Any]) throws -> ResolvedVideo { try resolved(settings.text("mMp4")) }
+    private func modelResolved(_ model: [String: Any]) throws -> ResolvedVideo { try resolved(model.text("url"), headers: headerString(model.text("headers"), lowercase: true)) }
+    private func isForPlay(_ model: [String: Any]) -> Bool { ["m3u8", "mp4"].contains(model.text("type").lowercased()) }
+    private func resolved(_ target: String, headers: [String: String] = [:]) throws -> ResolvedVideo { ResolvedVideo(url: try validatedURL(target), headers: headers) }
+    private func validatedURL(_ target: String) throws -> URL {
+        guard let url = URL(string: target), let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme), url.host != nil,
+              url.user == nil, url.password == nil else { throw APIError.invalidURL }
+        return url
+    }
+    private func clip(_ text: String, fore: String, tail: String) -> String? {
+        if fore.isEmpty && tail.isEmpty { return text }
+        guard !fore.isEmpty, !tail.isEmpty, let start = text.range(of: fore), let end = text.range(of: tail, range: start.upperBound..<text.endIndex) else { return nil }
+        return String(text[start.upperBound..<end.lowerBound])
+    }
+    private func integer(_ value: Any?) -> Int? {
+        if let number = value as? NSNumber { return number.intValue }
+        if let text = value as? String { return Int(text) }
+        return nil
+    }
+    private func headerModels(_ value: Any?) -> [String: String] {
+        var result: [String: String] = [:]
+        for row in value as? [[String: Any]] ?? [] {
+            let key = row.text("key")
+            if !key.isEmpty { result[key] = row.text("value") }
+        }
+        return result
+    }
+    private func headerString(_ text: String, lowercase: Bool = false) -> [String: String] {
+        var result: [String: String] = [:]
+        for line in text.replacingOccurrences(of: "\r", with: "").components(separatedBy: "\n") {
+            guard let colon = line.firstIndex(of: ":"), colon != line.startIndex else { continue }
+            let key = String(line[..<colon]).trimmingCharacters(in: .whitespaces)
+            let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            result[lowercase ? key.lowercased() : key] = value
+        }
+        return result
+    }
+
+    private func decodeJSON(_ data: Data, url: URL, encodedQuery: Bool = false) throws -> Any {
+        if let object = try? JSONSerialization.jsonObject(with: data) { return object }
+        guard let text = String(data: data, encoding: .utf8) else { throw Crypto.Failure.invalidUTF8 }
+        // Parent verified g3.c.d in smali: JSONObject succeeds => original JSON;
+        // catch_0 => truncated/padded seed and AES; catch_1 => original raw response.
+        // iOS throws a typed decode error for malformed ciphertext instead of returning garbage.
+        return try JSONSerialization.jsonObject(with: Crypto.decryptBase64(text, key: Crypto.responseKey(for: url, encodedQuery: encodedQuery)))
+    }
+
+    private func fetch(_ url: URL, method: String = "GET", headers: [String: String] = [:], body: Data? = nil, contentType: String? = nil) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = method.uppercased()
+        request.httpBody = body
+        for (key, value) in headers {
+            guard !key.contains("\r"), !key.contains("\n"), !value.contains("\r"), !value.contains("\n") else { throw APIError.invalidResponse }
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        if let contentType = contentType, request.value(forHTTPHeaderField: "Content-Type") == nil { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+        guard (200..<300).contains(response.statusCode) else { throw APIError.http(response.statusCode) }
+        guard data.count <= 16 * 1024 * 1024 else { throw APIError.invalidResponse }
+        return data
+    }
+
+    private func discoverDomain() async throws {
+        for discovery in discoveries {
+            let plain: String
+            do {
+                let data = try await fetch(validatedURL(discovery), headers: protocolHeaders)
+                guard let text = String(data: data, encoding: .utf8) else { throw Crypto.Failure.invalidUTF8 }
+                if text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("http") { plain = text }
+                else {
+                    let decoded = try Crypto.decryptBase64(text, key: Crypto.paddedSeed("@@bull!!!video$$"))
+                    guard let value = String(data: decoded, encoding: .utf8) else { throw Crypto.Failure.invalidUTF8 }
+                    plain = value
+                }
+            } catch let error as APIError {
+                if case .http(let code) = error, (400..<500).contains(code) { throw error }
+                continue
+            } catch is CancellationError { throw CancellationError() }
+            catch let error as URLError where error.code == .cancelled { throw error }
+            catch { continue }
+            }
+            for line in plain.components(separatedBy: .newlines) {
+                let candidate = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let url = URL(string: candidate), url.scheme == "https", url.host != nil, url.user == nil, url.password == nil,
+                      url.query == nil, url.fragment == nil, let probe = URL(string: "tik", relativeTo: url)?.absoluteURL else { continue }
+                do {
+                    _ = try await businessRequest(url: probe, method: "GET", body: nil)
+                    baseURL = url
+                    defaults.set(url.absoluteString, forKey: "api.baseURL")
+                    categoryCache = nil
+                    runtimeConfig = nil
+                    return
+                } catch let error as APIError {
+                    if case .http(let code) = error, (400..<500).contains(code) { throw error }
+                } catch is CancellationError { throw CancellationError() }
+                catch let error as URLError where error.code == .cancelled { throw error }
+                catch { continue }
+            }
+        }
+        throw URLError(.cannotConnectToHost)
+    }
+}
