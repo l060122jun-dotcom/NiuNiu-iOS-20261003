@@ -121,6 +121,7 @@ private final class VideoPageStore: ObservableObject {
     @Published private(set) var hasMore = true
     private var page = 0
     private var generation = UUID()
+    var needsFirstPage: Bool { page == 0 && error == nil && hasMore }
 
     func loadRank(category: String, order: String) async {
         generation = UUID()
@@ -171,10 +172,15 @@ private final class VideoPageStore: ObservableObject {
             let additions = response.filter { !$0.id.isEmpty && seen.insert($0.id).inserted }
             videos.append(contentsOf: additions)
             page = nextPage
-            hasMore = !additions.isEmpty
+            // Android SearchItemFragment.updateLoadMoreState uses >= 12.
+            // Keep category paging unchanged and stop duplicate-only pages too.
+            hasMore = !additions.isEmpty && (query == nil || response.count >= 12)
         } catch is CancellationError {
         } catch {
             guard request == generation else { return }
+            // URLSession may report URLError.cancelled instead of CancellationError.
+            // A cancelled first page remains resumable when the view reappears.
+            guard !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
     }
@@ -492,7 +498,15 @@ private struct VideoGrid: View {
 @MainActor
 private struct PagingFooter: View {
     @ObservedObject var store: VideoPageStore
+    var automatic = false
+    var viewportHeight: CGFloat = 0
+    var automaticEnabled = true
     let load: () -> Void
+    @State private var sentinelVisible = false
+
+    private var automaticKey: String {
+        "\(automaticEnabled)|\(sentinelVisible)|\(store.videos.count)|\(store.loading)|\(store.hasMore)|\(store.error ?? "")"
+    }
     var body: some View {
         Group {
             if store.loading {
@@ -502,11 +516,130 @@ private struct PagingFooter: View {
             } else if store.videos.isEmpty {
                 BrowseMessage(title: "暂无内容", detail: "试试其他分类或筛选条件")
             } else if store.hasMore {
-                Button("加载更多", action: load).buttonStyle(.bordered).padding()
+                if automatic {
+                    ProgressView("继续浏览以加载更多…").padding()
+                } else {
+                    Button("加载更多", action: load).buttonStyle(.bordered).padding()
+                }
             } else {
                 Text("已经到底了").font(.footnote).foregroundStyle(.secondary).padding()
             }
         }.frame(maxWidth: .infinity)
+            .background {
+                if automatic {
+                    GeometryReader { geometry in
+                        Color.clear.preference(key: SearchFooterFrameKey.self,
+                                               value: geometry.frame(in: .named("search.results")))
+                    }
+                }
+            }
+            .onPreferenceChange(SearchFooterFrameKey.self) { frame in
+                // Unlike onAppear, this does not eagerly fetch a whole eager VStack.
+                sentinelVisible = frame.map { $0.maxY > 0 && $0.minY < viewportHeight } ?? false
+            }
+            .task(id: automaticKey) {
+                guard automatic, automaticEnabled, sentinelVisible, !store.loading, store.hasMore,
+                      store.error == nil, !store.videos.isEmpty else { return }
+                load()
+            }
+            .onDisappear { sentinelVisible = false }
+    }
+}
+
+private struct SearchFooterFrameKey: PreferenceKey {
+    static var defaultValue: CGRect? = nil
+    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) { value = nextValue() ?? value }
+}
+
+private struct SearchVideoFramesKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private struct SearchScrollPosition {
+    let videoID: String
+    let minY: CGFloat
+    let height: CGFloat
+}
+
+/// iOS 16 has no scrollPosition. Stable row IDs plus their viewport geometry
+/// preserve the partially clipped top row, without inspecting private UIKit views.
+@MainActor
+private struct SearchResultsScroll: View {
+    @ObservedObject var store: VideoPageStore
+    let query: String
+    @Binding var position: SearchScrollPosition?
+    @Binding var restoreOnReturn: Bool
+    let rememberOnDisappear: () -> Bool
+    let load: () -> Void
+    let refresh: () async -> Void
+    @State private var tracking = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        GeometryReader { viewport in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(spacing: 16) {
+                        Color.clear.frame(height: 1).id("search.top")
+                        Text("“\(query)”的搜索结果").font(.footnote).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
+                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3), spacing: 18) {
+                            ForEach(store.videos) { video in
+                                VideoTile(video: video).id(video.id)
+                                    .background {
+                                        GeometryReader { geometry in
+                                            Color.clear.preference(key: SearchVideoFramesKey.self,
+                                                value: [video.id: geometry.frame(in: .named("search.results"))])
+                                        }
+                                    }
+                            }
+                        }.padding(.horizontal)
+                        PagingFooter(store: store, automatic: true, viewportHeight: viewport.size.height,
+                                     automaticEnabled: tracking, load: load)
+                        Button {
+                            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) {
+                                proxy.scrollTo("search.top", anchor: .top)
+                            }
+                        } label: {
+                            Label("回到顶部", systemImage: "arrow.up").font(.footnote.weight(.medium))
+                                .foregroundStyle(Color.primary).padding(.horizontal, 18).padding(.vertical, 12)
+                                .background(BrowseTheme.surface, in: Capsule())
+                        }.buttonStyle(BrowsePressStyle()).padding(.vertical, 20)
+                    }.padding(.vertical)
+                }
+                .coordinateSpace(name: "search.results")
+                .refreshable { await refresh() }
+                .onPreferenceChange(SearchVideoFramesKey.self) { frames in
+                    guard tracking else { return }
+                    let visible = frames.filter { $0.value.maxY > 0 && $0.value.minY < viewport.size.height }
+                    guard let first = visible.sorted(by: {
+                        $0.value.minY == $1.value.minY ? $0.key < $1.key : $0.value.minY < $1.value.minY
+                    }).first else { return }
+                    position = SearchScrollPosition(videoID: first.key, minY: first.value.minY,
+                                                    height: first.value.height)
+                }
+                .task {
+                    if restoreOnReturn, let saved = position,
+                       store.videos.contains(where: { $0.id == saved.videoID }) {
+                        // Allow the retained grid to lay out before a single restoration.
+                        await Task.yield()
+                        guard !Task.isCancelled else { return }
+                        let available = viewport.size.height - saved.height
+                        let y = available > 0 ? saved.minY / available : 0
+                        proxy.scrollTo(saved.videoID, anchor: UnitPoint(x: 0, y: y))
+                    }
+                    restoreOnReturn = false
+                    tracking = true
+                }
+                .onDisappear {
+                    tracking = false
+                    if rememberOnDisappear() { restoreOnReturn = position != nil }
+                }
+            }
+        }
     }
 }
 
@@ -849,6 +982,9 @@ struct SearchView: View {
     @State private var submitted = ""
     @State private var categoryID = ""
     @State private var submission = 0
+    @State private var requestKey: String?
+    @State private var scrollPosition: SearchScrollPosition?
+    @State private var restoreOnReturn = false
     @State private var suggestions: [String] = []
     @State private var hotWords: [String] = []
     @State private var suggestLoading = false
@@ -859,6 +995,7 @@ struct SearchView: View {
     @FocusState private var focused: Bool
     private var selectedID: String { catalog.categories.contains(where: { $0.id == categoryID }) ? categoryID : "" }
     private var trimmedText: String { text.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var searchRequestKey: String { "\(submission)|\(selectedID)|\(submitted)" }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -950,24 +1087,38 @@ struct SearchView: View {
                     }.padding()
                 }
             } else {
+                let identity = searchRequestKey
                 ChoiceStrip(title: nil, choices: [Choice(id: "", title: "全部")] + catalog.categories.map { Choice(id: $0.id, title: BrowseCatalog.family($0.name) ?? $0.name) }, selection: Binding(get: { selectedID }, set: { categoryID = $0 }))
                     .padding(.vertical, 8)
-                BrowseScroll {
-                    VStack(spacing: 16) {
-                        Text("“\(submitted)”的搜索结果").font(.footnote).foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
-                        VideoGrid(videos: store.videos, columns: 3)
-                        PagingFooter(store: store) { Task { await load(reset: false) } }
-                    }.padding(.vertical)
-                }.refreshable { await load(reset: true) }
+                SearchResultsScroll(store: store, query: submitted, position: $scrollPosition,
+                                    restoreOnReturn: $restoreOnReturn,
+                                    rememberOnDisappear: { searchRequestKey == identity && !focused },
+                                    load: { Task { await load(reset: false) } },
+                                    refresh: { await load(reset: true) })
+                    .id(searchRequestKey)
             }
         }
         .background(BrowseTheme.background)
         .navigationTitle("搜索").navigationBarTitleDisplayMode(.inline)
         .task(id: "\(trimmedText)|\(suggestionRetry)") { await loadSuggestions() }
         .task { await loadHot() }
-        .task(id: "\(submission)|\(selectedID)|\(submitted)") {
-            if !submitted.isEmpty { await load(reset: true) }
+        .task(id: searchRequestKey) {
+            guard !submitted.isEmpty else { requestKey = nil; return }
+            if requestKey != searchRequestKey {
+                requestKey = searchRequestKey
+                scrollPosition = nil
+                restoreOnReturn = false
+                await load(reset: true)
+            } else if store.needsFirstPage {
+                // The navigation lifetime can cancel page one before it commits.
+                // Resume without clearing any completed pages or remembering a false success.
+                while store.loading {
+                    do { try await Task.sleep(nanoseconds: 20_000_000) }
+                    catch { return }
+                }
+                guard !Task.isCancelled, store.needsFirstPage else { return }
+                await load(reset: false)
+            }
         }
     }
 
@@ -982,6 +1133,11 @@ struct SearchView: View {
 
     private func load(reset: Bool) async {
         guard !submitted.isEmpty else { return }
+        guard reset || requestKey == searchRequestKey else { return }
+        if reset {
+            scrollPosition = nil
+            restoreOnReturn = false
+        }
         await store.load(reset: reset, category: selectedID, query: submitted)
     }
 

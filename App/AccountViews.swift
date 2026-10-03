@@ -43,7 +43,12 @@ private enum AccountJSON {
     }
     static func integer(_ object: [String: Any], _ keys: String...) -> Int? {
         for key in keys {
-            if let number = value(object, key) as? NSNumber { return number.intValue }
+            if let number = value(object, key) as? NSNumber {
+                // Do not truncate fractions or wrap oversized server IDs/counts.
+                if let exact = Int(number.stringValue) { return exact }
+                if let numeric = Double(number.stringValue), numeric.isFinite,
+                   let exact = Int(exactly: numeric) { return exact }
+            }
             if let string = value(object, key) as? String, let number = Int(string) { return number }
         }
         return nil
@@ -57,8 +62,10 @@ private enum AccountJSON {
         return nil
     }
     static func time(_ raw: String) -> String {
-        guard let timestamp = Double(raw), timestamp > 0 else { return raw }
+        guard let timestamp = Double(raw), timestamp.isFinite, timestamp > 0 else { return raw }
         let seconds = timestamp > 10_000_000_000 ? timestamp / 1000 : timestamp
+        // Keep invalid/out-of-calendar server values visible without passing them to ICU.
+        guard seconds.isFinite, seconds <= 253_402_300_799 else { return raw }
         return Date(timeIntervalSince1970: seconds).formatted(date: .abbreviated, time: .shortened)
     }
     static func webURL(_ raw: String) -> URL? {
@@ -67,17 +74,77 @@ private enum AccountJSON {
         return url
     }
     static func richText(_ value: String) -> AttributedString {
-        if value.contains("<"), let data = value.data(using: .utf8),
-           let string = try? NSAttributedString(data: data,
-               options: [.documentType: NSAttributedString.DocumentType.html,
-                         .characterEncoding: String.Encoding.utf8.rawValue], documentAttributes: nil) {
-            // Keep paragraphs and links; let SwiftUI use the user's readable theme/font.
-            let clean = NSMutableAttributedString(attributedString: string)
-            clean.removeAttribute(.foregroundColor, range: NSRange(location: 0, length: clean.length))
-            clean.removeAttribute(.font, range: NSRange(location: 0, length: clean.length))
-            return AttributedString(clean)
+        // UIKit's HTML document importer may spin the main run loop via WebKit.
+        // Never call it during SwiftUI body/navigation updates. This inert HTML subset
+        // retains text, paragraph breaks and HTTP(S) anchors without executing/loading HTML.
+        guard value.contains("<"), let tags = try? NSRegularExpression(
+            pattern: "<!--[\\s\\S]*?-->|</?[A-Za-z](?:[^>\\\"']|\\\"[^\\\"]*\\\"|'[^']*')*>") else {
+            return AttributedString(value)
         }
-        return AttributedString(value)
+        var result = AttributedString()
+        var cursor = value.startIndex
+        var link: URL?
+        var hiddenTag: String?
+        func append(_ text: String) {
+            guard hiddenTag == nil else { return }
+            var segment = AttributedString(htmlEntities(text))
+            segment.link = link
+            result.append(segment)
+        }
+        for match in tags.matches(in: value, range: NSRange(value.startIndex..., in: value)) {
+            guard let range = Range(match.range, in: value) else { continue }
+            append(String(value[cursor..<range.lowerBound]))
+            let tag = String(value[range])
+            cursor = range.upperBound
+            if tag.hasPrefix("<!--") { continue }
+            let closing = tag.hasPrefix("</")
+            let name = tag.dropFirst(closing ? 2 : 1).prefix { $0.isLetter || $0.isNumber }.lowercased()
+            if let hidden = hiddenTag {
+                if closing && name == hidden { hiddenTag = nil }
+                continue
+            }
+            if !closing && ["script", "style", "head"].contains(name) { hiddenTag = name; continue }
+            if name == "a" {
+                link = closing ? nil : htmlLink(tag)
+            } else if name == "br" || (["p", "div", "li", "blockquote", "h1", "h2", "h3", "tr"].contains(name) && closing) {
+                append("\n")
+            }
+        }
+        append(String(value[cursor...]))
+        return result
+    }
+    private static func htmlLink(_ tag: String) -> URL? {
+        guard let expression = try? NSRegularExpression(
+            pattern: "\\bhref\\s*=\\s*(?:\\\"([^\\\"]*)\\\"|'([^']*)'|([^\\s>]+))", options: .caseInsensitive),
+              let match = expression.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)) else { return nil }
+        for index in 1...3 {
+            if let range = Range(match.range(at: index), in: tag) {
+                return webURL(htmlEntities(String(tag[range])).trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+        return nil
+    }
+    private static func htmlEntities(_ text: String) -> String {
+        guard text.contains("&"), let expression = try? NSRegularExpression(pattern: "&(#x[0-9a-fA-F]+|#X[0-9a-fA-F]+|#[0-9]+|[A-Za-z]+);") else { return text }
+        let named = ["amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": " ",
+                     "hellip": "…", "mdash": "—", "ndash": "–", "copy": "©", "reg": "®"]
+        var output = ""
+        var cursor = text.startIndex
+        for match in expression.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            guard let range = Range(match.range, in: text), let keyRange = Range(match.range(at: 1), in: text) else { continue }
+            output += text[cursor..<range.lowerBound]
+            let key = String(text[keyRange])
+            var replacement = named[key]
+            if key.hasPrefix("#") {
+                let hex = key.lowercased().hasPrefix("#x")
+                if let number = UInt32(key.dropFirst(hex ? 2 : 1), radix: hex ? 16 : 10),
+                   number != 0, let scalar = UnicodeScalar(number) { replacement = String(scalar) }
+            }
+            output += replacement ?? String(text[range])
+            cursor = range.upperBound
+        }
+        output += text[cursor...]
+        return output
     }
 }
 

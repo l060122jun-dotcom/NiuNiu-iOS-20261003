@@ -41,6 +41,9 @@ struct OfflineDownload: Identifiable, Codable {
     var sourcePlayerID: String?
     var sourceEpisodeIndex: Int?
     var sourceEpisodeURL: String?
+
+    /// Persisted or framework-provided numbers must never trap a SwiftUI Int conversion.
+    var displayProgress: Double { progress.isFinite ? min(1, max(0, progress)) : 0 }
 }
 
 struct OfflineDownloadOrigin {
@@ -50,8 +53,9 @@ struct OfflineDownloadOrigin {
     let episodeURL: String
 }
 
-/// Public mutation methods must be called on the main thread (as SwiftUI actions are).
+/// All state and lazy background sessions are isolated to the main actor.
 /// Background sessions own the actual transfers; the manifest owns UI metadata.
+@MainActor
 final class DownloadsStore: NSObject, ObservableObject {
     static let shared = DownloadsStore()
 
@@ -86,6 +90,8 @@ final class DownloadsStore: NSObject, ObservableObject {
     }
 
     private lazy var fileSession: URLSession = {
+        // A fresh background configuration per identifier; do not set
+        // waitsForConnectivity (background sessions ignore it), or reuse .shared.
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionPrefix + ".mp4")
         config.sessionSendsLaunchEvents = true
         config.isDiscretionary = false
@@ -93,6 +99,8 @@ final class DownloadsStore: NSObject, ObservableObject {
     }()
 
     private lazy var assetSession: AVAssetDownloadURLSession = {
+        // AVAssetDownloadURLSession requires a background configuration; default
+        // or ephemeral configurations raise an Objective-C exception, not Error.
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionPrefix + ".hls")
         config.sessionSendsLaunchEvents = true
         config.isDiscretionary = false
@@ -102,13 +110,16 @@ final class DownloadsStore: NSObject, ObservableObject {
 
     private override init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory,
-                                                in: .userDomainMask)[0]
+                                                in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Library/Application Support", isDirectory: true)
         rootURL = support.appendingPathComponent("OfflineDownloads", isDirectory: true)
         manifestURL = rootURL.appendingPathComponent("tasks.json")
         quarantineURL = rootURL.appendingPathComponent("quarantine-tasks.json")
         super.init()
         lifecycleObserver = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
-            object: nil, queue: .main) { [weak self] _ in self?.stopForegroundForBackground() }
+            object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.stopForegroundForBackground() }
+            }
         do {
             try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
             guard try rootURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
@@ -119,6 +130,9 @@ final class DownloadsStore: NSObject, ObservableObject {
             values.isExcludedFromBackup = true
             try root.setResourceValues(values)
             if FileManager.default.fileExists(atPath: manifestURL.path) {
+                guard (try manifestURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 16 * 1024 * 1024 else {
+                    throw ForegroundHLSDownload.Failure("下载索引超出 16MB 安全上限。")
+                }
                 items = try JSONDecoder().decode([OfflineDownload].self,
                                                 from: Data(contentsOf: manifestURL))
             }
@@ -127,12 +141,31 @@ final class DownloadsStore: NSObject, ObservableObject {
             manifestFailure = "读取下载记录失败：\(error.localizedDescription)。原清单已保留；后台任务已停止，隔离文件可在此删除。"
             storageError = manifestFailure
             if FileManager.default.fileExists(atPath: quarantineURL.path) {
-                do { items = try JSONDecoder().decode([OfflineDownload].self, from: Data(contentsOf: quarantineURL)) }
+                do {
+                    guard (try quarantineURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 16 * 1024 * 1024 else {
+                        throw ForegroundHLSDownload.Failure("隔离索引超出 16MB 安全上限。")
+                    }
+                    items = try JSONDecoder().decode([OfflineDownload].self, from: Data(contentsOf: quarantineURL))
+                }
                 catch {
                     quarantineReadable = false
                     storageError = (manifestFailure ?? "") + "\n隔离索引读取失败：\(error.localizedDescription)。索引未覆盖。"
                 }
             }
+        }
+        // Duplicate IDs break SwiftUI identity and incorrectly associate restored tasks.
+        var restoredIDs: Set<UUID> = []
+        if items.contains(where: { !restoredIDs.insert($0.id).inserted }) {
+            manifestReadable = false
+            quarantineReadable = false
+            manifestFailure = "下载记录包含重复任务 ID；原索引已保留，请修复记录后重试。"
+            storageError = manifestFailure
+            items = []
+        }
+        for index in items.indices {
+            items[index].progress = items[index].displayProgress
+            items[index].receivedBytes = max(0, items[index].receivedBytes)
+            if let expected = items[index].expectedBytes, expected <= 0 { items[index].expectedBytes = nil }
         }
         restoreSessions()
     }
@@ -150,7 +183,6 @@ final class DownloadsStore: NSObject, ObservableObject {
     @discardableResult
     func add(title: String, url: URL, headers: [String: String] = [:],
              format: OfflineDownloadFormat, origin: OfflineDownloadOrigin? = nil) -> UUID {
-        precondition(Thread.isMainThread)
         let id = UUID()
         var item = OfflineDownload(id: id, title: title.isEmpty ? url.lastPathComponent : title,
                                    sourceURL: url, headers: headers,
@@ -249,12 +281,10 @@ final class DownloadsStore: NSObject, ObservableObject {
     }
 
     func cancelRetry(_ id: UUID) {
-        precondition(Thread.isMainThread)
         retryTasks[id]?.cancel()
     }
 
     func cancel(_ id: UUID) {
-        precondition(Thread.isMainThread)
         guard let index = index(id), [.queued, .downloading].contains(items[index].state) else { return }
         releaseProxy(items[index].sourceURL)
         items[index].state = .cancelled
@@ -271,7 +301,6 @@ final class DownloadsStore: NSObject, ObservableObject {
 
     /// Removes files first; a filesystem error leaves the record visible for a later retry.
     func delete(_ id: UUID) {
-        precondition(Thread.isMainThread)
         cancelRetry(id)
         guard let index = index(id) else { return }
         cancel(id)
@@ -295,7 +324,6 @@ final class DownloadsStore: NSObject, ObservableObject {
 
     /// Returns only verified, completed local files/packages. Never falls back to the network URL.
     func localURL(for id: UUID) -> URL? {
-        precondition(Thread.isMainThread)
         guard let item = items.first(where: { $0.id == id }), item.state == .completed,
               verifiedItems.contains(id),
               let url = resolvedLocation(item), FileManager.default.fileExists(atPath: url.path) else { return nil }
@@ -304,7 +332,6 @@ final class DownloadsStore: NSObject, ObservableObject {
 
     /// Recheck the cache immediately before playback without loading media on the UI thread.
     fileprivate func preparePlayback(_ id: UUID, completion: @escaping (URL?) -> Void) {
-        precondition(Thread.isMainThread)
         guard let index = index(id), items[index].state == .completed else { completion(nil); return }
         guard let url = resolvedLocation(items[index]) else {
             verifiedItems.remove(id)
@@ -336,7 +363,6 @@ final class DownloadsStore: NSObject, ObservableObject {
     /// Return false if the identifier belongs to another subsystem.
     @discardableResult
     func handleBackgroundEvents(identifier: String, completionHandler: @escaping () -> Void) -> Bool {
-        precondition(Thread.isMainThread)
         guard [Self.sessionPrefix + ".mp4", Self.sessionPrefix + ".hls"].contains(identifier) else { return false }
         backgroundCompletions[identifier] = completionHandler
         _ = fileSession
@@ -397,7 +423,7 @@ final class DownloadsStore: NSObject, ObservableObject {
         task.taskDescription = id.uuidString
         if index(id) == nil {
             let url = (task as? AVAssetDownloadTask)?.urlAsset.url ?? task.originalRequest?.url
-                ?? URL(string: "https://invalid.invalid/")!
+                ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             var item = OfflineDownload(id: id, title: "隔离下载 · " + url.lastPathComponent,
                 sourceURL: url, headers: [:], format: task is AVAssetDownloadTask ? .hls : .mp4, createdAt: Date())
             item.state = .failed
@@ -507,6 +533,14 @@ final class DownloadsStore: NSObject, ObservableObject {
         guard manifestReadable else { return }
         guard let index = index(id), items[index].state == .queued else { return }
         let item = items[index]
+        // Recheck persisted records too, before calling Foundation/AVFoundation.
+        if let failure = transferInputFailure(item) {
+            items[index].state = .failed
+            items[index].errorMessage = failure
+            releaseProxy(item.sourceURL)
+            persist()
+            return
+        }
         if isLoopback(item.sourceURL) {
             guard foregroundRuns.count < 4 else { return }
             startForeground(id)
@@ -549,8 +583,10 @@ final class DownloadsStore: NSObject, ObservableObject {
         if throttled {
             guard pendingSave == nil else { return }
             let work = DispatchWorkItem { [weak self] in
-                self?.pendingSave = nil
-                self?.persist()
+                Task { @MainActor in
+                    self?.pendingSave = nil
+                    self?.persist()
+                }
             }
             pendingSave = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
@@ -565,6 +601,23 @@ final class DownloadsStore: NSObject, ObservableObject {
         } catch {
             storageError = "保存下载记录失败：\(error.localizedDescription)"
         }
+    }
+
+    private func transferInputFailure(_ item: OfflineDownload) -> String? {
+        let url = item.sourceURL
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              let host = url.host, !host.isEmpty, url.user == nil, url.password == nil else {
+            return "下载地址必须是无内嵌账号密码的有效 HTTP / HTTPS URL。"
+        }
+        var names: Set<String> = []
+        for (key, value) in item.headers {
+            guard !key.isEmpty, key.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "!#$%&'*+-.^_`|~".contains($0)) }),
+                  !value.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }),
+                  names.insert(key.lowercased()).inserted else {
+                return "下载请求头包含非法字符或大小写重复字段，未创建系统任务。"
+            }
+        }
+        return nil
     }
 
     private func cleanPendingLocation(_ id: UUID) {
@@ -761,7 +814,11 @@ final class DownloadsStore: NSObject, ObservableObject {
     }
 }
 
-extension DownloadsStore: URLSessionDownloadDelegate, AVAssetDownloadDelegate {
+// Foundation's Objective-C delegate requirements are nonisolated. These sessions
+// explicitly deliver ALL callbacks on OperationQueue.main, including temporary-file
+// callbacks which must finish moving the file before returning to URLSession.
+// @preconcurrency bridges that legacy protocol without unsafe MainActor.assumeIsolated.
+extension DownloadsStore: @preconcurrency URLSessionDownloadDelegate, @preconcurrency AVAssetDownloadDelegate {
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                     totalBytesExpectedToWrite: Int64) {
@@ -924,7 +981,7 @@ extension DownloadsStore: URLSessionDownloadDelegate, AVAssetDownloadDelegate {
     }
 }
 
-struct DownloadsView: View {
+@MainActor struct DownloadsView: View {
     @ObservedObject private var store = DownloadsStore.shared
     @State private var selection: OfflinePlaybackSelection?
     @State private var pendingDeletion: UUID?
@@ -948,14 +1005,14 @@ struct DownloadsView: View {
                             Spacer()
                             Text(item.format.rawValue.uppercased())
                             if item.state == .completed || (item.state == .downloading && (item.format != .foregroundHLS || item.expectedBytes != nil)) {
-                                Text("\(Int(item.progress * 100))%")
+                                Text("\(Int(item.displayProgress * 100))%")
                             }
                         }.font(.caption).foregroundColor(.secondary)
                         if item.state == .downloading {
                             if (item.format == .mp4 || item.format == .foregroundHLS) && item.expectedBytes == nil {
                                 ProgressView()
                             } else {
-                                ProgressView(value: item.progress)
+                                ProgressView(value: item.displayProgress)
                             }
                             if item.format == .mp4 || item.format == .foregroundHLS {
                                 Text(ByteCountFormatter.string(fromByteCount: item.receivedBytes, countStyle: .file)

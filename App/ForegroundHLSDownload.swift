@@ -24,20 +24,52 @@ final class ForegroundHLSDownload: NSObject, URLSessionDownloadDelegate, @unchec
     private let lock = NSLock()
     private var counts: [Int: (Int64, Int64)] = [:]
     private var reportsTotal = false
-    private lazy var session: URLSession = {
+    private var transferSession: URLSession?
+    private var cancelled = false
+
+    /// Swift lazy initialization is not thread safe: the three fetch tasks and cancel
+    /// used to race here. Serialize creation and never create a new session on cancel.
+    private func sessionForTransfer() throws -> URLSession {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { throw CancellationError() }
+        if let session = transferSession { return session }
         let config = URLSessionConfiguration.ephemeral
         config.httpMaximumConnectionsPerHost = 3
         config.timeoutIntervalForRequest = 45
         config.timeoutIntervalForResource = 600
         config.urlCache = nil
         config.httpCookieStorage = nil
-        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
-    }()
+        let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        transferSession = session
+        return session
+    }
 
     init(origin: URL, headers: [String: String], progress: @escaping (Int64, Int64?) -> Void) {
         self.origin = origin; self.headers = headers; self.progress = progress
     }
-    func cancel() { session.invalidateAndCancel() }
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let session = transferSession
+        lock.unlock()
+        session?.invalidateAndCancel()
+    }
+
+    private static func saturatedSum(_ values: [Int64]) -> Int64 {
+        values.reduce(0) { total, value in
+            let result = total.addingReportingOverflow(max(0, value))
+            return result.overflow ? Int64.max : result.partialValue
+        }
+    }
+
+    private static func checkedBytes(_ entries: [Entry]) throws -> Int64 {
+        try entries.reduce(0) { total, entry in
+            let result = total.addingReportingOverflow(entry.bytes)
+            guard entry.bytes >= 0, !result.overflow else { throw Failure("离线资源总大小超出可表示范围。") }
+            return result.partialValue
+        }
+    }
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
@@ -49,10 +81,11 @@ final class ForegroundHLSDownload: NSObject, URLSessionDownloadDelegate, @unchec
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         lock.lock()
-        counts[downloadTask.taskIdentifier] = (totalBytesWritten, totalBytesExpectedToWrite)
-        let bytes = counts.values.reduce(Int64(0)) { $0 + $1.0 }
+        guard !cancelled else { lock.unlock(); return }
+        counts[downloadTask.taskIdentifier] = (max(0, totalBytesWritten), totalBytesExpectedToWrite)
+        let bytes = Self.saturatedSum(counts.values.map { $0.0 })
         let expected = reportsTotal && counts.values.allSatisfy { $0.1 > 0 }
-            ? counts.values.reduce(Int64(0)) { $0 + $1.1 } : nil
+            ? Self.saturatedSum(counts.values.map { $0.1 }) : nil
         lock.unlock()
         progress(bytes, expected)
     }
@@ -75,6 +108,7 @@ final class ForegroundHLSDownload: NSObject, URLSessionDownloadDelegate, @unchec
     }
     private func fetch(_ url: URL, range: Range<Int64>? = nil) async throws -> URL {
         try Task.checkCancellation()
+        let session = try sessionForTransfer()
         let (temporary, response) = try await session.download(for: request(url, range: range))
         do {
             try Task.checkCancellation()
@@ -88,6 +122,15 @@ final class ForegroundHLSDownload: NSObject, URLSessionDownloadDelegate, @unchec
             }
             let size = try temporary.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
             guard size > 0 else { throw Failure("源返回空资源。") }
+            // Bad origins may label HTML/JSON error bodies as octet-stream/video.
+            let handle = try FileHandle(forReadingFrom: temporary)
+            defer { try? handle.close() }
+            let prefix = try handle.read(upToCount: 512) ?? Data()
+            let text = String(decoding: prefix, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !text.hasPrefix("<!doctype html"), !text.hasPrefix("<html"),
+                  !text.hasPrefix("{\""), !text.hasPrefix("<?xml") else {
+                throw Failure("源返回伪装为媒体的 HTML/JSON/XML 错误页，未保存为视频。")
+            }
             if let range = range {
                 let contentRange = response.value(forHTTPHeaderField: "Content-Range") ?? ""
                 guard Int64(size) == range.upperBound - range.lowerBound,
@@ -142,7 +185,7 @@ final class ForegroundHLSDownload: NSObject, URLSessionDownloadDelegate, @unchec
     }
 
     func run(package: URL, hls: Bool) async throws -> URL {
-        defer { session.invalidateAndCancel() }
+        defer { cancel() }
         lock.lock(); reportsTotal = !hls; lock.unlock()
         // No reuse/overwrite: partial packages belong to one UUID task only.
         try FileManager.default.createDirectory(at: package, withIntermediateDirectories: false)
@@ -247,10 +290,11 @@ final class ForegroundHLSDownload: NSObject, URLSessionDownloadDelegate, @unchec
                 }
             }
             while next < min(3, resources.count) { enqueue(resources[next]); next += 1 }
-            while let entry = try await group.next() {
+            while true {
+                guard let entry = try await group.next() else { break }
                 entries.append(entry)
                 // Until all resources are known/completed the true total size is unknown.
-                progress(entries.reduce(0) { $0 + $1.bytes }, nil)
+                progress(try Self.checkedBytes(entries), nil)
                 if next < resources.count { enqueue(resources[next]); next += 1 }
             }
         }
@@ -259,7 +303,7 @@ final class ForegroundHLSDownload: NSObject, URLSessionDownloadDelegate, @unchec
         try (rewritten.joined(separator: "\n") + "\n").write(to: local, atomically: true, encoding: .utf8)
         entries.append(try Self.entry(local, name: "local.m3u8"))
         try JSONEncoder().encode(Receipt(version: 1, files: entries)).write(to: package.appendingPathComponent("receipt.json"), options: .atomic)
-        let bytes = entries.reduce(Int64(0)) { $0 + $1.bytes }
+        let bytes = try Self.checkedBytes(entries)
         progress(bytes, bytes)
         try Self.validate(local)
         return local
@@ -268,7 +312,12 @@ final class ForegroundHLSDownload: NSObject, URLSessionDownloadDelegate, @unchec
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hash = SHA256(); var bytes: Int64 = 0
-        while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty { hash.update(data: chunk); bytes += Int64(chunk.count) }
+        while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+            let result = bytes.addingReportingOverflow(Int64(chunk.count))
+            guard !result.overflow else { throw Failure("离线文件大小超出可表示范围。") }
+            hash.update(data: chunk)
+            bytes = result.partialValue
+        }
         return Entry(name: name, bytes: bytes, sha256: hash.finalize().map { String(format: "%02x", $0) }.joined())
     }
     static func safePackage(_ package: URL) -> Bool {
@@ -311,15 +360,16 @@ final class ForegroundHLSDownload: NSObject, URLSessionDownloadDelegate, @unchec
 }
 
 /// A real FFmpeg/IJK prepare probe, separate from Apple's movpkg assetCache check.
-final class ForegroundHLSProbe {
+@MainActor final class ForegroundHLSProbe {
     private var player: IJKFFMoviePlayerController?
     private var renderer: IJKSampleBufferView?
     private var observers: [NSObjectProtocol] = []
     private var timeout: DispatchWorkItem?
     private var completion: ((String?) -> Void)?
     func check(_ url: URL, completion: @escaping (String?) -> Void) {
+        guard self.completion == nil else { completion("IJK 校验器已在运行，未重复初始化。"); return }
         self.completion = completion
-        let options = IJKFFOptions.byDefault()!
+        guard let options = IJKFFOptions.byDefault() else { finish("IJK 无法创建本地 HLS 校验选项。"); return }
         options.showHudView = false
         options.setFormatOptionValue("file,crypto,data", forKey: "protocol_whitelist")
         options.setFormatOptionValue("ALL", forKey: "allowed_extensions")
@@ -336,7 +386,9 @@ final class ForegroundHLSProbe {
                 }
             })
         }
-        let work = DispatchWorkItem { [weak self] in self?.finish("IJK 本地 HLS 校验超时（20秒），未标记完成。") }
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in self?.finish("IJK 本地 HLS 校验超时（20秒），未标记完成。") }
+        }
         timeout = work; DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
         player.prepareToPlay()
     }

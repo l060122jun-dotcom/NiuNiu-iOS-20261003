@@ -54,6 +54,14 @@ def main():
 
         exec(compile(section, 'metadata-patch', 'exec'), {'ijk': SourcePath(), 'replace': replace})
         assert len(patched) == 5
+        # The seek result carries an immutable queue serial in message-owned
+        # storage. Validate this additional exact patch, not a guessed getter.
+        serial_start = build.index('# Carry the queue serial')
+        serial_end = build.index('# Return the actual AVAudioSession', serial_start)
+        exec(compile(build[serial_start:serial_end], 'seek-serial-patch', 'exec'), {
+            'ijk': SourcePath(), 'replace': replace,
+            'controller': 'ios/IJKMediaPlayer/IJKMediaPlayer/IJKFFMoviePlayerController.m'})
+        assert len(patched) == 6
         for rel in patched:
             print('Pinned source assertion passed: ' + rel)
     print('No library/App build or device playback was performed.')

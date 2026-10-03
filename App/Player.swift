@@ -19,6 +19,10 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
     @Published private(set) var stage = "idle"
     @Published private(set) var videoToolboxEnabled = true
     @Published private(set) var capabilityMessage: String?
+    /// DAR of an actual displayed decoder frame, including SAR; nil until first frame.
+    @Published private(set) var videoDisplayAspect: Double?
+    @Published private(set) var hasRenderedFrame = false
+    var playbackRequested: Bool { wantsToPlay }
 
     // An IJK OpenGL view is neither AVPlayerLayer nor an AVSampleBufferDisplayLayer.
     // Supporting PiP requires a new sample-buffer rendering pipeline, not a dummy AVPlayer.
@@ -49,6 +53,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
     // One native seek in flight: IJK notifications contain target but no request
     // ID. Coalesce UI seeks until its notification; same-target A/B is unambiguous.
     private var nativeSeekTarget: Double?
+    private var seekVideoSerial: Int32?
+    private var seekFrameAcknowledged = false
     private var wantsToPlay = true
     private var didFinish = false
     private var fill = false
@@ -118,11 +124,22 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         candidate.playbackRate = rate
         renderer = output
         output.contentMode = fill ? .scaleAspectFill : .scaleAspectFit
+        output.videoDisplayAspectChanged = { [weak self, weak output] aspect in
+            guard let self, self.renderer === output, aspect.isFinite, aspect > 0 else { return }
+            if self.videoDisplayAspect != aspect { self.videoDisplayAspect = aspect }
+        }
         output.renderError = { [weak self, weak output] message in
             guard let self, self.renderer === output else { return }
             self.error = message
             self.pause()
             self.pip?.stopPictureInPicture()
+        }
+        output.seekFrameDisplayed = { [weak self, weak output] serial in
+            guard let self, self.renderer === output, self.isSeeking,
+                  self.nativeSeekTarget == nil, self.seekCompleted,
+                  self.seekVideoSerial == serial else { return }
+            self.seekFrameAcknowledged = true
+            if let core = self.core { self.refresh(core) }
         }
         core = candidate
         if AVPictureInPictureController.isPictureInPictureSupported() {
@@ -163,7 +180,9 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
 
     func seek(_ seconds: Double) {
         guard seconds.isFinite, let core else { return }
-        let target = duration > 0 ? min(max(0, seconds), duration) : max(0, seconds)
+        // Pinned ffp_seek_to_l at >=duration emits COMPLETED without executing
+        // a seek or issuing SEEK_COMPLETE. Never submit that special EOF path.
+        let target = duration > 0 ? min(max(0, seconds), max(0, duration - 0.001)) : max(0, seconds)
         if !isReady {
             pendingSeek = target
             isSeeking = true
@@ -172,6 +191,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         didFinish = false
         seekTarget = target
         seekCompleted = false
+        seekFrameAcknowledged = false
+        seekVideoSerial = nil
         isSeeking = true
         stage = "seek"
         renderer?.beginSeek(to: target)
@@ -284,11 +305,13 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         case .IJKMPMoviePlayerComponentOpen:
             stage = "open-codec"
         case .IJKMPMoviePlayerFirstVideoFrameRendered:
+            hasRenderedFrame = true
             stage = "render"
         case .IJKMPMoviePlayerDidSeekComplete:
             guard isSeeking, let target = seekTarget, let submitted = nativeSeekTarget else { return }
-            if let reported = (note.userInfo?[IJKMPMoviePlayerDidSeekCompleteTargetKey] as? NSNumber)?.doubleValue,
-               abs(reported / 1000 - submitted) > 0.001 { return }
+            // One native request is in flight. Upstream arg1 is absolute stream
+            // milliseconds (includes positive start_time), not our relative
+            // submitted seconds; never reject the result by comparing these.
             nativeSeekTarget = nil
             if submitted != target {
                 nativeSeekTarget = target
@@ -304,14 +327,38 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
                 capabilityMessage = Self.describe(stage: "seek", code: code, core: candidate)
                 stage = "playback" // Recover existing playback, including same serial.
             } else {
-                renderer?.confirmSeek()
+                guard let serial = (note.userInfo?["IJKSeekVideoSerial"] as? NSNumber)?.int32Value else {
+                    renderer?.cancelSeek()
+                    isSeeking = false; seekTarget = nil
+                    capabilityMessage = "seek 完成通知缺少真实队列 serial，请检查 framework 与 App 是否配套。"
+                    completeSkip()
+                    return
+                }
+                seekVideoSerial = serial
+                seekFrameAcknowledged = serial < 0 // Audio-only stream has no video frame to acknowledge.
+                if serial >= 0 { renderer?.confirmSeek(serial: serial) }
                 seekCompleted = true
                 stage = "playback"
             }
         case .IJKMPMoviePlayerPlaybackDidFinish:
             // Suppress only natural completion; decoder/network failures remain visible.
             let finishReason = (note.userInfo?[IJKMPMoviePlayerPlaybackDidFinishReasonUserInfoKey] as? NSNumber)?.intValue
-            if isSeeking && finishReason == IJKMPMovieFinishReason.playbackEnded.rawValue { return }
+            if isSeeking && finishReason == IJKMPMovieFinishReason.playbackEnded.rawValue {
+                // A confirmed seek may legitimately land beyond the last video
+                // frame. Settle without waiting for an impossible frame ack and
+                // without treating an intermediate/old EOF as episode advance.
+                if nativeSeekTarget == nil && seekCompleted {
+                    renderer?.cancelSeek()
+                    seekTarget = nil; isSeeking = false
+                    wantsToPlay = false; isPlaying = false
+                    candidate.pause()
+                    position = Self.validTime(candidate.currentPlaybackTime)
+                    renderer?.updateClock(position, rate: 0)
+                    completeSkip()
+                    stage = "seek-ended"
+                }
+                return
+            }
             guard !didFinish else { return }
             didFinish = true
             wantsToPlay = false
@@ -358,7 +405,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         let seconds = candidate.currentPlaybackTime
         guard seconds.isFinite, seconds >= 0 else { return }
         if isSeeking {
-            guard isReady, seekCompleted, let target = seekTarget, abs(seconds - target) <= 1 else { return }
+            guard isReady, seekCompleted, seekFrameAcknowledged else { return }
             seekTarget = nil
             isSeeking = false
         }
@@ -375,7 +422,10 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
     }
 
     private func releaseCore() {
+        videoDisplayAspect = nil
+        hasRenderedFrame = false
         nativeSeekTarget = nil
+        seekVideoSerial = nil; seekFrameAcknowledged = false
         completeSkip()
         pipPossibleObservation = nil
         pipStartTimeout?.cancel(); pipStartTimeout = nil

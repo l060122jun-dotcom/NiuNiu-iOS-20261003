@@ -32,13 +32,24 @@ import UIKit
     @State private var playing = false
     @State private var fullScreen = false
     @State private var detailVisible = false
-    @State private var landscape = true
+    // Explicit orientation lasts for this detail playback session (including source/episode changes).
+    @State private var manualLandscape: Bool?
     @State private var locked = false
     @State private var fill = false
     @State private var introPending = false
     @State private var backgroundPauseTask: Task<Void, Never>?
     @State private var resolveTask: Task<Void, Never>?
     @State private var resolutionGeneration = 0
+    @State private var firstFrameTimeout: Task<Void, Never>?
+    @State private var triedSources = Set<String>()
+    @State private var attemptDiagnostics: [String] = []
+    @State private var attemptEpisodeName = ""
+    @State private var attemptEpisodeIndex = 0
+    @State private var attemptResume: Double = 0
+    @State private var attemptPaused = false
+    @State private var attemptStatus: String?
+    @State private var loadedGeneration: Int?
+    @State private var loadedSourceID: String?
     @State private var handledEnd = false
     @State private var suspended = false
     @State private var resumeAfterNavigation = false
@@ -65,6 +76,11 @@ import UIKit
     private var episode: Episode? { episodes.indices.contains(episodeIndex) ? episodes[episodeIndex] : nil }
     private var favorite: Bool { AccountStore.shared.isLoggedIn ? accountFavorite ?? false : library.isFavorite(videoID) }
     private var errorText: String? { failure ?? playback.error }
+    private var landscape: Bool {
+        // Unknown and near-square video stay portrait. Only real displayed DAR
+        // above 1.10 chooses the system's counterclockwise LandscapeRight turn.
+        manualLandscape ?? ((playback.videoDisplayAspect ?? 1) > 1.10)
+    }
 
     public var body: some View {
         VStack(spacing: 0) {
@@ -88,7 +104,8 @@ import UIKit
                 }
             }
         }
-        .navigationTitle(video?.name ?? "影片详情").navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .navigationBar)
+        .toolbar(.hidden, for: .tabBar)
         .task {
             configureCallbacks()
             playback.restorePictureInPictureUI = {
@@ -112,6 +129,19 @@ import UIKit
         .onChange(of: scenePhase) { phase in backgroundChanged(phase) }
         .onChange(of: fill) { playback.setFill($0) }
         .onChange(of: playback.isPlaying) { playing = $0 }
+        .onChange(of: playback.hasRenderedFrame) { rendered in
+            guard rendered, !suspended, loadedGeneration == resolutionGeneration,
+                  loadedSourceID == source?.id, let source else { return }
+            // Prepared is not proof of a working source. Persist only actual first frame.
+            UserDefaults.standard.set(source.id, forKey: preferredSourceKey)
+            firstFrameTimeout?.cancel(); firstFrameTimeout = nil
+            attemptStatus = nil
+        }
+        .onChange(of: playback.error) { message in
+            guard let message, loadedGeneration == resolutionGeneration,
+                  loadedSourceID == source?.id else { return }
+            failover(message, generation: resolutionGeneration, sourceID: source?.id ?? "")
+        }
         .onChange(of: account.isLoggedIn) { _ in Task { await loadFavoriteStatus() } }
         .onDisappear {
             // A custom fullscreen presentation is not navigation away from detail.
@@ -145,7 +175,7 @@ import UIKit
                     rate: settings.rate, rates: PlaybackPreferences.rates, danmakuShown: danmaku.show,
                     onBack: { if fullScreen { fullScreen = false } else { closeDetail(); dismiss() } },
                     onPlay: togglePlay, onNext: { startEpisode(episodeIndex + 1) }, onSeek: seek,
-                    onFullScreen: { if !fullScreen { landscape = true }; fullScreen.toggle() }, onFill: { fill.toggle() },
+                    onFullScreen: { fullScreen.toggle() }, onFill: { fill.toggle() },
                     onSettings: { sheet = .settings }, onEpisodes: { sheet = .episodes },
                     onDanmaku: { danmaku.show.toggle() },
                     onRate: applyRate,
@@ -154,12 +184,16 @@ import UIKit
                     }
                     .padding(fullScreen ? fullscreenInsets : EdgeInsets())
                 if resolving && !locked { ProgressView("正在解析播放地址…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)) }
+                if let attemptStatus, !locked {
+                    VStack { Spacer(); Text(attemptStatus).font(.caption).padding(8).background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 8)); Spacer().frame(height: 80) }
+                        .allowsHitTesting(false)
+                }
                 if let errorText, !locked {
                     VStack(spacing: 12) {
                         Text(errorText).multilineTextAlignment(.center)
                         HStack {
                             Button("返回") { if fullScreen { fullScreen = false } else { closeDetail(); dismiss() } }
-                            Button("重试") { startEpisode(episodeIndex, resume: time) }
+                            Button("重试") { startEpisode(episodeIndex, resume: time, preferSuccessful: false, preservePaused: attemptPaused) }
                             Menu("换源") { sourceButtons }
                             Button("报错") { Task { await report(update: false) } }.disabled(reportBusy || source == nil)
                         }
@@ -187,7 +221,10 @@ import UIKit
         Button("弹幕样式") { sheet = .danmaku }
         Button(fill ? "画面适应" : "画面填充") { fill.toggle() }
         Button("锁屏") { locked = true; playerInteraction.show() }
-        if fullScreen { Button(landscape ? "切换竖屏" : "切换横屏") { landscape.toggle() } }
+        if fullScreen {
+            Button(landscape ? "切换竖屏" : "切换横屏") { manualLandscape = !landscape }
+            if manualLandscape != nil { Button("按视频比例自动方向") { manualLandscape = nil } }
+        }
         Menu("播放方式") { Button("连续播放") { settings.mode = "continuous" }; Button("单集停止") { settings.mode = "single" }; Button("单集循环") { settings.mode = "loop" } }
         Button("AirPlay / 系统投屏") { sheet = .cast }
         Button("画中画") { sheet = .pip }
@@ -337,6 +374,7 @@ import UIKit
             List {
                 Section {
                     Menu("下载线路：\(source?.id ?? "暂无")") { sourceButtons }
+                        .disabled(downloading)
                     HStack {
                         Button("全选未缓存") { selectedDownloads = Set(episodes.indices.filter { cachedDownload($0) == nil }) }
                         Spacer(); Button("取消全选") { selectedDownloads = [] }
@@ -355,13 +393,15 @@ import UIKit
                         }
                     }
                 }
+                if let error = downloads.storageError { Text(error).font(.caption).foregroundStyle(.red) }
+                if downloads.isRestoring { ProgressView("正在恢复下载记录…") }
                 if let notice { Text(notice).font(.caption) }
                 if downloading { ProgressView("逐集解析并加入真实下载队列…"); Button("停止加入队列") { downloadTask?.cancel() } }
                 NavigationLink("查看所有下载") { DownloadsView() }
             }.navigationTitle("下载选集")
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) { Button("关闭") { sheet = nil } }
-                    ToolbarItem(placement: .confirmationAction) { Button("下载所选 \(selectedDownloads.count) 集") { queueDownloads() }.disabled(selectedDownloads.isEmpty || downloading) }
+                    ToolbarItem(placement: .confirmationAction) { Button("下载所选 \(selectedDownloads.count) 集") { queueDownloads() }.disabled(selectedDownloads.isEmpty || downloading || downloads.isRestoring || downloads.storageError != nil) }
                 }
         }
     }
@@ -372,6 +412,10 @@ import UIKit
     }
     private func queueDownloads() {
         guard let source, let video, !downloading else { return }
+        guard !downloads.isRestoring, downloads.storageError == nil else {
+            notice = downloads.storageError ?? "下载记录正在恢复，请稍后再试。"
+            return
+        }
         let selected = selectedDownloads.sorted().filter { source.episodes.indices.contains($0) }
         downloading = true
         downloadTask = Task { @MainActor in
@@ -390,7 +434,7 @@ import UIKit
                     var transferred = false
                     defer { if !transferred { SpecialSourceResolver.shared.releaseDownload(url: result.url) } }
                     try Task.checkCancellation()
-                    guard !suspended else { throw CancellationError() }
+                    guard !suspended, UIApplication.shared.applicationState != .background else { throw CancellationError() }
                     if !downloads.items.contains(where: { $0.title == title && [.queued, .downloading, .completed].contains($0.state) }) {
                         let origin = OfflineDownloadOrigin(videoID: video.id, playerID: source.id,
                                                            episodeIndex: index, episodeURL: item.url)
@@ -442,6 +486,7 @@ import UIKit
         if playback.core != nil { time = playback.position.isFinite ? max(0, playback.position) : time }
         resumeAfterNavigation = playback.isPlaying
         suspended = true
+        firstFrameTimeout?.cancel(); firstFrameTimeout = nil
         resolveTask?.cancel(); resolveTask = nil; resolutionGeneration += 1; resolving = false
         downloadTask?.cancel(); downloadTask = nil
         backgroundPauseTask?.cancel(); backgroundPauseTask = nil
@@ -479,36 +524,101 @@ import UIKit
         guard !downloading, let video, video.sources.indices.contains(index) else { return }
         let oldIndex = episodeIndex
         let oldTime = time
+        let oldName = episode?.name
+        let paused = playback.core != nil && !playback.playbackRequested
         recordHistory(); resolved = nil; sourceIndex = index; group = 0; selectedDownloads = []
-        let target = min(oldIndex, max(0, episodes.count - 1))
-        if oldIndex != target { notice = "该线路集数较少，已切换到最后一集" }
-        startEpisode(target, resume: oldIndex == target ? oldTime : 0)
+        guard !episodes.isEmpty else { notice = "该线路没有可播放集数"; return }
+        let target = episodes.firstIndex(where: { $0.name == oldName }) ?? min(oldIndex, max(0, episodes.count - 1))
+        if oldIndex != target && episodes[target].name != oldName { notice = "该线路集数较少，已按集数范围匹配，请核对集名" }
+        startEpisode(target, resume: oldTime, preferSuccessful: false, preservePaused: paused)
     }
-    private func startEpisode(_ index: Int, resume: Double = 0) {
-        guard episodes.indices.contains(index), let source else { return }
-        recordHistory(); resolveTask?.cancel(); resolutionGeneration += 1
+    private var preferredSourceKey: String { "niuniu.preferredSource.\(videoID)" }
+    private func startEpisode(_ index: Int, resume: Double = 0, continuingAttempts: Bool = false,
+                              preferSuccessful: Bool = true, preservePaused: Bool = false) {
+        guard episodes.indices.contains(index) else { return }
+        recordHistory()
+        var target = index
+        if !continuingAttempts {
+            attemptEpisodeName = episodes[index].name; attemptEpisodeIndex = index
+            attemptResume = resume.isFinite ? max(0, resume) : 0
+            attemptPaused = preservePaused
+            triedSources = []; attemptDiagnostics = []
+            if preferSuccessful, let video, let preferred = UserDefaults.standard.string(forKey: preferredSourceKey),
+               let preferredIndex = video.sources.firstIndex(where: { $0.id == preferred && !$0.episodes.isEmpty }) {
+                sourceIndex = preferredIndex
+                target = episodes.firstIndex(where: { $0.name == attemptEpisodeName }) ?? min(index, episodes.count - 1)
+            }
+        }
+        guard let source, source.episodes.indices.contains(target) else { return }
+        resolveTask?.cancel(); resolutionGeneration += 1
         let generation = resolutionGeneration
-        episodeIndex = index; group = (reversed ? episodes.count - 1 - index : index) / 50
-        let episode = source.episodes[index]
+        firstFrameTimeout?.cancel(); firstFrameTimeout = nil
+        loadedGeneration = nil; loadedSourceID = nil
+        triedSources.insert(source.id)
+        attemptStatus = "正在尝试线路 \(source.id)（\(triedSources.count)/\(video?.sources.filter { !$0.episodes.isEmpty }.count ?? 0)）"
+        episodeIndex = target; group = (reversed ? episodes.count - 1 - target : target) / 50
+        let episode = source.episodes[target]
         temporaryRate(false)
         playback.stop(); playback.error = nil; playing = false; handledEnd = false; failure = nil; resolved = nil; resolving = true
         time = 0; duration = 0; savedHistorySecond = -1
-        danmaku.updatePlayback(episode: String(index), time: 0)
+        danmaku.updatePlayback(episode: String(target), time: 0)
+        armFirstFrameTimeout(generation: generation, sourceID: source.id)
         resolveTask = Task { @MainActor in
             do {
                 let result = try await APIClient.shared.resolve(episode: episode, source: source.id)
                 guard generation == resolutionGeneration, !Task.isCancelled else { return }
                 resolved = result
+                loadedGeneration = generation; loadedSourceID = source.id
                 playback.setRate(settings.rate)
                 introPending = resume <= 0 && settings.intro > 0
                 playback.load(result.url, headers: result.headers, resume: resume.isFinite ? max(0, resume) : 0)
+                if attemptPaused { playback.pause() }
                 playback.setFill(fill)
                 resolving = false
             } catch {
                 guard generation == resolutionGeneration, !Task.isCancelled else { return }
-                failure = error.localizedDescription; resolving = false
+                resolving = false
+                failover(error.localizedDescription, generation: generation, sourceID: source.id)
             }
         }
+    }
+    private func armFirstFrameTimeout(generation: Int, sourceID: String) {
+        firstFrameTimeout = Task { @MainActor in
+            var activeSeconds = 0
+            while activeSeconds < 30 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, !suspended, generation == resolutionGeneration,
+                      source?.id == sourceID, !playback.hasRenderedFrame else { return }
+                // Neither user pause nor background time counts as failed prepare.
+                if scenePhase == .active && !attemptPaused && (resolving || playback.playbackRequested) { activeSeconds += 1 }
+            }
+            failover("阶段 prepare · 30 秒未收到真实首帧", generation: generation, sourceID: sourceID)
+        }
+    }
+    private func failover(_ diagnostic: String, generation: Int, sourceID: String) {
+        guard !suspended, generation == resolutionGeneration, source?.id == sourceID else { return }
+        firstFrameTimeout?.cancel(); firstFrameTimeout = nil
+        // Invalidate synchronously, before another simultaneous error/timeout can advance twice.
+        loadedGeneration = nil; loadedSourceID = nil
+        resolutionGeneration += 1
+        resolveTask?.cancel(); resolveTask = nil; resolving = false
+        attemptDiagnostics.append("线路 \(sourceID)：\(diagnostic)")
+        if playback.core != nil {
+            // renderError pauses the native core for safety; that is NOT a user
+            // pause and must not make the next source permanently paused.
+            if playback.position.isFinite && playback.position > 0 { attemptResume = playback.position }
+        }
+        guard let video, let next = video.sources.firstIndex(where: { !triedSources.contains($0.id) && !$0.episodes.isEmpty }) else {
+            playback.pause(); playing = false
+            attemptStatus = nil
+            failure = "可用线路均已尝试，未确认播放成功。\n" + attemptDiagnostics.joined(separator: "\n")
+            return
+        }
+        recordHistory()
+        resolved = nil // Never attribute the old source's URL/progress to the next source.
+        sourceIndex = next; selectedDownloads = []
+        let target = episodes.firstIndex(where: { $0.name == attemptEpisodeName }) ?? min(attemptEpisodeIndex, episodes.count - 1)
+        startEpisode(target, resume: attemptResume, continuingAttempts: true, preferSuccessful: false)
     }
     private func seek(_ seconds: Double) {
         guard seconds.isFinite, resolved != nil, !resolving else { return }
@@ -521,8 +631,8 @@ import UIKit
     }
     private func togglePlay() {
         guard resolved != nil, !resolving else { return }
-        if playback.isPlaying { playback.pause(); playing = false }
-        else { playback.setRate(settings.rate); playback.play(); playing = playback.isPlaying }
+        if playback.playbackRequested { attemptPaused = true; playback.pause(); playing = false }
+        else { attemptPaused = false; playback.setRate(settings.rate); playback.play(); playing = playback.isPlaying }
     }
     private func applyRate(_ value: Float) {
         guard value.isFinite, PlaybackPreferences.rates.contains(value) else { return }

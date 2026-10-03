@@ -56,7 +56,7 @@ extension EnvironmentValues {
         var orientationFailure: ((String) -> Void)?
         var content: ((EdgeInsets) -> AnyView)?
         var insets = EdgeInsets()
-        var desiredLandscape = true
+        var desiredLandscape = false
         var desiredPresented = false
         var dismissing = false
         var presentationPending = false
@@ -169,11 +169,14 @@ extension EnvironmentValues {
         setNeedsUpdateOfHomeIndicatorAutoHidden()
     }
     func setLandscape(_ landscape: Bool) {
+        // UIKit geometry requests must wait for the actual presented scene. The
+        // coordinator retries the latest decoded-frame decision from onShown.
+        guard didShow, let scene = view.window?.windowScene else { return }
         let mask: UIInterfaceOrientationMask = landscape ? .landscapeRight : .portrait
         guard mask != orientationMask else { return }
         orientationMask = mask
         setNeedsUpdateOfSupportedInterfaceOrientations()
-        view.window?.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { [weak self] error in
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { [weak self] error in
             self?.orientationFailure?("系统未允许此屏幕方向：\(error.localizedDescription)")
         }
     }

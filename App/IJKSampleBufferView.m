@@ -10,7 +10,8 @@
     int _serial, _lastSerial;
     BOOL _scheduled, _closed, _waitingSerial, _hasSerial;
     BOOL _seekConfirmed;
-    double _seekTarget;
+    int _seekSerial;
+    BOOL _seekAckPending;
     BOOL _hasAcceptedSerial;
     int _acceptedSerial;
     uint64_t _generation;
@@ -18,6 +19,7 @@
     CVPixelBufferPoolRef _pool;
     int _poolWidth, _poolHeight;
     BOOL _errorReported;
+    double _lastDisplayAspect;
     CGFloat _fps, _scaleFactor;
     BOOL _isThirdGLView;
 }
@@ -57,12 +59,12 @@
 - (void)display_pixels:(IJKOverlay *)overlay {
     if (!overlay) return;
     os_unfair_lock_lock(&_lock);
-    BOOL reject = _closed || (_waitingSerial && (!_seekConfirmed || !isfinite(overlay->pts) || fabs(overlay->pts - _seekTarget) > 1.0)) ||
+    BOOL reject = _closed || (_waitingSerial && _seekConfirmed && overlay->serial != _seekSerial) ||
         (!_waitingSerial && _hasAcceptedSerial && overlay->serial < _acceptedSerial);
     uint64_t generation = _generation;
     os_unfair_lock_unlock(&_lock);
     if (reject) return;
-    if (!isfinite(overlay->pts) || overlay->w <= 0 || overlay->h <= 0 || overlay->w > 8192 || overlay->h > 8192) {
+    if (overlay->w <= 0 || overlay->h <= 0 || overlay->w > 8192 || overlay->h > 8192) {
         [self reportError:@"IJK sample-buffer output: invalid frame dimensions or PTS"];
         return;
     }
@@ -142,8 +144,8 @@
     CVBufferSetAttachment(buffer, kCVImageBufferPixelAspectRatioKey, (__bridge CFDictionaryRef)aspect, kCVAttachmentMode_ShouldPropagate);
     os_unfair_lock_lock(&_lock);
     if (_closed || generation != _generation) { os_unfair_lock_unlock(&_lock); CVPixelBufferRelease(buffer); return; }
-    if (_waitingSerial) {
-        // Latch the first confirmed near-target frame at acceptance, NOT drain.
+    if (_waitingSerial && _seekConfirmed) {
+        // Latch the exact completion serial at acceptance, NOT drain.
         // Subsequent seek increments generation even when this hasn't drained.
         _waitingSerial = NO; _hasSerial = NO;
     }
@@ -159,6 +161,9 @@
 - (void)drain {
     NSAssert(NSThread.isMainThread, @"Layer operations require main thread");
     os_unfair_lock_lock(&_lock);
+    if (_waitingSerial && !_seekConfirmed) {
+        _scheduled = NO; os_unfair_lock_unlock(&_lock); return;
+    }
     CVPixelBufferRef buffer = _pending; _pending = NULL; _scheduled = NO;
     if (!buffer) { os_unfair_lock_unlock(&_lock); return; }
     double pts = _pts, duration = _duration;
@@ -168,19 +173,38 @@
     _waitingSerial = NO; _lastSerial = serial; _hasSerial = YES;
     os_unfair_lock_unlock(&_lock);
     if (closed) { CVPixelBufferRelease(buffer); return; }
-    if (discontinuity || self.displayLayer.status == AVQueuedSampleBufferRenderingStatusFailed) [self.displayLayer flushAndRemoveImage];
+    // Keep the previous image until an actual replacement sample is ready.
     CMVideoFormatDescriptionRef description = NULL;
     CMSampleBufferRef sample = NULL;
     OSStatus status = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, buffer, &description);
     CMSampleTimingInfo timing = {isfinite(duration) && duration > 0 ? CMTimeMakeWithSeconds(duration, 1000000) : kCMTimeInvalid,
-                                CMTimeMakeWithSeconds(pts, 1000000), kCMTimeInvalid};
+                                isfinite(pts) ? CMTimeMakeWithSeconds(pts, 1000000) : kCMTimeInvalid, kCMTimeInvalid};
     if (status == noErr) status = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, buffer, description, &timing, &sample);
     if (status == noErr) {
         // IJK has already waited/dropped against its audio master. Do not add a
         // second independent scheduler; preserve PTS for media/PiP time mapping.
         CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, true);
         CFDictionarySetValue((CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0), kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
-        if (self.displayLayer.readyForMoreMediaData) [self.displayLayer enqueueSampleBuffer:sample];
+        if (discontinuity || self.displayLayer.status == AVQueuedSampleBufferRenderingStatusFailed) [self.displayLayer flush];
+        if (self.displayLayer.readyForMoreMediaData) {
+            [self.displayLayer enqueueSampleBuffer:sample];
+            // Use the SAME accepted sample, not coded stream dimensions. CoreMedia
+            // presentation dimensions include the propagated pixel-aspect ratio.
+            // Filtered/autorotated overlays already have their final dimensions;
+            // never apply stream rotation again to this sample-buffer layer.
+            CGSize displaySize = CMVideoFormatDescriptionGetPresentationDimensions(description, true, false);
+            double aspect = displaySize.height > 0 ? displaySize.width / displaySize.height : 0;
+            if (isfinite(aspect) && aspect > 0 &&
+                (_lastDisplayAspect == 0 || fabs(aspect - _lastDisplayAspect) > 0.0001)) {
+                _lastDisplayAspect = aspect;
+                if (self.videoDisplayAspectChanged) self.videoDisplayAspectChanged(aspect);
+            }
+            os_unfair_lock_lock(&_lock);
+            BOOL acknowledge = _seekAckPending && _seekConfirmed && serial == _seekSerial;
+            if (acknowledge) _seekAckPending = NO;
+            os_unfair_lock_unlock(&_lock);
+            if (acknowledge && self.seekFrameDisplayed) self.seekFrameDisplayed(serial);
+        }
     } else [self reportError:@"IJK sample-buffer output: sample creation failed"];
     if (sample) CFRelease(sample);
     if (description) CFRelease(description);
@@ -196,22 +220,28 @@
 - (void)beginSeekTo:(double)target {
     NSAssert(NSThread.isMainThread, @"Seek invalidation requires main thread");
     os_unfair_lock_lock(&_lock);
-    ++_generation; _waitingSerial = YES; _seekConfirmed = NO; _seekTarget = target;
+    ++_generation; _waitingSerial = YES; _seekConfirmed = NO; _seekAckPending = YES;
     if (_pending) { CVPixelBufferRelease(_pending); _pending = NULL; }
     os_unfair_lock_unlock(&_lock);
-    [self.displayLayer flushAndRemoveImage];
+    // No immediate image removal: retain last real frame while seek is pending.
 }
-- (void)confirmSeek {
+- (void)confirmSeekWithSerial:(int)serial {
     NSAssert(NSThread.isMainThread, @"Seek confirmation requires main thread");
-    os_unfair_lock_lock(&_lock); _seekConfirmed = YES; os_unfair_lock_unlock(&_lock);
+    os_unfair_lock_lock(&_lock);
+    _seekSerial = serial; _seekConfirmed = YES;
+    if (_pending && _serial != serial) { CVPixelBufferRelease(_pending); _pending = NULL; }
+    BOOL schedule = _pending && !_scheduled;
+    if (schedule) _scheduled = YES;
+    os_unfair_lock_unlock(&_lock);
+    if (schedule) dispatch_async(dispatch_get_main_queue(), ^{ [self drain]; });
 }
 - (void)cancelSeek {
     NSAssert(NSThread.isMainThread, @"Seek cancellation requires main thread");
     os_unfair_lock_lock(&_lock);
-    ++_generation; _waitingSerial = NO; _seekConfirmed = NO; _hasSerial = NO; _hasAcceptedSerial = NO;
+    ++_generation; _waitingSerial = NO; _seekConfirmed = NO; _seekAckPending = NO; _hasSerial = NO; _hasAcceptedSerial = NO;
     if (_pending) { CVPixelBufferRelease(_pending); _pending = NULL; }
     os_unfair_lock_unlock(&_lock);
-    [self.displayLayer flushAndRemoveImage];
+    [self.displayLayer flush];
 }
 - (void)close {
     NSAssert(NSThread.isMainThread, @"Close requires main thread");
@@ -220,6 +250,8 @@
     if (_pending) { CVPixelBufferRelease(_pending); _pending = NULL; }
     os_unfair_lock_unlock(&_lock);
     self.renderError = nil;
+    self.seekFrameDisplayed = nil;
+    self.videoDisplayAspectChanged = nil;
     [self.displayLayer flushAndRemoveImage];
 }
 - (void)dealloc {

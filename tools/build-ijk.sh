@@ -195,6 +195,13 @@ replace(ijk/'ijkmedia/ijksdl/ffmpeg/ijksdl_vout_overlay_ffmpeg.c', '        over
         }
 ''', 1)
 replace(controller, 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ijk0.8.8--20201130--001";', 'static const char *kIJKFFRequiredFFmpegVersion = "ff4.0--ijk0.8.8--20210426--001";', 1)
+# Carry the queue serial in the SAME seek completion message, not a later
+# mutable getter (another request may already have changed the queue).
+replace(ijk/'ijkmedia/ijkplayer/ff_ffplay.c', '            ffp_notify_msg3(ffp, FFP_MSG_SEEK_COMPLETE, (int)fftime_to_milliseconds(seek_target), ret);', '''            int seek_video_serial = is->video_stream >= 0 ? is->videoq.serial : -1;
+            ffp_notify_msg4(ffp, FFP_MSG_SEEK_COMPLETE, (int)fftime_to_milliseconds(seek_target), ret,
+                            &seek_video_serial, sizeof(seek_video_serial));''', 1)
+replace(controller, '''                        IJKMPMoviePlayerDidSeekCompleteErrorKey: @(avmsg->arg2)}];''', '''                        IJKMPMoviePlayerDidSeekCompleteErrorKey: @(avmsg->arg2),
+                        @"IJKSeekVideoSerial": @(avmsg->obj ? *(const int *)avmsg->obj : -1)}];''', 1)
 # Return the actual AVAudioSession result on every BOOL path; keep the
 # upstream deactivation exception handler rather than silencing return-type.
 replace(ijk/'ios/IJKMediaPlayer/IJKMediaPlayer/IJKAudioKit.m', '''- (BOOL)setActive:(BOOL)active
