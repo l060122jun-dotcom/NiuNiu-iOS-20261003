@@ -66,7 +66,6 @@ import MediaPlayer
     @State private var scrubTime: Double = 0
     @State private var openMenu: ControlMenu?
     @State private var menuExpanded = false
-    @State private var menuContentHeight: CGFloat = 686
     @State private var menuClosing = false
     private enum ControlMenu: Equatable { case more, rate }
     private let menuAnimation = Animation.spring(response: 0.28, dampingFraction: 1)
@@ -171,7 +170,6 @@ import MediaPlayer
         if openMenu == menu, menuExpanded { closeMenu() }
         else {
             menuClosing = false
-            menuContentHeight = menu == .more ? 686 : CGFloat(rates.count) * 49
             menuExpanded = false
             openMenu = menu
             interaction.setMenuOpen(true)
@@ -211,7 +209,11 @@ import MediaPlayer
                 let x = min(max(8, button.maxX - width), max(8, geometry.size.width - width - 8))
                 let top = menu == .more ? min(button.maxY + 4, max(8, bottom - 49)) : 8
                 let availableHeight = max(1, bottom - top - 6)
-                let height = min(max(49, menuContentHeight), availableHeight)
+                // The viewport must not depend on a preference measured inside
+                // its own ScrollView: transient zero/row measurements collapse
+                // the surface and can leave only the disabled first row visible.
+                let preferredHeight: CGFloat = menu == .more ? 420 : CGFloat(rates.count) * 49
+                let height = min(preferredHeight, availableHeight)
                 let y = menu == .more ? top : max(8, button.minY - height - 4)
                 // The usual origin is topTrailing, adjusted to the actual
                 // ellipsis centre after clamping (also survives rotation).
@@ -222,7 +224,7 @@ import MediaPlayer
                 Color.clear.contentShape(Rectangle()).onTapGesture { closeMenu() }
                     .frame(width: geometry.size.width, height: max(0, bottom))
                 VStack(spacing: 0) {
-                    ScrollView(.vertical, showsIndicators: false) {
+                    ScrollView(.vertical, showsIndicators: true) {
                         VStack(alignment: .leading, spacing: 0) {
                             if menu == .more {
                                 more()
@@ -233,10 +235,8 @@ import MediaPlayer
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
                         .buttonStyle(PlayerMenuActionStyle(close: closeMenu))
-                        .background(GeometryReader { content in
-                            Color.clear.preference(key: PlayerMenuHeightKey.self, value: content.size.height)
-                        })
                     }
                 }
                 .foregroundStyle(Color.white.opacity(0.8)).tint(Color.white.opacity(0.8))
@@ -254,7 +254,6 @@ import MediaPlayer
                 .modifier(PlayerMenuAnimationCompletion(progress: menuExpanded ? 1 : 0, closing: menuClosing, completion: finishMenuClose))
                 .offset(x: x, y: y)
                 .allowsHitTesting(menuExpanded)
-                .onPreferenceChange(PlayerMenuHeightKey.self) { menuContentHeight = $0 }
                 }
             }
         }
@@ -300,10 +299,6 @@ private struct PlayerControlBoundsKey: PreferenceKey {
     static func reduce(value: inout [PlayerControlAnchor: Anchor<CGRect>], nextValue: () -> [PlayerControlAnchor: Anchor<CGRect>]) {
         value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
-}
-private struct PlayerMenuHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
 // Observe the animatable value rather than using iOS 17's completion API or
