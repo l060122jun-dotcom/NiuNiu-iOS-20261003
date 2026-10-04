@@ -400,8 +400,10 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
 
     private func refresh(_ candidate: IJKFFMoviePlayerController) {
         guard core === candidate else { return }
-        duration = Self.validTime(candidate.duration)
-        isPlaying = !didFinish && candidate.isPlaying()
+        let nextDuration = Self.validTime(candidate.duration)
+        if duration != nextDuration { duration = nextDuration }
+        let nextPlaying = !didFinish && candidate.isPlaying()
+        if isPlaying != nextPlaying { isPlaying = nextPlaying }
         let seconds = candidate.currentPlaybackTime
         guard seconds.isFinite, seconds >= 0 else { return }
         if isSeeking {

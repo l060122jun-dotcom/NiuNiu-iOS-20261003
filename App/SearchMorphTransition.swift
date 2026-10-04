@@ -4,12 +4,16 @@ import SwiftUI
 // safeAreaInset reserves its initial height, while the scroll's edge extends
 // beneath it after scrolling (do not clip the scroll to its reduced bounds).
 struct FloatingBrowseHeader: ViewModifier {
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     func body(content: Content) -> some View {
         // Each control supplies its own material. Leave the gaps transparent;
         // never blur the header as a full-width rectangular block.
         content.background(Color.clear)
     }
+}
+
+/// A shared surface for both matched-geometry endpoints; no full-width header blur.
+struct GlassSearchPill: View {
+    var body: some View { GlassSurface(shape: Capsule(), material: .thinMaterial) }
 }
 
 private struct SearchMorphNamespaceKey: EnvironmentKey {

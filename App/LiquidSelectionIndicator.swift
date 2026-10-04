@@ -73,10 +73,8 @@ struct LiquidChoiceCapsule: View {
             let shape = LiquidCapsuleShape(stretch: stretch * min(16, abs(distance) * 0.10),
                                            direction: distance >= 0 ? 1 : -1)
             ZStack {
-                if opaque {
-                    shape.fill(scheme == .dark ? Color(white: 0.22) : Color(white: 0.96))
-                } else {
-                    shape.fill(.regularMaterial)
+                GlassSurface(shape: shape, material: .regularMaterial)
+                if !opaque {
                     shape.fill(BrowseTheme.green.opacity(scheme == .dark ? 0.24 : 0.18))
                 }
                 shape.strokeBorderCompat(Color.primary.opacity(opaque ? 0.14 : 0.12))
@@ -121,9 +119,10 @@ final class LiquidTabIndicatorView: UIView {
     func update(selection: Int, count: Int, dark: Bool, enabled: Bool, bottomInset: CGFloat) {
         let count = max(1, count)
         let slot = bounds.width / CGFloat(count)
-        let itemHeight = max(32, min(50, bounds.height - bottomInset))
+        let itemHeight = max(0, bounds.height - bottomInset)
+        let indicatorHeight = min(58, itemHeight)
         let target = CGRect(x: slot * (CGFloat(min(max(0, selection), count - 1)) + 0.5) - (slot - 12) / 2,
-                            y: max(2, (itemHeight - 40) / 2), width: max(24, slot - 12), height: min(40, itemHeight - 4))
+                            y: (itemHeight - indicatorHeight) / 2, width: max(24, slot - 12), height: indicatorHeight)
         let opaque = UIAccessibility.isReduceTransparencyEnabled
         let fill = dark ? UIColor(white: 0.30, alpha: opaque ? 1 : 0.70)
             : UIColor(white: 1, alpha: opaque ? 1 : 0.72)

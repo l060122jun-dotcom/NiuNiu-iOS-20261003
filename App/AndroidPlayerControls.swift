@@ -241,8 +241,7 @@ import MediaPlayer
                 }
                 .foregroundStyle(Color.white.opacity(0.8)).tint(Color.white.opacity(0.8))
                 .frame(width: width, height: height)
-                .background(Color.gray.opacity(0.18), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .glassBackground(in: RoundedRectangle(cornerRadius: 26, style: .continuous), dark: true)
                 .overlay {
                     RoundedRectangle(cornerRadius: 26, style: .continuous)
                         .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.5)

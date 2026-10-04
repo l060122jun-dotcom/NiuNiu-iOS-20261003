@@ -40,7 +40,15 @@ private struct BrowseTrackingKey: EnvironmentKey {
     static let defaultValue = true
 }
 
+private struct PosterCoordinateSpaceKey: EnvironmentKey {
+    static let defaultValue = "browse.results"
+}
+
 private extension EnvironmentValues {
+    var posterCoordinateSpace: String {
+        get { self[PosterCoordinateSpaceKey.self] }
+        set { self[PosterCoordinateSpaceKey.self] = newValue }
+    }
     var browseViewportHeight: CGFloat {
         get { self[BrowseViewportKey.self] }
         set { self[BrowseViewportKey.self] = newValue }
@@ -56,10 +64,12 @@ private struct BrowseScroll<Content: View>: View {
     @State private var tracking = false
     private let resetKey: String
     private let resetRevision: Int
+    private let active: Bool
     private let content: Content
-    init(resetKey: String = "", resetRevision: Int = 0, @ViewBuilder content: () -> Content) {
+    init(resetKey: String = "", resetRevision: Int = 0, active: Bool = true, @ViewBuilder content: () -> Content) {
         self.resetKey = resetKey
         self.resetRevision = resetRevision
+        self.active = active
         self.content = content()
     }
     var body: some View {
@@ -82,7 +92,8 @@ private struct BrowseScroll<Content: View>: View {
             }
             .coordinateSpace(name: "browse.results")
             .environment(\.browseViewportHeight, viewport.size.height)
-            .environment(\.browseTracking, tracking)
+            .environment(\.browseTracking, tracking && active)
+            .environment(\.posterCoordinateSpace, "browse.results")
             .onAppear { tracking = true }
             .onDisappear { tracking = false }
             // Push/pop keeps this ScrollView's identity. Never issue a scroll command
@@ -199,7 +210,8 @@ private final class VideoPageStore: ObservableObject {
         }
     }
 
-    func load(reset: Bool, category: String, filters: [String: String] = [:], query: String? = nil) async {
+    func load(reset: Bool, category: String, filters: [String: String] = [:], query: String? = nil,
+              shouldCommit: () -> Bool = { true }) async {
         if !reset && (loading || !hasMore) { return }
         if reset {
             generation = UUID()
@@ -221,7 +233,7 @@ private final class VideoPageStore: ObservableObject {
                 response = try await APIClient.shared.videos(category: category, page: nextPage, filters: filters)
             }
             try Task.checkCancellation()
-            guard request == generation else { return }
+            guard request == generation, shouldCommit() else { return }
             var seen = Set(videos.map(\.id))
             let additions = response.filter { !$0.id.isEmpty && seen.insert($0.id).inserted }
             videos.append(contentsOf: additions)
@@ -234,7 +246,7 @@ private final class VideoPageStore: ObservableObject {
             guard request == generation else { return }
             // URLSession may report URLError.cancelled instead of CancellationError.
             // A cancelled first page remains resumable when the view reappears.
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, shouldCommit() else { return }
             self.error = error.localizedDescription
         }
     }
@@ -293,6 +305,7 @@ struct MainTabView: View {
 
 /// Keep SwiftUI's native navigation/visibility router; the compact bar owns its UI.
 private struct MainTabAppearance: UIViewControllerRepresentable {
+    @AppStorage(GlassAppearance.storageKey) private var glassOpacity = GlassAppearance.defaultOpacity
     let dark: Bool
     @Binding var selection: Int
     let badge: String?
@@ -309,9 +322,13 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
         return 0
     }
 
-    func makeUIViewController(context: Context) -> GlassTabContainer { GlassTabContainer() }
+    func makeUIViewController(context: Context) -> GlassTabContainer {
+        GlassAppearance.migrate()
+        return GlassTabContainer()
+    }
     func updateUIViewController(_ controller: GlassTabContainer, context: Context) {
         controller.dark = dark
+        controller.glassOpacity = GlassAppearance.normalized(glassOpacity)
         controller.selection = selection
         controller.badge = badge
         controller.active = active
@@ -337,21 +354,21 @@ private struct BrowseTopBar: View {
                 .padding(.horizontal, 13).frame(minHeight: 44)
                 .background {
                     if let namespace = searchNamespace, !reduceMotion {
-                        Capsule().fill(.thinMaterial)
+                        GlassSearchPill()
                             .matchedGeometryEffect(id: "browse.search.pill", in: namespace, isSource: !search.expanded)
                     } else {
-                        Capsule().fill(.thinMaterial)
+                        GlassSearchPill()
                     }
                 }
             }.buttonStyle(BrowsePressStyle()).accessibilityLabel("搜索影片、剧集")
             NavigationLink { DownloadsView().toolbar(.visible, for: .navigationBar) } label: {
-                Image(systemName: "arrow.down.to.line").font(.body.weight(.semibold)).frame(width: 44, height: 44).background(.ultraThinMaterial, in: Circle())
+                Image(systemName: "arrow.down.to.line").font(.body.weight(.semibold)).frame(width: 44, height: 44).glassBackground(in: Circle())
             }.accessibilityLabel("下载管理")
             NavigationLink { SavedLibraryView(kind: .history).toolbar(.visible, for: .navigationBar) } label: {
-                Image(systemName: "clock").font(.body.weight(.semibold)).frame(width: 44, height: 44).background(.ultraThinMaterial, in: Circle())
+                Image(systemName: "clock").font(.body.weight(.semibold)).frame(width: 44, height: 44).glassBackground(in: Circle())
             }.accessibilityLabel("观看历史")
             NavigationLink { MessagesView().toolbar(.visible, for: .navigationBar) } label: {
-                Image(systemName: "bell").font(.body.weight(.semibold)).frame(width: 44, height: 44).background(.ultraThinMaterial, in: Circle())
+                Image(systemName: "bell").font(.body.weight(.semibold)).frame(width: 44, height: 44).glassBackground(in: Circle())
             }.accessibilityLabel("消息通知")
         }
         .foregroundStyle(Color.primary)
@@ -445,10 +462,7 @@ private struct ChoiceStrip: View {
                 .onChange(of: reduceMotion) { if $0 { motionEpoch = UUID(); moving = false } }
             }
         }
-        .background {
-            if reduceTransparency { Capsule().fill(BrowseTheme.surface) }
-            else { Capsule().fill(.ultraThinMaterial) }
-        }
+        .glassBackground(in: Capsule())
     }
     @State private var lastSelectedCenter: CGFloat = 0
 }
@@ -469,13 +483,27 @@ private struct BrowseMessage: View {
     }
 }
 
+private struct PosterPrefetchKey: PreferenceKey {
+    static var defaultValue = false
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
+}
+
 private struct PosterView: View {
     let url: String
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.browseViewportHeight) private var viewportHeight
+    @Environment(\.browseTracking) private var tracking
+    @Environment(\.posterCoordinateSpace) private var coordinateSpace
+    @State private var prefetched = false
+    @State private var image: UIImage?
     var body: some View {
         GeometryReader { geometry in
-            AsyncImage(url: URL(string: url)) { phase in
-                if let image = phase.image {
-                    image.resizable().scaledToFill()
+            let frame = geometry.frame(in: .named(coordinateSpace))
+            let pixels = min(2048, max(1, Int(ceil(max(geometry.size.width, geometry.size.height) * displayScale))))
+            let eligible = tracking && prefetched
+            Group {
+                if let image = image {
+                    Image(uiImage: image).resizable().scaledToFill()
                 } else {
                     ZStack {
                         Color(uiColor: .secondarySystemBackground)
@@ -485,6 +513,17 @@ private struct PosterView: View {
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
+            .preference(key: PosterPrefetchKey.self, value: viewportHeight > 0 && frame.width > 0
+                        && frame.maxY > -viewportHeight && frame.minY < viewportHeight * 2)
+            .onPreferenceChange(PosterPrefetchKey.self) { prefetched = $0 }
+            .task(id: "\(url)|\(pixels)|\(eligible)") {
+                image = nil
+                guard eligible, let source = URL(string: url), ["http", "https"].contains(source.scheme?.lowercased() ?? "") else { return }
+                let result = await PosterImagePipeline.shared.image(url: source, pixels: pixels)
+                guard !Task.isCancelled else { return }
+                image = result
+            }
+            .onDisappear { image = nil; prefetched = false }
         }
         .aspectRatio(0.7, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -620,6 +659,9 @@ private struct PagingFooter: View {
                 pagingTask?.cancel()
                 pagingTask = nil
             }
+            .onChange(of: automaticEnabled) { enabled in
+                if !enabled { pagingTask?.cancel(); pagingTask = nil }
+            }
     }
 }
 
@@ -680,6 +722,7 @@ private struct RecommendationGroupsFooter: View {
 private struct SearchResultsScroll: View {
     @ObservedObject var store: VideoPageStore
     let query: String
+    let visible: Bool
     let resetKey: String
     let resetRevision: Int
     let load: () -> Void
@@ -697,7 +740,7 @@ private struct SearchResultsScroll: View {
                             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
                         VideoGrid(videos: store.videos, columns: 3)
                         PagingFooter(store: store, automatic: true, viewportHeight: viewport.size.height,
-                                     automaticEnabled: tracking, coordinateSpace: "search.results", load: load)
+                                      automaticEnabled: tracking && visible, coordinateSpace: "search.results", automaticLoad: { await nextPage() }, load: load)
                         Button {
                             withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) {
                                 proxy.scrollTo("search.top", anchor: .top)
@@ -710,6 +753,9 @@ private struct SearchResultsScroll: View {
                     }.padding(.vertical)
                 }
                 .coordinateSpace(name: "search.results")
+                .environment(\.browseViewportHeight, viewport.size.height)
+                .environment(\.browseTracking, tracking && visible)
+                .environment(\.posterCoordinateSpace, "search.results")
                 .refreshable { await refresh() }
                 .onChange(of: resetKey) { _ in proxy.scrollTo("search.top", anchor: .top) }
                 .onChange(of: resetRevision) { _ in proxy.scrollTo("search.top", anchor: .top) }
@@ -718,6 +764,7 @@ private struct SearchResultsScroll: View {
             }
         }
     }
+    let nextPage: () async -> Void
 }
 
 @MainActor
@@ -1125,6 +1172,16 @@ struct RankingView: View {
 }
 
 @MainActor
+private final class SearchActivity: ObservableObject {
+    var visible = false
+    var revision = 0
+    func update(_ visible: Bool) {
+        if self.visible != visible { revision += 1 }
+        self.visible = visible
+    }
+}
+
+@MainActor
 struct SearchView: View {
     var morphPresented = true
     var morphReady = true
@@ -1135,6 +1192,7 @@ struct SearchView: View {
     @EnvironmentObject private var catalog: BrowseCatalog
     @ObservedObject private var account = AccountStore.shared
     @StateObject private var store = VideoPageStore()
+    @StateObject private var activity = SearchActivity()
     @State private var text = ""
     @State private var submitted = ""
     @State private var categoryID = ""
@@ -1148,12 +1206,18 @@ struct SearchView: View {
     @State private var hotLoading = false
     @State private var hotError: String?
     @State private var suggestionRetry = 0
+    @State private var suggestionGeneration = UUID()
+    @State private var searchActionTask: Task<Void, Never>?
+    @State private var hotActionTask: Task<Void, Never>?
     @FocusState private var focused: Bool
     private var selectedID: String { catalog.categories.contains(where: { $0.id == categoryID }) ? categoryID : "" }
     private var trimmedText: String { text.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var searchRequestKey: String {
         "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|\(submission)|\(selectedID)|\(submitted)"
     }
+    private var visibleSearchKey: String { "\(morphPresented)|\(searchRequestKey)" }
+    private var suggestionKey: String { "\(morphPresented)|\(account.token)|\(catalog.visibilityContext)|\(trimmedText)|\(suggestionRetry)" }
+    private var hotKey: String { "\(morphPresented)|\(account.token)|\(catalog.visibilityContext)" }
 
     private var searchHeader: some View {
         HStack(spacing: 10) {
@@ -1171,9 +1235,9 @@ struct SearchView: View {
             .padding(.horizontal, 13).frame(minHeight: 44)
             .background {
                 if let namespace = searchNamespace, !reduceMotion {
-                    Capsule().fill(.thinMaterial)
+                    GlassSearchPill()
                         .matchedGeometryEffect(id: "browse.search.pill", in: namespace, isSource: morphPresented)
-                } else { Capsule().fill(.thinMaterial) }
+                } else { GlassSearchPill() }
             }
             if let onCancel = onCancel {
                 Button("取消") { focused = false; onCancel() }
@@ -1192,7 +1256,7 @@ struct SearchView: View {
                 BrowseMessage(title: "暂无可搜索的分类") { Task { await catalog.load() } }
             }
             if submitted.isEmpty || (focused && trimmedText != submitted) {
-                BrowseScroll {
+                BrowseScroll(active: morphPresented) {
                     VStack(alignment: .leading, spacing: 18) {
                         if !trimmedText.isEmpty {
                             Text("联想建议").font(.title3.bold())
@@ -1236,7 +1300,7 @@ struct SearchView: View {
                          HStack {
                              Label("热门搜索", systemImage: "flame.fill").font(.title3.bold())
                             Spacer()
-                            Button { Task { await loadHot() } } label: {
+                             Button { refreshHot() } label: {
                                 Image(systemName: "arrow.clockwise").frame(width: 44, height: 44)
                              }.accessibilityLabel("刷新热门搜索")
                         }
@@ -1254,20 +1318,23 @@ struct SearchView: View {
                         }
                         if hotLoading { ProgressView("正在加载热门…") }
                         else if let error = hotError {
-                            BrowseMessage(title: "热门加载失败", detail: error) { Task { await loadHot() } }
+                             BrowseMessage(title: "热门加载失败", detail: error) { refreshHot() }
                          } else if hotWords.isEmpty {
                              Text("服务器暂无热门搜索").font(.footnote).foregroundStyle(.secondary)
                         }
                     }.padding()
                 }
             } else {
-                SearchResultsScroll(store: store, query: submitted,
+                SearchResultsScroll(store: store, query: submitted, visible: morphPresented,
                                      resetKey: searchRequestKey, resetRevision: scrollResetRevision,
-                                    load: { Task { await load(reset: false) } },
+                                     load: {
+                                         searchActionTask?.cancel()
+                                         searchActionTask = Task { await load(reset: false) }
+                                     },
                                      refresh: {
                                          scrollResetRevision += 1
                                          await load(reset: true)
-                                     })
+                                      }, nextPage: { await load(reset: false) })
                     .opacity(requestKey == searchRequestKey ? 1 : 0)
             }
         }
@@ -1292,10 +1359,33 @@ struct SearchView: View {
             // or force the keyboard over retained search results.
             focused = ready && morphPresented
         }
-        .onChange(of: morphPresented) { if !$0 { focused = false } }
-        .task(id: "\(trimmedText)|\(suggestionRetry)") { await loadSuggestions() }
-        .task { await loadHot() }
-        .task(id: searchRequestKey) {
+        .onChange(of: morphPresented) { visible in
+            activity.update(visible)
+            if !visible {
+                focused = false
+                searchActionTask?.cancel(); searchActionTask = nil
+                hotActionTask?.cancel(); hotActionTask = nil
+            }
+        }
+        .onDisappear {
+            activity.update(false)
+            searchActionTask?.cancel(); searchActionTask = nil
+            hotActionTask?.cancel(); hotActionTask = nil
+        }
+        .onAppear { activity.update(morphPresented) }
+        .task(id: suggestionKey) { guard morphPresented else { return }; activity.update(true); await loadSuggestions() }
+        .task(id: hotKey) {
+            guard morphPresented else { return }
+            activity.update(true)
+            while hotLoading {
+                do { try await Task.sleep(nanoseconds: 20_000_000) } catch { return }
+            }
+            guard !Task.isCancelled, morphPresented else { return }
+            await loadHot()
+        }
+        .task(id: visibleSearchKey) {
+            guard morphPresented else { return }
+            activity.update(true)
             guard !submitted.isEmpty else { requestKey = nil; return }
             if requestKey != searchRequestKey {
                 requestKey = searchRequestKey
@@ -1307,7 +1397,7 @@ struct SearchView: View {
                     do { try await Task.sleep(nanoseconds: 20_000_000) }
                     catch { return }
                 }
-                guard !Task.isCancelled, store.needsFirstPage else { return }
+                guard !Task.isCancelled, morphPresented, store.needsFirstPage else { return }
                 await load(reset: false)
             }
         }
@@ -1323,42 +1413,53 @@ struct SearchView: View {
     }
 
     private func load(reset: Bool) async {
-        guard !submitted.isEmpty else { return }
+        guard morphPresented, !Task.isCancelled, !submitted.isEmpty else { return }
         guard reset || requestKey == searchRequestKey else { return }
-        await store.load(reset: reset, category: selectedID, query: submitted)
+        let revision = activity.revision
+        await store.load(reset: reset, category: selectedID, query: submitted,
+                         shouldCommit: { activity.visible && activity.revision == revision })
     }
 
     private func loadSuggestions() async {
+        guard morphPresented, !Task.isCancelled else { return }
+        let identity = suggestionKey
+        let revision = activity.revision
+        let generation = UUID()
+        suggestionGeneration = generation
         let query = trimmedText
         suggestions = []
         suggestError = nil
         suggestLoading = false
         guard !query.isEmpty else { return }
         suggestLoading = true
-        defer { if trimmedText == query { suggestLoading = false } }
+        defer { if suggestionGeneration == generation { suggestLoading = false } }
         do {
             try await Task.sleep(nanoseconds: 280_000_000)
+            guard activity.visible, activity.revision == revision, morphPresented, identity == suggestionKey else { return }
             let response = try await APIClient.shared.suggest(keyword: query)
             try Task.checkCancellation()
-            guard trimmedText == query else { return }
+            guard activity.visible, activity.revision == revision, morphPresented, identity == suggestionKey else { return }
             var seen = Set<String>()
             suggestions = response.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty && seen.insert($0).inserted }
         } catch is CancellationError {
         } catch {
-            guard trimmedText == query else { return }
+            guard !Task.isCancelled, activity.visible, activity.revision == revision, morphPresented, identity == suggestionKey else { return }
             suggestError = error.localizedDescription
         }
     }
 
     private func loadHot() async {
-        guard !hotLoading else { return }
+        guard morphPresented, !Task.isCancelled, !hotLoading else { return }
+        let identity = hotKey
+        let revision = activity.revision
         hotLoading = true
         hotError = nil
         defer { hotLoading = false }
         do {
             let configuration = try await APIClient.shared.configuration()
             try Task.checkCancellation()
+            guard activity.visible, activity.revision == revision, morphPresented, identity == hotKey else { return }
             // Verified in SexyConfig.java: @SerializedName("search_hot_words") List<String>.
             guard let response = configuration["search_hot_words"] as? [String] else {
                 hotWords = []
@@ -1368,7 +1469,16 @@ struct SearchView: View {
             hotWords = response.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty && seen.insert($0).inserted }
         } catch is CancellationError {
-        } catch { hotError = error.localizedDescription }
+        } catch {
+            guard !Task.isCancelled, activity.visible, activity.revision == revision, morphPresented, identity == hotKey else { return }
+            hotError = error.localizedDescription
+        }
+    }
+
+    private func refreshHot() {
+        guard morphPresented else { return }
+        hotActionTask?.cancel()
+        hotActionTask = Task { await loadHot() }
     }
 }
 

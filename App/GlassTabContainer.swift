@@ -6,9 +6,10 @@ import UIKit
 @MainActor
 final class GlassTabContainer: UIViewController, UITabBarDelegate {
     var dark = false
+    var glassOpacity = GlassAppearance.defaultOpacity
     var selection = 0
     var badge: String?
-    var active = true
+    var active = true { didSet { if oldValue != active { refresh() } } }
     var onSelect: ((Int) -> Void)?
     private let capsule = UIView()
     private let glass = UIVisualEffectView()
@@ -16,13 +17,29 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
     private let compactBar = CompactTabBar()
     private let emptyMask = CALayer()
     private weak var nativeController: UITabBarController?
+    private weak var cachedRoot: UIViewController?
     private var originalInteraction = true
     private var originalAccessibilityHidden = false
     private var displayLink: CADisplayLink?
+    private var idleTimer: Timer?
+    private var visibilityObservers: [NSKeyValueObservation] = []
+    private var burstDeadline: CFTimeInterval = 0
+    private weak var lastTransition: AnyObject?
+    private var layoutFrame: CGRect?
+    private var itemState: ItemState?
+    private struct ItemState: Equatable {
+        let selection: Int
+        let badge: String?
+        let dark: Bool
+        let visible: Bool
+        let opaque: Bool
+        let reduceMotion: Bool
+        let bounds: CGRect
+    }
     private var appearanceKey = ""
     private var observers: [NSObjectProtocol] = []
 
-    /// Rasterize to a 24pt image before UIKit measures it. @2x = 48px, @3x = 72px;
+    /// Rasterize to a 20pt image before UIKit measures it. @2x = 40px, @3x = 60px;
     /// renderingMode/template and UIImage.scale survive tabItem bridging.
     static func icon(_ name: String) -> UIImage {
         let size = CGSize(width: 20, height: 20)
@@ -40,7 +57,7 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         view = UIView()
         view.backgroundColor = .clear
         view.isUserInteractionEnabled = false
-        capsule.layer.cornerRadius = 29
+        capsule.layer.cornerRadius = 35
         capsule.clipsToBounds = true
         capsule.isHidden = true
         glass.isUserInteractionEnabled = false
@@ -59,12 +76,19 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         }
         let link = CADisplayLink(target: TickProxy(self), selector: #selector(TickProxy.tick))
         link.preferredFramesPerSecond = 30
+        link.isPaused = true
         link.add(to: .main, forMode: .common)
         displayLink = link
+        // Public visibility KVO and layout callbacks are the primary signals.
+        // A 3Hz fallback catches presentation-only changes without per-tick Tasks.
+        idleTimer = Timer.scheduledTimer(timeInterval: 1.0 / 3.0, target: TickProxy(self),
+                                        selector: #selector(TickProxy.idle), userInfo: nil, repeats: true)
+        if let idleTimer = idleTimer { RunLoop.main.add(idleTimer, forMode: .common) }
     }
 
     deinit {
         displayLink?.invalidate()
+        idleTimer?.invalidate()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         capsule.removeFromSuperview()
         if let bar = nativeController?.tabBar, bar.layer.mask === emptyMask {
@@ -74,8 +98,8 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         }
     }
 
-    override func viewDidLayoutSubviews() { super.viewDidLayoutSubviews(); refresh() }
-    override func viewDidAppear(_ animated: Bool) { super.viewDidAppear(animated); refresh() }
+    override func viewDidLayoutSubviews() { super.viewDidLayoutSubviews(); startBurst(); refresh() }
+    override func viewDidAppear(_ animated: Bool) { super.viewDidAppear(animated); startBurst(); refresh() }
     override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         super.traitCollectionDidChange(previousTraitCollection)
         refresh()
@@ -83,11 +107,20 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
 
     func refresh() {
         guard isViewLoaded else { return }
-        displayLink?.isPaused = !active
+        guard active else { displayLink?.isPaused = true; return }
         var root: UIViewController = self
         while let parent = root.parent { root = parent }
-        guard let owner = findTabController(root), owner.view.window != nil else {
+        let owner: UITabBarController?
+        if let cached = nativeController, cachedRoot === root, cached.viewIfLoaded?.window != nil,
+           belongsToRoot(cached, root: root) {
+            owner = cached
+        } else {
+            owner = findTabController(root)
+        }
+        guard let owner = owner, owner.viewIfLoaded?.window != nil else {
             capsule.isHidden = true
+            itemState = nil
+            displayLink?.isPaused = true
             return
         }
         let native = owner.tabBar
@@ -98,43 +131,68 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
                 previous.accessibilityElementsHidden = originalAccessibilityHidden
             }
             nativeController = owner
+            cachedRoot = root
+            layoutFrame = nil
+            itemState = nil
             originalInteraction = native.isUserInteractionEnabled
             originalAccessibilityHidden = native.accessibilityElementsHidden
+            visibilityObservers = [
+                native.observe(\.isHidden, options: [.new]) { [weak self] _, _ in
+                    DispatchQueue.main.async { self?.nativeVisibilityChanged() }
+                },
+                native.observe(\.alpha, options: [.new]) { [weak self] _, _ in
+                    DispatchQueue.main.async { self?.nativeVisibilityChanged() }
+                }
+            ]
         }
+        cachedRoot = root
         // Empty public layer mask suppresses *all* native pixels, including its
         // full-width background, without changing isHidden/alpha visibility routing.
-        native.layer.mask = emptyMask
-        native.isUserInteractionEnabled = false
-        native.accessibilityElementsHidden = true
+        if native.layer.mask !== emptyMask { native.layer.mask = emptyMask }
+        if native.isUserInteractionEnabled { native.isUserInteractionEnabled = false }
+        if !native.accessibilityElementsHidden { native.accessibilityElementsHidden = true }
         if capsule.superview !== owner.view { capsule.removeFromSuperview(); owner.view.addSubview(capsule) }
 
         let bounds = owner.view.bounds
         let safe = owner.view.safeAreaInsets
-        let width = max(0, min(300, bounds.width - 88))
-        capsule.frame = CGRect(x: (bounds.width - width) / 2, y: bounds.maxY - safe.bottom - 10 - 58, width: width, height: 58)
-        glass.frame = capsule.bounds
-        // Bar and indicator share the same 50pt item coordinate space. The
-        // existing indicator's 40pt capsule and two damped rebounds stay intact.
-        let itemFrame = CGRect(x: 4, y: 4, width: max(0, width - 8), height: 50)
-        compactBar.frame = itemFrame
-        indicator.frame = itemFrame
+        let width = max(0, min(280, bounds.width - 88))
+        let frame = CGRect(x: (bounds.width - width) / 2, y: bounds.maxY - safe.bottom - 10 - 70, width: width, height: 70)
+        if layoutFrame != frame {
+            layoutFrame = frame
+            capsule.frame = frame
+            glass.frame = capsule.bounds
+            // The complete icon/title stack and selection share 58pt coordinates.
+            let itemFrame = CGRect(x: 6, y: 6, width: max(0, width - 12), height: 58)
+            compactBar.frame = itemFrame
+            indicator.frame = itemFrame
+        }
+        observeTransition(owner)
         let nativeFrame = native.layer.presentation()?.frame ?? native.frame
         let nativeVisible = !native.isHidden && native.alpha > 0.01 && nativeFrame.minY < bounds.maxY - 1
         // Poll public presentation geometry during interactive push/pop and
         // toolbar transitions too; no private item/background view inspection.
-        capsule.isHidden = !nativeVisible
-        capsule.isUserInteractionEnabled = nativeVisible
-        capsule.accessibilityElementsHidden = !nativeVisible
-        compactBar.selectedItem = compactBar.items?[min(2, max(0, selection))]
-        compactBar.items?.last?.badgeValue = badge
-        indicator.update(selection: selection, count: 3, dark: dark, enabled: nativeVisible, bottomInset: 0)
-
         let opaque = UIAccessibility.isReduceTransparencyEnabled
-        let key = "\(dark)|\(opaque)"
+        let state = ItemState(selection: min(2, max(0, selection)), badge: badge, dark: dark,
+                              visible: nativeVisible, opaque: opaque,
+                              reduceMotion: UIAccessibility.isReduceMotionEnabled, bounds: indicator.bounds)
+        if state != itemState {
+            if itemState?.visible != nativeVisible {
+                capsule.isHidden = !nativeVisible
+                capsule.isUserInteractionEnabled = nativeVisible
+                capsule.accessibilityElementsHidden = !nativeVisible
+            }
+            if itemState?.selection != state.selection { compactBar.selectedItem = compactBar.items?[state.selection] }
+            if itemState == nil || itemState?.badge != badge { compactBar.items?.last?.badgeValue = badge }
+            indicator.update(selection: state.selection, count: 3, dark: dark, enabled: nativeVisible, bottomInset: 0)
+            itemState = state
+        }
+        displayLink?.isPaused = CACurrentMediaTime() >= burstDeadline
+        let opacity = opaque ? 1 : GlassAppearance.normalized(glassOpacity)
+        let key = "\(dark)|\(opaque)|\(opacity)"
         guard key != appearanceKey else { return }
         appearanceKey = key
-        glass.effect = opaque ? nil : UIBlurEffect(style: dark ? .systemMaterialDark : .systemMaterialLight)
-        glass.contentView.backgroundColor = (dark ? UIColor(white: 0.12, alpha: 1) : UIColor(white: 0.98, alpha: 1)).withAlphaComponent(opaque ? 1 : 0.25)
+        glass.effect = opacity >= 1 ? nil : UIBlurEffect(style: dark ? .systemMaterialDark : .systemMaterialLight)
+        glass.contentView.backgroundColor = GlassAppearance.solidColor(dark: dark).withAlphaComponent(CGFloat(opacity))
         capsule.layer.borderWidth = 0.75
         capsule.layer.borderColor = (dark ? UIColor.white : UIColor.black).withAlphaComponent(0.12).cgColor
         let appearance = UITabBarAppearance()
@@ -172,13 +230,47 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         return nil
     }
 
+    private func belongsToRoot(_ controller: UIViewController, root: UIViewController) -> Bool {
+        var ancestor: UIViewController = controller
+        while let parent = ancestor.parent { ancestor = parent }
+        return ancestor === root
+    }
+
+    private func startBurst(duration: CFTimeInterval = 0.5) {
+        guard active else { return }
+        burstDeadline = max(burstDeadline, CACurrentMediaTime() + duration)
+        displayLink?.isPaused = false
+    }
+
+    private func nativeVisibilityChanged() {
+        startBurst()
+        refresh()
+    }
+
+    private func observeTransition(_ owner: UITabBarController) {
+        let navigation = owner.selectedViewController as? UINavigationController
+        let coordinator = navigation?.topViewController?.transitionCoordinator
+            ?? owner.selectedViewController?.transitionCoordinator ?? owner.transitionCoordinator
+        guard let coordinator = coordinator else { lastTransition = nil; return }
+        if lastTransition !== (coordinator as AnyObject) {
+            lastTransition = coordinator as AnyObject
+            startBurst(duration: max(0.5, coordinator.transitionDuration + 0.1))
+        }
+        // Interactive gestures can outlast the nominal transition duration.
+        if coordinator.isInteractive { startBurst() }
+    }
+
+    @MainActor
     private final class TickProxy: NSObject {
         weak var owner: GlassTabContainer?
         init(_ owner: GlassTabContainer) { self.owner = owner }
         @objc func tick() {
-            // The display link fires off the main actor; hop back explicitly
-            // instead of assuming an isolated call is valid.
-            Task { @MainActor [weak owner] in owner?.refresh() }
+            // Installed only on RunLoop.main; no asynchronous Task per frame.
+            owner?.refresh()
+        }
+        @objc func idle() {
+            guard let owner = owner, owner.active, owner.displayLink?.isPaused != false else { return }
+            owner.refresh()
         }
     }
 

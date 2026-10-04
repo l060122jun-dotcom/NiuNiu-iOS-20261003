@@ -7,6 +7,8 @@ struct SettingsView: View {
     @EnvironmentObject private var catalog: BrowseCatalog
     @ObservedObject private var account = AccountStore.shared
     @AppStorage("niuniu.incognito") private var incognito = false
+    @AppStorage(GlassAppearance.storageKey) private var glassOpacity = GlassAppearance.defaultOpacity
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var teenMode = APIClient.shared.isTeenModeEnabled
     @State private var serverConfig: [String: Any] = [:]
     @State private var configLoaded = false
@@ -29,6 +31,21 @@ struct SettingsView: View {
                     NavigationLink { SettingsNightView() } label: {
                         row("深色模式") { Image(systemName: "chevron.right").font(.system(size: 14)) }
                     }
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("液态玻璃不透明度").font(.system(size: 14, weight: .bold))
+                            Spacer()
+                            Text("\(Int((GlassAppearance.normalized(glassOpacity) * 100).rounded()))%")
+                                .font(.system(size: 15)).monospacedDigit().foregroundStyle(.secondary)
+                        }
+                        Slider(value: Binding(get: { GlassAppearance.normalized(glassOpacity) },
+                                              set: { glassOpacity = GlassAppearance.normalized($0) }),
+                               in: GlassAppearance.opacityRange, step: 0.01)
+                            .accessibilityLabel("液态玻璃不透明度")
+                            .accessibilityValue("\(Int((GlassAppearance.normalized(glassOpacity) * 100).rounded()))%")
+                        Text(reduceTransparency ? "系统已开启降低透明度，玻璃背景始终显示为实色；此设置将在关闭后生效。" : "15% 更通透，100% 为实色背景；即时应用并自动保存，不影响文字和图标。")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
+                    }.padding(.vertical, 12)
                     Toggle(isOn: Binding(get: { incognito }, set: { value in
                         incognito = value
                         teenMode = APIClient.shared.isTeenModeEnabled
@@ -51,7 +68,7 @@ struct SettingsView: View {
                         }
                     }
                     Button { Task { await checkVersion() } } label: {
-                        row("版本检测") { Text("v1.6.2") }
+                        row("版本检测") { Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知")") }
                     }
                     Button { contact() } label: {
                         row("联系我们") { Text(serverConfig.text("connect_us_content")).multilineTextAlignment(.trailing) }
@@ -86,6 +103,7 @@ struct SettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
         .task {
+            GlassAppearance.migrate()
             teenMode = APIClient.shared.isTeenModeEnabled
             await refreshCaches()
             await loadConfig()
