@@ -6,14 +6,9 @@ import SwiftUI
 struct FloatingBrowseHeader: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     func body(content: Content) -> some View {
-        content
-            .background {
-                if reduceTransparency { Rectangle().fill(BrowseTheme.surface) }
-                else { Rectangle().fill(.ultraThinMaterial) }
-            }
-            .overlay(alignment: .bottom) {
-                Rectangle().fill(Color.primary.opacity(0.07)).frame(height: 0.5)
-            }
+        // Each control supplies its own material. Leave the gaps transparent;
+        // never blur the header as a full-width rectangular block.
+        content.background(Color.clear)
     }
 }
 

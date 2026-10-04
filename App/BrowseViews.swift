@@ -345,13 +345,13 @@ private struct BrowseTopBar: View {
                 }
             }.buttonStyle(BrowsePressStyle()).accessibilityLabel("搜索影片、剧集")
             NavigationLink { DownloadsView().toolbar(.visible, for: .navigationBar) } label: {
-                Image(systemName: "arrow.down.to.line").font(.body.weight(.semibold)).frame(width: 44, height: 44)
+                Image(systemName: "arrow.down.to.line").font(.body.weight(.semibold)).frame(width: 44, height: 44).background(.ultraThinMaterial, in: Circle())
             }.accessibilityLabel("下载管理")
             NavigationLink { SavedLibraryView(kind: .history).toolbar(.visible, for: .navigationBar) } label: {
-                Image(systemName: "clock").font(.body.weight(.semibold)).frame(width: 44, height: 44)
+                Image(systemName: "clock").font(.body.weight(.semibold)).frame(width: 44, height: 44).background(.ultraThinMaterial, in: Circle())
             }.accessibilityLabel("观看历史")
             NavigationLink { MessagesView().toolbar(.visible, for: .navigationBar) } label: {
-                Image(systemName: "bell").font(.body.weight(.semibold)).frame(width: 44, height: 44)
+                Image(systemName: "bell").font(.body.weight(.semibold)).frame(width: 44, height: 44).background(.ultraThinMaterial, in: Circle())
             }.accessibilityLabel("消息通知")
         }
         .foregroundStyle(Color.primary)

@@ -25,14 +25,14 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
     /// Rasterize to a 24pt image before UIKit measures it. @2x = 48px, @3x = 72px;
     /// renderingMode/template and UIImage.scale survive tabItem bridging.
     static func icon(_ name: String) -> UIImage {
-        let size = CGSize(width: 24, height: 24)
+        let size = CGSize(width: 20, height: 20)
         let format = UIGraphicsImageRendererFormat.default()
         format.opaque = false
         let source = UIImage(named: name) ?? UIImage(systemName: "circle")!
         return UIGraphicsImageRenderer(size: size, format: format).image { _ in
             let ratio = min(size.width / max(1, source.size.width), size.height / max(1, source.size.height))
             let fitted = CGSize(width: source.size.width * ratio, height: source.size.height * ratio)
-            source.draw(in: CGRect(x: (24 - fitted.width) / 2, y: (24 - fitted.height) / 2, width: fitted.width, height: fitted.height))
+            source.draw(in: CGRect(x: (20 - fitted.width) / 2, y: (20 - fitted.height) / 2, width: fitted.width, height: fitted.height))
         }.withRenderingMode(.alwaysTemplate)
     }
 
@@ -40,7 +40,7 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         view = UIView()
         view.backgroundColor = .clear
         view.isUserInteractionEnabled = false
-        capsule.layer.cornerRadius = 32
+        capsule.layer.cornerRadius = 29
         capsule.clipsToBounds = true
         capsule.isHidden = true
         glass.isUserInteractionEnabled = false
@@ -110,13 +110,12 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
 
         let bounds = owner.view.bounds
         let safe = owner.view.safeAreaInsets
-        let side: CGFloat = bounds.width < 360 ? 16 : 22
-        let width = max(0, min(430, bounds.width - side * 2))
-        capsule.frame = CGRect(x: (bounds.width - width) / 2, y: bounds.maxY - safe.bottom - 10 - 64, width: width, height: 64)
+        let width = max(0, min(300, bounds.width - 88))
+        capsule.frame = CGRect(x: (bounds.width - width) / 2, y: bounds.maxY - safe.bottom - 10 - 58, width: width, height: 58)
         glass.frame = capsule.bounds
         // Bar and indicator share the same 50pt item coordinate space. The
         // existing indicator's 40pt capsule and two damped rebounds stay intact.
-        let itemFrame = CGRect(x: 0, y: 7, width: width, height: 50)
+        let itemFrame = CGRect(x: 4, y: 4, width: max(0, width - 8), height: 50)
         compactBar.frame = itemFrame
         indicator.frame = itemFrame
         let nativeFrame = native.layer.presentation()?.frame ?? native.frame
