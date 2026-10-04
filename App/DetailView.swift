@@ -197,7 +197,23 @@ import UIKit
                         playerMoreMenu
                     }
                     .padding(fullScreen ? insets : EdgeInsets())
-                if resolving && !locked { ProgressView("正在解析播放地址…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)) }
+                if errorText == nil && (resolving || (resolved != nil && playback.isBuffering)) {
+                    VStack(spacing: 10) {
+                        ProgressView().progressViewStyle(.circular).tint(.white)
+                            .scaleEffect(1.2)
+                        Text(resolving ? "正在加载…" : "正在缓冲…")
+                            .font(.system(size: 13, weight: .medium))
+                        Text(resolving ? "— MB/s" : playback.networkMegabytesPerSecond.map { String(format: "%.2f MB/s", $0) } ?? "— MB/s")
+                            .font(.system(size: 14, weight: .semibold)).monospacedDigit()
+                    }
+                    .foregroundStyle(.white)
+                    .padding(18)
+                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    .allowsHitTesting(false)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("niuniu.player.loading")
+                }
                 if let attemptStatus, !locked {
                     VStack { Spacer(); Text(attemptStatus).font(.caption).padding(8).background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 8)); Spacer().frame(height: 80) }
                         .allowsHitTesting(false)
@@ -484,17 +500,20 @@ import UIKit
 
     private func configureCallbacks() {
         playback.onTime = { seconds in
-            guard !suspended, !playback.isSeeking, resolved != nil, !resolving, seconds.isFinite, seconds >= 0 else { return }
+            guard !suspended, resolved != nil, !resolving, seconds.isFinite, seconds >= 0 else { return }
             let position = playback.position
             guard position.isFinite, position >= 0 else { return }
             time = position
             let rawDuration = playback.duration
             duration = rawDuration.isFinite ? max(0, rawDuration) : 0
+            playing = playback.isPlaying
+            // A native-completed seek may publish its real IJK clock before
+            // the first-frame acknowledgement. Update UI, not episode actions.
+            guard !playback.isSeeking else { return }
             if introPending, duration > 0 {
                 introPending = false
                 if duration > settings.intro + settings.outro + 1, time < settings.intro { seek(settings.intro); return }
             }
-            playing = playback.isPlaying
             danmaku.updatePlayback(episode: String(episodeIndex), time: time)
             if duration > settings.intro + settings.outro + 1, settings.outro > 0, time >= duration - settings.outro, !handledEnd { finishEpisode() }
         }

@@ -17,6 +17,10 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
     @Published var error: String?
     @Published private(set) var isReady = false
     @Published private(set) var isSeeking = false
+    @Published private(set) var isBuffering = false
+    /// Actual IJK byte-counter delta / monotonic seconds / 1,000,000.
+    /// nil until a complete sampling interval (or during URL resolution).
+    @Published private(set) var networkMegabytesPerSecond: Double?
     @Published private(set) var stage = "idle"
     @Published private(set) var videoToolboxEnabled = true
     @Published private(set) var capabilityMessage: String?
@@ -57,10 +61,19 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
     private var nativeSeekTarget: Double?
     private var seekVideoSerial: Int32?
     private var seekFrameAcknowledged = false
+    private var seekGeneration: UInt64 = 0
+    /// UI clock authority is independent of renderer/PiP seek completion. IJK
+    /// returns the requested target while native seek is pending, not its clock.
+    var hasAuthoritativeSeekClock: Bool {
+        isReady && isSeeking && pendingSeek == nil && nativeSeekTarget == nil &&
+            seekCompleted && seekTarget != nil && seekVideoSerial != nil
+    }
     private var wantsToPlay = true
     private var didFinish = false
     private var fill = false
     private var lastProgressTime = -Double.infinity
+    private var trafficSample: (bytes: Int64, uptime: TimeInterval)?
+    private var hasStartedOutput = false
 
     override init() {
         super.init()
@@ -83,6 +96,10 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         duration = 0
         isReady = false
         isPlaying = false
+        isBuffering = true
+        networkMegabytesPerSecond = nil
+        trafficSample = nil
+        hasStartedOutput = false
         didFinish = false
         wantsToPlay = true
         stage = "configure"
@@ -183,6 +200,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
 
     func seek(_ seconds: Double) {
         guard seconds.isFinite, let core else { return }
+        seekGeneration &+= 1
         // Pinned ffp_seek_to_l at >=duration emits COMPLETED without executing
         // a seek or issuing SEEK_COMPLETE. Never submit that special EOF path.
         let target = duration > 0 ? min(max(0, seconds), max(0, duration - 0.001)) : max(0, seconds)
@@ -272,6 +290,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
             .IJKMPMoviePlayerFindStreamInfo,
             .IJKMPMoviePlayerComponentOpen,
             .IJKMPMoviePlayerFirstVideoFrameRendered,
+            .IJKMPMoviePlayerFirstAudioFrameRendered,
             .IJKMPMoviePlayerDidSeekComplete
         ]
         for name in names {
@@ -308,8 +327,11 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         case .IJKMPMoviePlayerComponentOpen:
             stage = "open-codec"
         case .IJKMPMoviePlayerFirstVideoFrameRendered:
+            hasStartedOutput = true
             hasRenderedFrame = true
             stage = "render"
+        case .IJKMPMoviePlayerFirstAudioFrameRendered:
+            hasStartedOutput = true
         case .IJKMPMoviePlayerDidSeekComplete:
             guard isSeeking, let target = seekTarget, let submitted = nativeSeekTarget else { return }
             // One native request is in flight. Upstream arg1 is absolute stream
@@ -403,23 +425,36 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
 
     private func refresh(_ candidate: IJKFFMoviePlayerController) {
         guard core === candidate else { return }
+        refreshTransferState(candidate)
         let nextDuration = Self.validTime(candidate.duration)
         if duration != nextDuration { duration = nextDuration }
         let nextPlaying = !didFinish && candidate.isPlaying()
         if isPlaying != nextPlaying { isPlaying = nextPlaying }
+        guard core === candidate else { return }
+        let generation = seekGeneration
+        // Do not publish IJK's pending seek_msec or A's clock while a coalesced
+        // B is awaiting submission/completion. Final native completion, however,
+        // permits UI time even if the renderer's exact-serial ack is delayed.
+        if isSeeking && !hasAuthoritativeSeekClock { return }
         let seconds = candidate.currentPlaybackTime
         guard seconds.isFinite, seconds >= 0 else { return }
         if isSeeking {
-            guard isReady, seekCompleted, seekFrameAcknowledged else { return }
-            seekTarget = nil
-            isSeeking = false
+            if seekFrameAcknowledged {
+                seekTarget = nil
+                isSeeking = false
+            }
         }
+        guard core === candidate, seekGeneration == generation else { return }
         position = seconds
+        // Published values and user callbacks can synchronously start a new
+        // seek/load. Never continue an old refresh into that request's clock.
+        guard core === candidate, seekGeneration == generation else { return }
         renderer?.updateClock(seconds, rate: isPlaying && !isSeeking ? Double(rate) : 0)
         pip?.invalidatePlaybackState()
         if !isSeeking { completeSkip() }
+        guard core === candidate, seekGeneration == generation else { return }
         onTime?(seconds)
-        guard core === candidate, !isSeeking else { return }
+        guard core === candidate, seekGeneration == generation, !isSeeking else { return }
         if isReady && abs(seconds - lastProgressTime) >= 5 {
             lastProgressTime = seconds
             onProgress?(seconds)
@@ -427,6 +462,11 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
     }
 
     private func releaseCore() {
+        seekGeneration &+= 1
+        trafficSample = nil
+        networkMegabytesPerSecond = nil
+        isBuffering = false
+        hasStartedOutput = false
         let releasedURL = loadedURL
         loadedURL = nil
         videoDisplayAspect = nil
@@ -457,6 +497,32 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         if let releasedURL { Self.releasePlaybackResource?(releasedURL) }
     }
 
+    private func refreshTransferState(_ candidate: IJKFFMoviePlayerController) {
+        // Stalled is bit 2 in the pinned public IJKMPMovieLoadState enum.
+        // Frame acknowledgement is intentionally NOT a buffering signal: the
+        // video may already be advancing while its seek acknowledgement lags.
+        let stalled = candidate.loadState.rawValue & (1 << 2) != 0
+        let nativeSeekPending = isSeeking && !hasAuthoritativeSeekClock
+        let buffering = !didFinish && error == nil &&
+            (!isReady || (wantsToPlay && (!hasStartedOutput || stalled)) ||
+             nativeSeekPending || candidate.isSeekBuffering != 0)
+        if isBuffering != buffering { isBuffering = buffering }
+        let bytes = candidate.trafficStatistic()
+        let uptime = ProcessInfo.processInfo.systemUptime
+        guard bytes >= 0 else { trafficSample = nil; networkMegabytesPerSecond = nil; return }
+        guard let previous = trafficSample, bytes >= previous.bytes else {
+            trafficSample = (bytes, uptime)
+            networkMegabytesPerSecond = nil
+            return
+        }
+        let interval = uptime - previous.uptime
+        guard interval >= 0.5 else { return }
+        let speed = Double(bytes - previous.bytes) / interval / 1_000_000
+        trafficSample = (bytes, uptime)
+        let rounded = (speed * 100).rounded() / 100
+        if networkMegabytesPerSecond != rounded { networkMegabytesPerSecond = rounded }
+    }
+
     private func completeSkip() {
         skipTimeout?.cancel(); skipTimeout = nil
         let completion = skipCompletion; skipCompletion = nil
@@ -481,6 +547,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         skipTimeout = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 10_000_000_000)
             guard !Task.isCancelled else { return }
+            // Release the system command without marking the renderer seek
+            // acknowledged; never leave an AVKit completion waiting forever.
             self?.completeSkip()
         }
     }

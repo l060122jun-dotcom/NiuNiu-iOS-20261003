@@ -113,9 +113,10 @@ import MediaPlayer
         }
         .foregroundStyle(.white).buttonStyle(.plain)
         .onAppear { interaction.show() }
-        .onDisappear { resetMenu(); interaction.cancel() }
+        .onDisappear { cancelScrubbing(); resetMenu(); interaction.cancel() }
         .onChange(of: sessionID) { _ in resetMenu(); scrubbing = false; scrubTime = 0; interaction.cancel() }
-        .onChange(of: locked) { value in if value { resetMenu(); interaction.setMenuOpen(false) } }
+        .onChange(of: locked) { value in if value { cancelScrubbing(); resetMenu(); interaction.setMenuOpen(false) } }
+        .onChange(of: fullScreen) { _ in cancelScrubbing() }
         .onChange(of: interaction.menuOpen) { open in if !open { resetMenu() } }
         .onChange(of: duration) { _ in scrubTime = safePosition(scrubTime) }
     }
@@ -266,6 +267,14 @@ import MediaPlayer
         Button { closeMenu(); interaction.show(); action() } label: {
             Image(systemName: symbol).font(.system(size: 17)).frame(width: 40, height: 40)
         }.accessibilityLabel(title)
+    }
+    private func cancelScrubbing() {
+        // View replacement/locking can cancel a native slider interaction
+        // without delivering onEditingChanged(false). Never retain its preview.
+        guard scrubbing else { return }
+        scrubbing = false
+        scrubTime = safePosition(time)
+        interaction.end()
     }
     static func format(_ value: Double) -> String {
         let seconds = value.isFinite ? Int(min(86_400_000, max(0, value))) : 0
