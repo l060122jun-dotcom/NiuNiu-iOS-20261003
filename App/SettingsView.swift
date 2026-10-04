@@ -223,7 +223,8 @@ struct SettingsView: View {
     }
 
     private func refreshCaches() async {
-        cacheBytes = Int64(URLCache.shared.currentDiskUsage + URLCache.shared.currentMemoryUsage)
+        let posterBytes = await PosterImagePipeline.shared.httpCacheUsage()
+        cacheBytes = Int64(URLCache.shared.currentDiskUsage + URLCache.shared.currentMemoryUsage) + posterBytes
         for source in sources {
             do {
                 sourceStatus[source.0] = try SpecialSourceResolver.shared.cacheStatus(source: source.0)
@@ -239,7 +240,8 @@ struct SettingsView: View {
         // Only remove the cache actually owned by this client, never downloads/history.
         URLCache.shared.removeAllCachedResponses()
         await PosterImagePipeline.shared.clearCache()
-        cacheBytes = Int64(URLCache.shared.currentDiskUsage + URLCache.shared.currentMemoryUsage)
+        let posterBytes = await PosterImagePipeline.shared.httpCacheUsage()
+        cacheBytes = Int64(URLCache.shared.currentDiskUsage + URLCache.shared.currentMemoryUsage) + posterBytes
         notice = "图片与请求缓存已清除。iOS 系统播放缓存由 AVPlayer 管理。"
     }
 

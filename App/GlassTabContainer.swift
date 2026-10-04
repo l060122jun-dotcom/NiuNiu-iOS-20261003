@@ -1,10 +1,13 @@
 import SwiftUI
 import UIKit
 
-/// An owned public UITabBar, not a painted capsule over a full-width touch surface.
+/// One owned capsule of plain controls; no second UITabBar or UIKit tab chrome.
 /// The native TabView remains the navigation and toolbar visibility authority.
 @MainActor
-final class GlassTabContainer: UIViewController, UITabBarDelegate {
+final class GlassTabContainer: UIViewController {
+    // Weak on both sides: the registry coordinates ownership, never extends it.
+    private static let owners = NSMapTable<UITabBarController, GlassTabContainer>.weakToWeakObjects()
+    private static let capsuleID = "liuyun.mainTab.capsule"
     var dark = false
     var glassConfiguration = GlassConfiguration()
     var selection = 0
@@ -15,7 +18,8 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
     private let glass = UIHostingController(rootView: GlassTabSurface(configuration: GlassConfiguration(), dark: false))
     private var appliedGlassConfiguration: GlassConfiguration?
     private let indicator = LiquidTabIndicatorView()
-    private let compactBar = CompactTabBar()
+    private let items = UIStackView()
+    private var controls: [TabControl] = []
     private let emptyMask = CALayer()
     private weak var nativeController: UITabBarController?
     private weak var cachedRoot: UIViewController?
@@ -63,20 +67,28 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         view.backgroundColor = .clear
         view.isUserInteractionEnabled = false
         capsule.layer.cornerRadius = 35
+        capsule.accessibilityIdentifier = Self.capsuleID
         capsule.clipsToBounds = true
         capsule.isHidden = true
         glass.view.backgroundColor = .clear
         glass.view.isUserInteractionEnabled = false
         glass.view.accessibilityElementsHidden = true
         indicator.isUserInteractionEnabled = false
-        // Explicit sibling ordering: glass -> selection -> native item controls.
+        // Explicit sibling ordering: glass -> selection -> plain item controls.
         // The hosting view is mounted only after addChild, in refreshNow().
         capsule.addSubview(indicator)
-        capsule.addSubview(compactBar)
-        compactBar.delegate = self
-        compactBar.itemPositioning = .fill
-        compactBar.items = zip(["首页", "榜单", "我"], ["MainTabHome", "MainTabRank", "MainTabMe"])
-            .enumerated().map { index, pair in UITabBarItem(title: pair.0, image: Self.icon(pair.1), tag: index) }
+        capsule.addSubview(items)
+        items.axis = .horizontal
+        items.distribution = .fillEqually
+        controls = zip(["首页", "榜单", "我"], ["MainTabHome", "MainTabRank", "MainTabMe"])
+            .enumerated().map { index, pair in
+                let control = TabControl(title: pair.0, image: Self.icon(pair.1))
+                control.tag = index
+                control.accessibilityIdentifier = "liuyun.mainTab.item.\(index)"
+                control.addTarget(self, action: #selector(selectTab(_:)), for: .touchUpInside)
+                items.addArrangedSubview(control)
+                return control
+            }
         for name in [UIAccessibility.reduceMotionStatusDidChangeNotification,
                      UIAccessibility.reduceTransparencyStatusDidChangeNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.refresh() })
@@ -152,10 +164,16 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         capsule.removeFromSuperview()
         capsule.isHidden = true
         capsule.isUserInteractionEnabled = false
-        if let bar = nativeController?.tabBar, bar.layer.mask === emptyMask {
-            bar.layer.mask = originalMask
-            bar.isUserInteractionEnabled = originalInteraction
-            bar.accessibilityElementsHidden = originalAccessibilityHidden
+        // Only the registered owner may restore routing state. An old bridge's
+        // delayed teardown must never restore a mask over its replacement.
+        if let owner = nativeController, Self.owners.object(forKey: owner) === self {
+            Self.owners.removeObject(forKey: owner)
+            let bar = owner.tabBar
+            if bar.layer.mask === emptyMask {
+                bar.layer.mask = originalMask
+                bar.isUserInteractionEnabled = originalInteraction
+                bar.accessibilityElementsHidden = originalAccessibilityHidden
+            }
         }
         nativeController = nil
         cachedRoot = nil
@@ -214,7 +232,13 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         let native = owner.tabBar
         if nativeController !== owner {
             unmount()
+            // Synchronous handoff: remove the former host/capsule and restore its
+            // original mask BEFORE capturing state for this owner. No mask chain.
+            if let previous = Self.owners.object(forKey: owner), previous !== self {
+                previous.dismantle()
+            }
             nativeController = owner
+            Self.owners.setObject(self, forKey: owner)
             cachedRoot = root
             layoutFrame = nil
             itemState = nil
@@ -252,6 +276,12 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
             layoutFrame = nil
             itemState = nil
         }
+        assert(Self.owners.object(forKey: owner) === self)
+        assert(owner.view.subviews.filter { $0.accessibilityIdentifier == Self.capsuleID }.count == 1,
+               "A tab controller must mount exactly one custom capsule")
+        assert(glass.parent === owner && glass.view.superview === capsule)
+        assert(capsule.subviews.count == 3 && items.arrangedSubviews.count == 3,
+               "Exactly one glass host, one liquid indicator and three plain controls")
 
         let bounds = owner.view.bounds
         let safe = owner.view.safeAreaInsets
@@ -263,7 +293,7 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
             glass.view.frame = capsule.bounds
             // The complete icon/title stack and selection share 58pt coordinates.
             let itemFrame = CGRect(x: 6, y: 6, width: max(0, width - 12), height: 58)
-            compactBar.frame = itemFrame
+            items.frame = itemFrame
             indicator.frame = itemFrame
         }
         observeTransition(owner)
@@ -281,8 +311,9 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
                 capsule.isUserInteractionEnabled = nativeVisible
                 capsule.accessibilityElementsHidden = !nativeVisible
             }
-            if itemState?.selection != state.selection { compactBar.selectedItem = compactBar.items?[state.selection] }
-            if itemState == nil || itemState?.badge != badge { compactBar.items?.last?.badgeValue = badge }
+            for (index, control) in controls.enumerated() {
+                control.update(selected: index == state.selection, dark: dark, badge: index == 2 ? badge : nil)
+            }
             indicator.update(selection: state.selection, count: 3, dark: dark, enabled: nativeVisible, bottomInset: 0)
             itemState = state
         }
@@ -295,30 +326,11 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         glass.rootView = GlassTabSurface(configuration: glassConfiguration, dark: dark)
         capsule.layer.borderWidth = 0.75
         capsule.layer.borderColor = (dark ? UIColor.white : UIColor.black).withAlphaComponent(0.12).cgColor
-        let appearance = UITabBarAppearance()
-        appearance.configureWithTransparentBackground()
-        appearance.backgroundEffect = nil
-        appearance.backgroundColor = .clear
-        appearance.shadowColor = .clear
-        let active = dark ? UIColor(red: 151 / 255, green: 211 / 255, blue: 39 / 255, alpha: 1) : UIColor(red: 0.23, green: 0.38, blue: 0.04, alpha: 1)
-        let inactive = UIColor(white: dark ? 0.75 : 0.38, alpha: 1)
-        for item in [appearance.stackedLayoutAppearance, appearance.inlineLayoutAppearance, appearance.compactInlineLayoutAppearance] {
-            item.normal.iconColor = inactive
-            item.selected.iconColor = active
-            item.normal.titleTextAttributes = [.font: UIFont.systemFont(ofSize: 10), .foregroundColor: inactive]
-            item.selected.titleTextAttributes = [.font: UIFont.systemFont(ofSize: 10), .foregroundColor: active]
-            item.normal.badgeBackgroundColor = .systemRed
-            item.selected.badgeBackgroundColor = .systemRed
-        }
-        compactBar.standardAppearance = appearance
-        compactBar.scrollEdgeAppearance = appearance
-        compactBar.tintColor = active
-        compactBar.unselectedItemTintColor = inactive
     }
 
-    func tabBar(_ tabBar: UITabBar, didSelect item: UITabBarItem) {
-        selection = item.tag
-        onSelect?(item.tag)
+    @objc private func selectTab(_ control: TabControl) {
+        selection = control.tag
+        onSelect?(control.tag)
         refresh()
     }
 
@@ -374,15 +386,70 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         }
     }
 
-    /// Detached from the system bottom edge: these are item coordinates, not
-    /// a home-indicator safe-area extension. No KVC or private UIKit override.
-    private final class CompactTabBar: UITabBar {
-        override var safeAreaInsets: UIEdgeInsets { .zero }
+    /// UIControl has no automatic iOS 26 glass/selection background. All visuals
+    /// here are only the 20pt icon, 10pt title and optional unread badge.
+    private final class TabControl: UIControl {
+        private let icon = UIImageView()
+        private let title = UILabel()
+        private let badgeLabel = UILabel()
+
+        init(title text: String, image: UIImage) {
+            super.init(frame: .zero)
+            backgroundColor = .clear
+            icon.image = image
+            icon.contentMode = .scaleAspectFit
+            title.text = text
+            title.font = .systemFont(ofSize: 10)
+            title.textAlignment = .center
+            badgeLabel.font = .systemFont(ofSize: 9, weight: .semibold)
+            badgeLabel.textAlignment = .center
+            badgeLabel.textColor = .white
+            badgeLabel.backgroundColor = .systemRed
+            badgeLabel.layer.cornerRadius = 8
+            badgeLabel.clipsToBounds = true
+            badgeLabel.isHidden = true
+            let children: [UIView] = [icon, title, badgeLabel]
+            for child in children {
+                child.isUserInteractionEnabled = false
+                child.isAccessibilityElement = false
+                addSubview(child)
+            }
+            isAccessibilityElement = true
+            accessibilityLabel = text
+            accessibilityTraits = .button
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            let center = bounds.midX
+            let top = (bounds.height - 36) / 2
+            icon.frame = CGRect(x: center - 10, y: top, width: 20, height: 20)
+            title.frame = CGRect(x: 2, y: top + 23, width: max(0, bounds.width - 4), height: 13)
+            let badgeWidth = max(16, min(34, badgeLabel.intrinsicContentSize.width + 8))
+            badgeLabel.frame = CGRect(x: min(center + 6, bounds.width - badgeWidth - 2),
+                                      y: max(1, top - 5), width: badgeWidth, height: 16)
+        }
+
+        func update(selected: Bool, dark: Bool, badge: String?) {
+            isSelected = selected
+            let active = dark ? UIColor(red: 151 / 255, green: 211 / 255, blue: 39 / 255, alpha: 1)
+                : UIColor(red: 0.23, green: 0.38, blue: 0.04, alpha: 1)
+            let color = selected ? active : UIColor(white: dark ? 0.75 : 0.38, alpha: 1)
+            icon.tintColor = color
+            title.textColor = color
+            badgeLabel.text = badge
+            badgeLabel.isHidden = badge == nil || badge?.isEmpty == true
+            accessibilityTraits = selected ? [.button, .selected] : .button
+            accessibilityValue = badgeLabel.isHidden ? nil : "\(badge ?? "") 条未读"
+            setNeedsLayout()
+        }
     }
 }
 
 /// Explicit UIKit -> SwiftUI bridge. Only the capsule's decorative background is
-/// hosted; UITabBar controls, indicator, navigation and polling stay UIKit-owned.
+/// hosted; plain controls, indicator, navigation and polling stay UIKit-owned.
 private struct GlassTabSurface: View {
     let configuration: GlassConfiguration
     let dark: Bool

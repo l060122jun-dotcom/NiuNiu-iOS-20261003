@@ -394,7 +394,7 @@ struct MainTabView: View {
     }
 }
 
-/// Keep SwiftUI's native navigation/visibility router; the compact bar owns its UI.
+/// Keep SwiftUI's native navigation/visibility router; one plain-control capsule owns its UI.
 @MainActor
 private struct MainTabAppearance: UIViewControllerRepresentable {
     @Environment(\.liuyunGlassConfiguration) private var glassConfiguration
@@ -583,6 +583,11 @@ private struct PosterPrefetchKey: PreferenceKey {
     static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
 }
 
+private struct PosterVisibleKey: PreferenceKey {
+    static var defaultValue = false
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
+}
+
 @MainActor
 private struct PosterView: View {
     let url: String
@@ -594,13 +599,14 @@ private struct PosterView: View {
     @ObservedObject private var cacheState = PosterCacheState.shared
     @State private var appeared = false
     @State private var prefetched = false
+    @State private var visible = false
     @State private var image: UIImage?
     @State private var loadedURL: String?
     @State private var loadedRevision: UInt64?
     var body: some View {
         GeometryReader { geometry in
             let extent = max(geometry.size.width, geometry.size.height) * displayScale
-            let pixels = extent.isFinite ? Int(min(2048, max(1, ceil(extent)))) : 1
+            let pixels = PosterImagePipeline.pixelBucket(extent.isFinite ? Int(min(2048, max(1, ceil(extent)))) : 1)
             // Lists do not supply the BrowseScroll coordinate environment. Their
             // row lifecycle is the fallback gate; do not permanently require height > 0.
             let eligible = appeared && tracking && contentActive && (viewportHeight <= 0 || prefetched)
@@ -623,11 +629,19 @@ private struct PosterView: View {
                     let frame = measurement.frame(in: .named(coordinateSpace))
                     Color.clear.preference(key: PosterPrefetchKey.self,
                         value: frame.width > 0 && frame.maxY > -viewportHeight && frame.minY < viewportHeight * 2)
+                        .preference(key: PosterVisibleKey.self,
+                            value: frame.width > 0 && frame.maxY > 0 && frame.minY < viewportHeight)
                 }
             }
             .onPreferenceChange(PosterPrefetchKey.self) { value in
                 prefetched = value
                 if viewportHeight > 0 && !value { image = nil; loadedURL = nil }
+            }
+            .onPreferenceChange(PosterVisibleKey.self) { value in
+                visible = value
+                if value, eligible, let source = URL(string: url) {
+                    Task { await PosterImagePipeline.shared.promote(url: source, pixels: pixels) }
+                }
             }
             .task(id: "\(url)|\(pixels)|\(eligible)|\(cacheState.revision)") {
                 let revision = cacheState.revision
@@ -635,14 +649,15 @@ private struct PosterView: View {
                 guard eligible else { image = nil; loadedURL = nil; return }
                 guard let source = URL(string: url), ["http", "https"].contains(source.scheme?.lowercased() ?? "") else { return }
                 guard loadedURL != url || image == nil else { return }
-                let result = await PosterImagePipeline.shared.image(url: source, pixels: pixels)
+                let result = await PosterImagePipeline.shared.image(url: source, pixels: pixels,
+                                                                    visible: viewportHeight <= 0 || visible)
                 guard !Task.isCancelled, revision == cacheState.revision else { return }
                 image = result
                 loadedURL = url
                 loadedRevision = revision
             }
             .onAppear { appeared = true }
-            .onDisappear { appeared = false; image = nil; loadedURL = nil; prefetched = false }
+            .onDisappear { appeared = false; image = nil; loadedURL = nil; prefetched = false; visible = false }
         }
         .aspectRatio(0.7, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
