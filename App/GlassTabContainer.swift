@@ -1,55 +1,20 @@
 import SwiftUI
 import UIKit
 
-/// One owned capsule of plain controls; no second UITabBar or UIKit tab chrome.
-/// The native TabView remains the navigation and toolbar visibility authority.
+/// Plain controls only. SwiftUI owns the glass background, layout and navigation
+/// lifetime. Never attach a host or overlay to a native tab controller.
 @MainActor
 final class GlassTabContainer: UIViewController {
-    // Weak on both sides: the registry coordinates ownership, never extends it.
-    private static let owners = NSMapTable<UITabBarController, GlassTabContainer>.weakToWeakObjects()
-    private static let capsuleID = "liuyun.mainTab.capsule"
     var dark = false
-    var glassConfiguration = GlassConfiguration()
     var selection = 0
     var badge: String?
-    var active = true { didSet { if oldValue != active { refresh() } } }
+    var active = true
     var onSelect: ((Int) -> Void)?
-    private let capsule = UIView()
-    private let glass = UIHostingController(rootView: GlassTabSurface(configuration: GlassConfiguration(), dark: false))
-    private var appliedGlassConfiguration: GlassConfiguration?
     private let indicator = LiquidTabIndicatorView()
     private let items = UIStackView()
     private var controls: [TabControl] = []
-    private let emptyMask = CALayer()
-    private weak var nativeController: UITabBarController?
-    private weak var cachedRoot: UIViewController?
-    private var originalInteraction = true
-    private var originalAccessibilityHidden = false
-    private var originalMask: CALayer?
-    private var refreshPending = false
-    private var refreshing = false
-    private var invalidated = false
-    private var displayLink: CADisplayLink?
-    private var idleTimer: Timer?
-    private var visibilityObservers: [NSKeyValueObservation] = []
-    private var burstDeadline: CFTimeInterval = 0
-    private weak var lastTransition: AnyObject?
-    private var layoutFrame: CGRect?
-    private var itemState: ItemState?
-    private struct ItemState: Equatable {
-        let selection: Int
-        let badge: String?
-        let dark: Bool
-        let visible: Bool
-        let opaque: Bool
-        let reduceMotion: Bool
-        let bounds: CGRect
-    }
-    private var appearanceKey = ""
     private var observers: [NSObjectProtocol] = []
 
-    /// Rasterize to a 20pt image before UIKit measures it. @2x = 40px, @3x = 60px;
-    /// renderingMode/template and UIImage.scale survive tabItem bridging.
     static func icon(_ name: String) -> UIImage {
         let size = CGSize(width: 20, height: 20)
         let format = UIGraphicsImageRendererFormat.default()
@@ -65,19 +30,9 @@ final class GlassTabContainer: UIViewController {
     override func loadView() {
         view = UIView()
         view.backgroundColor = .clear
-        view.isUserInteractionEnabled = false
-        capsule.layer.cornerRadius = 35
-        capsule.accessibilityIdentifier = Self.capsuleID
-        capsule.clipsToBounds = true
-        capsule.isHidden = true
-        glass.view.backgroundColor = .clear
-        glass.view.isUserInteractionEnabled = false
-        glass.view.accessibilityElementsHidden = true
-        indicator.isUserInteractionEnabled = false
-        // Explicit sibling ordering: glass -> selection -> plain item controls.
-        // The hosting view is mounted only after addChild, in refreshNow().
-        capsule.addSubview(indicator)
-        capsule.addSubview(items)
+        view.accessibilityIdentifier = "liuyun.mainTab.controls"
+        view.addSubview(indicator)
+        view.addSubview(items)
         items.axis = .horizontal
         items.distribution = .fillEqually
         controls = zip(["首页", "榜单", "我"], ["MainTabHome", "MainTabRank", "MainTabMe"])
@@ -91,241 +46,35 @@ final class GlassTabContainer: UIViewController {
             }
         for name in [UIAccessibility.reduceMotionStatusDidChangeNotification,
                      UIAccessibility.reduceTransparencyStatusDidChangeNotification] {
-            observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.refresh() })
-        }
-        let link = CADisplayLink(target: TickProxy(self), selector: #selector(TickProxy.tick))
-        link.preferredFramesPerSecond = 30
-        link.isPaused = true
-        link.add(to: .main, forMode: .common)
-        displayLink = link
-        // Public visibility KVO and layout callbacks are the primary signals.
-        // A 3Hz fallback catches presentation-only changes without per-tick Tasks.
-        idleTimer = Timer.scheduledTimer(timeInterval: 1.0 / 3.0, target: TickProxy(self),
-                                        selector: #selector(TickProxy.idle), userInfo: nil, repeats: true)
-        if let idleTimer = idleTimer { RunLoop.main.add(idleTimer, forMode: .common) }
-    }
-
-    deinit {
-        displayLink?.invalidate()
-        idleTimer?.invalidate()
-        observers.forEach { NotificationCenter.default.removeObserver($0) }
-        // The normal path is dismantle() on MainActor. Keep a fallback that
-        // does not call UIKit from a potentially nonisolated deinitializer.
-        let host = glass
-        let overlay = capsule
-        let owner = nativeController
-        let mask = emptyMask
-        let savedMask = originalMask
-        let interaction = originalInteraction
-        let accessibilityHidden = originalAccessibilityHidden
-        DispatchQueue.main.async {
-            if host.parent != nil { host.willMove(toParent: nil) }
-            host.viewIfLoaded?.removeFromSuperview()
-            if host.parent != nil { host.removeFromParent() }
-            overlay.removeFromSuperview()
-            if let bar = owner?.tabBar, bar.layer.mask === mask {
-                bar.layer.mask = savedMask
-                bar.isUserInteractionEnabled = interaction
-                bar.accessibilityElementsHidden = accessibilityHidden
-            }
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.refresh()
+            })
         }
     }
 
-    override func willMove(toParent parent: UIViewController?) {
-        if parent == nil { unmount() }
-        super.willMove(toParent: parent)
-    }
+    deinit { observers.forEach { NotificationCenter.default.removeObserver($0) } }
 
-    override func didMove(toParent parent: UIViewController?) {
-        super.didMove(toParent: parent)
-        if parent != nil { refresh() }
-    }
-
-    /// SwiftUI owns this bridge, but UIKit owns the mounted decorative child.
-    /// Explicit teardown is required before the bridge itself is released.
-    func dismantle() {
-        guard !invalidated else { return }
-        invalidated = true
-        onSelect = nil
-        displayLink?.invalidate()
-        displayLink = nil
-        idleTimer?.invalidate()
-        idleTimer = nil
-        observers.forEach { NotificationCenter.default.removeObserver($0) }
-        observers.removeAll()
-        unmount()
-    }
-
-    private func unmount() {
-        visibilityObservers.removeAll()
-        if glass.parent != nil { glass.willMove(toParent: nil) }
-        glass.viewIfLoaded?.removeFromSuperview()
-        if glass.parent != nil { glass.removeFromParent() }
-        capsule.removeFromSuperview()
-        capsule.isHidden = true
-        capsule.isUserInteractionEnabled = false
-        // Only the registered owner may restore routing state. An old bridge's
-        // delayed teardown must never restore a mask over its replacement.
-        if let owner = nativeController, Self.owners.object(forKey: owner) === self {
-            Self.owners.removeObject(forKey: owner)
-            let bar = owner.tabBar
-            if bar.layer.mask === emptyMask {
-                bar.layer.mask = originalMask
-                bar.isUserInteractionEnabled = originalInteraction
-                bar.accessibilityElementsHidden = originalAccessibilityHidden
-            }
-        }
-        nativeController = nil
-        cachedRoot = nil
-        originalMask = nil
-        layoutFrame = nil
-        itemState = nil
-        lastTransition = nil
-        displayLink?.isPaused = true
-    }
-
-    override func viewDidLayoutSubviews() { super.viewDidLayoutSubviews(); startBurst(); refresh() }
-    override func viewDidAppear(_ animated: Bool) { super.viewDidAppear(animated); startBurst(); refresh() }
-    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
-        super.traitCollectionDidChange(previousTraitCollection)
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let frame = view.bounds.insetBy(dx: 6, dy: 6)
+        items.frame = frame
+        indicator.frame = frame
         refresh()
     }
 
     func refresh() {
-        // MainActor alone does not prevent SwiftUI update-transaction reentry.
-        // Coalesce all signals and mutate containment/rootView on the next turn.
-        guard !invalidated, !refreshPending else { return }
-        refreshPending = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.refreshPending = false
-            self.refreshNow()
+        guard isViewLoaded else { return }
+        view.isUserInteractionEnabled = active
+        for (index, control) in controls.enumerated() {
+            control.update(selected: index == selection, dark: dark, badge: index == 2 ? badge : nil)
         }
+        indicator.update(selection: selection, count: 3, dark: dark, enabled: true, bottomInset: 0)
     }
 
-    private func refreshNow() {
-        guard !invalidated, isViewLoaded else { return }
-        guard !refreshing else { refresh(); return }
-        refreshing = true
-        defer { refreshing = false }
-        guard parent != nil, viewIfLoaded?.window != nil else { unmount(); return }
-        guard active else {
-            capsule.isHidden = true
-            capsule.isUserInteractionEnabled = false
-            itemState = nil
-            displayLink?.isPaused = true
-            return
-        }
-        var root: UIViewController = self
-        while let parent = root.parent { root = parent }
-        let owner: UITabBarController?
-        if let cached = nativeController, cachedRoot === root, cached.viewIfLoaded?.window != nil,
-           belongsToRoot(cached, root: root) {
-            owner = cached
-        } else {
-            owner = findTabController(root)
-        }
-        guard let owner = owner, owner.viewIfLoaded?.window != nil else {
-            unmount()
-            return
-        }
-        let native = owner.tabBar
-        if nativeController !== owner {
-            unmount()
-            // Synchronous handoff: remove the former host/capsule and restore its
-            // original mask BEFORE capturing state for this owner. No mask chain.
-            if let previous = Self.owners.object(forKey: owner), previous !== self {
-                previous.dismantle()
-            }
-            nativeController = owner
-            Self.owners.setObject(self, forKey: owner)
-            cachedRoot = root
-            layoutFrame = nil
-            itemState = nil
-            originalInteraction = native.isUserInteractionEnabled
-            originalAccessibilityHidden = native.accessibilityElementsHidden
-            originalMask = native.layer.mask
-            visibilityObservers = [
-                native.observe(\.isHidden, options: [.new]) { [weak self] _, _ in
-                    DispatchQueue.main.async { self?.nativeVisibilityChanged() }
-                },
-                native.observe(\.alpha, options: [.new]) { [weak self] _, _ in
-                    DispatchQueue.main.async { self?.nativeVisibilityChanged() }
-                }
-            ]
-        }
-        cachedRoot = root
-        // Empty public layer mask suppresses *all* native pixels, including its
-        // full-width background, without changing isHidden/alpha visibility routing.
-        if native.layer.mask !== emptyMask { native.layer.mask = emptyMask }
-        if native.isUserInteractionEnabled { native.isUserInteractionEnabled = false }
-        if !native.accessibilityElementsHidden { native.accessibilityElementsHidden = true }
-        // The hosting controller must belong to the same controller whose view
-        // contains its root view. UIKit 26 enforces this during window attachment.
-        if glass.parent !== owner || capsule.superview !== owner.view || glass.view.superview !== capsule {
-            if glass.parent != nil {
-                glass.willMove(toParent: nil)
-                glass.view.removeFromSuperview()
-                glass.removeFromParent()
-            }
-            capsule.removeFromSuperview()
-            owner.addChild(glass)
-            capsule.insertSubview(glass.view, at: 0)
-            owner.view.addSubview(capsule)
-            glass.didMove(toParent: owner)
-            layoutFrame = nil
-            itemState = nil
-        }
-        assert(Self.owners.object(forKey: owner) === self)
-        assert(owner.view.subviews.filter { $0.accessibilityIdentifier == Self.capsuleID }.count == 1,
-               "A tab controller must mount exactly one custom capsule")
-        assert(glass.parent === owner && glass.view.superview === capsule)
-        assert(capsule.subviews.count == 3 && items.arrangedSubviews.count == 3,
-               "Exactly one glass host, one liquid indicator and three plain controls")
-
-        let bounds = owner.view.bounds
-        let safe = owner.view.safeAreaInsets
-        let width = max(0, min(280, bounds.width - 88))
-        let frame = CGRect(x: (bounds.width - width) / 2, y: bounds.maxY - safe.bottom - 10 - 70, width: width, height: 70)
-        if layoutFrame != frame {
-            layoutFrame = frame
-            capsule.frame = frame
-            glass.view.frame = capsule.bounds
-            // The complete icon/title stack and selection share 58pt coordinates.
-            let itemFrame = CGRect(x: 6, y: 6, width: max(0, width - 12), height: 58)
-            items.frame = itemFrame
-            indicator.frame = itemFrame
-        }
-        observeTransition(owner)
-        let nativeFrame = native.layer.presentation()?.frame ?? native.frame
-        let nativeVisible = !native.isHidden && native.alpha > 0.01 && nativeFrame.minY < bounds.maxY - 1
-        // Poll public presentation geometry during interactive push/pop and
-        // toolbar transitions too; no private item/background view inspection.
-        let opaque = UIAccessibility.isReduceTransparencyEnabled
-        let state = ItemState(selection: min(2, max(0, selection)), badge: badge, dark: dark,
-                              visible: nativeVisible, opaque: opaque,
-                              reduceMotion: UIAccessibility.isReduceMotionEnabled, bounds: indicator.bounds)
-        if state != itemState {
-            if itemState?.visible != nativeVisible {
-                capsule.isHidden = !nativeVisible
-                capsule.isUserInteractionEnabled = nativeVisible
-                capsule.accessibilityElementsHidden = !nativeVisible
-            }
-            for (index, control) in controls.enumerated() {
-                control.update(selected: index == state.selection, dark: dark, badge: index == 2 ? badge : nil)
-            }
-            indicator.update(selection: state.selection, count: 3, dark: dark, enabled: nativeVisible, bottomInset: 0)
-            itemState = state
-        }
-        displayLink?.isPaused = CACurrentMediaTime() >= burstDeadline
-        let opacity = opaque ? 1 : glassConfiguration.normalizedOpacity
-        let key = "\(dark)|\(opaque)|\(opacity)"
-        guard key != appearanceKey || appliedGlassConfiguration != glassConfiguration else { return }
-        appearanceKey = key
-        appliedGlassConfiguration = glassConfiguration
-        glass.rootView = GlassTabSurface(configuration: glassConfiguration, dark: dark)
-        capsule.layer.borderWidth = 0.75
-        capsule.layer.borderColor = (dark ? UIColor.white : UIColor.black).withAlphaComponent(0.12).cgColor
+    func dismantle() {
+        onSelect = nil
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
     }
 
     @objc private func selectTab(_ control: TabControl) {
@@ -334,60 +83,7 @@ final class GlassTabContainer: UIViewController {
         refresh()
     }
 
-    private func findTabController(_ controller: UIViewController) -> UITabBarController? {
-        if let tab = controller as? UITabBarController { return tab }
-        for child in controller.children {
-            if let tab = findTabController(child) { return tab }
-        }
-        return nil
-    }
-
-    private func belongsToRoot(_ controller: UIViewController, root: UIViewController) -> Bool {
-        var ancestor: UIViewController = controller
-        while let parent = ancestor.parent { ancestor = parent }
-        return ancestor === root
-    }
-
-    private func startBurst(duration: CFTimeInterval = 0.5) {
-        guard active, !invalidated else { return }
-        burstDeadline = max(burstDeadline, CACurrentMediaTime() + duration)
-        displayLink?.isPaused = false
-    }
-
-    private func nativeVisibilityChanged() {
-        startBurst()
-        refresh()
-    }
-
-    private func observeTransition(_ owner: UITabBarController) {
-        let navigation = owner.selectedViewController as? UINavigationController
-        let coordinator = navigation?.topViewController?.transitionCoordinator
-            ?? owner.selectedViewController?.transitionCoordinator ?? owner.transitionCoordinator
-        guard let coordinator = coordinator else { lastTransition = nil; return }
-        if lastTransition !== (coordinator as AnyObject) {
-            lastTransition = coordinator as AnyObject
-            startBurst(duration: max(0.5, coordinator.transitionDuration + 0.1))
-        }
-        // Interactive gestures can outlast the nominal transition duration.
-        if coordinator.isInteractive { startBurst() }
-    }
-
-    @MainActor
-    private final class TickProxy: NSObject {
-        weak var owner: GlassTabContainer?
-        init(_ owner: GlassTabContainer) { self.owner = owner }
-        @objc func tick() {
-            // Installed only on RunLoop.main; no asynchronous Task per frame.
-            owner?.refresh()
-        }
-        @objc func idle() {
-            guard let owner = owner, owner.active, owner.displayLink?.isPaused != false else { return }
-            owner.refresh()
-        }
-    }
-
-    /// UIControl has no automatic iOS 26 glass/selection background. All visuals
-    /// here are only the 20pt icon, 10pt title and optional unread badge.
+    /// UIControl adds no automatic iOS 26 glass or selected-item background.
     private final class TabControl: UIControl {
         private let icon = UIImageView()
         private let title = UILabel()
@@ -445,18 +141,5 @@ final class GlassTabContainer: UIViewController {
             accessibilityValue = badgeLabel.isHidden ? nil : "\(badge ?? "") 条未读"
             setNeedsLayout()
         }
-    }
-}
-
-/// Explicit UIKit -> SwiftUI bridge. Only the capsule's decorative background is
-/// hosted; plain controls, indicator, navigation and polling stay UIKit-owned.
-private struct GlassTabSurface: View {
-    let configuration: GlassConfiguration
-    let dark: Bool
-
-    var body: some View {
-        GlassSurface(shape: Capsule(), material: .regularMaterial, dark: dark)
-            .environment(\.liuyunGlassConfiguration, configuration)
-            .environment(\.colorScheme, dark ? .dark : .light)
     }
 }

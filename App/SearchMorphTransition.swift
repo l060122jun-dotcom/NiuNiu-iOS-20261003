@@ -105,7 +105,8 @@ struct SearchMorphHost: ViewModifier {
         // A single inline chrome is owned by the overlay, never a sheet or a
         // second navigation stack. Detail destinations retain their own toolbar.
         .toolbar(.hidden, for: .navigationBar)
-        .toolbar(presentation.expanded ? .hidden : .visible, for: .tabBar)
+        .toolbar(.hidden, for: .tabBar)
+        .preference(key: MainTabSearchExpandedKey.self, value: presentation.expanded)
         .task(id: presentation.expanded) {
             guard presentation.expanded else { return }
             do { try await Task.sleep(nanoseconds: reduceMotion ? 150_000_000 : 480_000_000) }

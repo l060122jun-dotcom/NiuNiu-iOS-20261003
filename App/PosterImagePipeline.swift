@@ -173,6 +173,7 @@ actor PosterImagePipeline {
     private var active = 0
     private var activePrefetch = 0
     private var clearing = false
+    private var clearTask: Task<Void, Never>?
     private let pendingLimit = 128
     private let waiterLimit = 256
     private let perJobWaiterLimit = 16
@@ -183,6 +184,19 @@ actor PosterImagePipeline {
     func httpCacheUsage() async -> Int64 { await transport.cacheUsage() }
 
     func clearCache() async {
+        // Coalesce reentrant clears. Otherwise the first transport await can
+        // reopen admission while a second clear is still removing responses.
+        if let task = clearTask {
+            await task.value
+            return
+        }
+        let task = Task { await self.performClearCache() }
+        clearTask = task
+        await task.value
+        clearTask = nil
+    }
+
+    private func performClearCache() async {
         cacheRevision &+= 1
         clearing = true
         cache.removeAllObjects()
@@ -243,13 +257,20 @@ actor PosterImagePipeline {
             guard attempts < 40 else { return nil }
             attempts += 1
             do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return nil }
-            guard !Task.isCancelled, revision == cacheRevision else { return nil }
+            guard !Task.isCancelled, !clearing, revision == cacheRevision else { return nil }
             if let image = cache.object(forKey: key as NSString) { return image }
         }
         let waiter = UUID()
         return await withTaskCancellationHandler(operation: {
             await withCheckedContinuation { continuation in
-                guard !Task.isCancelled, revision == cacheRevision, canAdmit(key) else { continuation.resume(returning: nil); return }
+                guard !Task.isCancelled, !clearing, revision == cacheRevision else { continuation.resume(returning: nil); return }
+                // A shared job may finish while this caller awaits registration.
+                // Always consult the decoded cache again before starting a transfer.
+                if let image = cache.object(forKey: key as NSString) {
+                    continuation.resume(returning: image)
+                    return
+                }
+                guard canAdmit(key) else { continuation.resume(returning: nil); return }
                 if jobs[key] != nil {
                     jobs[key]?.waiters[waiter] = continuation
                     if visible, jobs[key]?.task == nil { jobs[key]?.visible = true }
@@ -265,8 +286,10 @@ actor PosterImagePipeline {
     }
 
     private func cancel(key: String, waiter: UUID) {
-        guard var job = jobs[key] else { return }
-        job.waiters.removeValue(forKey: waiter)?.resume(returning: nil)
+        // A late cancellation belongs only to its registered waiter, never a
+        // subsequent same-key request (or an already completed continuation).
+        guard var job = jobs[key], let continuation = job.waiters.removeValue(forKey: waiter) else { return }
+        continuation.resume(returning: nil)
         jobs[key] = job
         if job.waiters.isEmpty {
             if let task = job.task {

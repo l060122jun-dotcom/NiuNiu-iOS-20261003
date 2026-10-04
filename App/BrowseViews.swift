@@ -356,20 +356,22 @@ struct MainTabView: View {
     }
 
     var body: some View {
-        // Keep the actual system tab bar: destination toolbar(.hidden) must still
-        // control its visibility, and each tab retains its own navigation stack.
+        // Keep independent native stacks and stable tab identities. System chrome
+        // is hidden through SwiftUI; custom chrome belongs only to each root.
         TabView(selection: $selection) {
-            NavigationStack { HomeView() }
+            NavigationStack { tabRoot { HomeView() } }
+                .toolbar(.hidden, for: .tabBar)
                 .tabItem { Label { Text("首页") } icon: { Image(uiImage: GlassTabContainer.icon("MainTabHome")) } }.tag(0)
-            NavigationStack { RankingView() }
+            NavigationStack { tabRoot { RankingView() } }
+                .toolbar(.hidden, for: .tabBar)
                 .tabItem { Label { Text("榜单") } icon: { Image(uiImage: GlassTabContainer.icon("MainTabRank")) } }.tag(1)
-            NavigationStack { ProfileView() }
+            NavigationStack { tabRoot { ProfileView() } }
+                .toolbar(.hidden, for: .tabBar)
                 .tabItem { Label { Text("我") } icon: { Image(uiImage: GlassTabContainer.icon("MainTabMe")) } }.tag(2)
                 .badge(unreadBadge)
         }
         .tint(BrowseTheme.accent)
         .background(BrowseTheme.background)
-        .background(MainTabAppearance(dark: colorScheme == .dark, selection: $selection, badge: unreadBadge, active: scenePhase == .active))
         .task(id: "\(account.token)|\(selection)|\(scenePhase)") {
             unreadCount = 0
             guard account.isLoggedIn, scenePhase == .active else { return }
@@ -394,20 +396,56 @@ struct MainTabView: View {
     }
 }
 
-/// Keep SwiftUI's native navigation/visibility router; one plain-control capsule owns its UI.
-@MainActor
-private struct MainTabAppearance: UIViewControllerRepresentable {
-    @Environment(\.liuyunGlassConfiguration) private var glassConfiguration
+extension MainTabView {
+    private func tabRoot<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        MainTabRoot(content: content(), dark: colorScheme == .dark, selection: $selection,
+                    badge: unreadBadge, active: scenePhase == .active)
+    }
+}
+
+/// Search is an in-place root overlay, rather than a pushed destination.
+/// Its explicit SwiftUI state suppresses the root's custom inset.
+struct MainTabSearchExpandedKey: PreferenceKey {
+    static var defaultValue: Bool { false }
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
+}
+
+private struct MainTabRoot<Content: View>: View {
+    let content: Content
     let dark: Bool
     @Binding var selection: Int
     let badge: String?
     let active: Bool
-    static let trackColor = Color(uiColor: UIColor { traits in
-        traits.userInterfaceStyle == .dark
-            ? UIColor(white: 30.0 / 255, alpha: 239.0 / 255)
-            : UIColor(red: 239.0 / 255, green: 239.0 / 255, blue: 244.0 / 255, alpha: 239.0 / 255)
-    })
+    @State private var searchExpanded = false
 
+    var body: some View {
+        content
+            .onPreferenceChange(MainTabSearchExpandedKey.self) { searchExpanded = $0 }
+            // Outside HomeView's resume inset: reserve 90pt before that banner
+            // is laid out. Only the navigation root owns this space and surface.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if !searchExpanded {
+                    MainTabAppearance(dark: dark, selection: $selection, badge: badge, active: active)
+                        .frame(maxWidth: 280).frame(height: 70)
+                        .background { GlassSurface(shape: Capsule(), material: .regularMaterial, dark: dark) }
+                        .clipShape(Capsule())
+                        .overlay { Capsule().stroke((dark ? Color.white : Color.black).opacity(0.12), lineWidth: 0.75) }
+                        .accessibilityIdentifier("liuyun.mainTab.capsule")
+                        .padding(.horizontal, 44).padding(.vertical, 10)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .toolbar(.hidden, for: .tabBar)
+    }
+}
+
+/// Keep SwiftUI's native navigation stacks; UIKit owns plain controls only.
+@MainActor
+private struct MainTabAppearance: UIViewControllerRepresentable {
+    let dark: Bool
+    @Binding var selection: Int
+    let badge: String?
+    let active: Bool
     static func integer(_ value: Any?) -> Int {
         if let value = value as? NSNumber { return value.intValue }
         if let value = value as? String { return Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0 }
@@ -419,7 +457,6 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
     }
     func updateUIViewController(_ controller: GlassTabContainer, context: Context) {
         controller.dark = dark
-        controller.glassConfiguration = glassConfiguration
         controller.selection = selection
         controller.badge = badge
         controller.active = active
@@ -578,11 +615,6 @@ private struct BrowseMessage: View {
     }
 }
 
-private struct PosterPrefetchKey: PreferenceKey {
-    static var defaultValue = false
-    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
-}
-
 private struct PosterVisibleKey: PreferenceKey {
     static var defaultValue = false
     static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
@@ -593,12 +625,9 @@ private struct PosterView: View {
     let url: String
     @Environment(\.displayScale) private var displayScale
     @Environment(\.browseViewportHeight) private var viewportHeight
-    @Environment(\.browseTracking) private var tracking
     @Environment(\.posterCoordinateSpace) private var coordinateSpace
-    @Environment(\.browseContentActive) private var contentActive
     @ObservedObject private var cacheState = PosterCacheState.shared
     @State private var appeared = false
-    @State private var prefetched = false
     @State private var visible = false
     @State private var image: UIImage?
     @State private var loadedURL: String?
@@ -607,11 +636,11 @@ private struct PosterView: View {
         GeometryReader { geometry in
             let extent = max(geometry.size.width, geometry.size.height) * displayScale
             let pixels = PosterImagePipeline.pixelBucket(extent.isFinite ? Int(min(2048, max(1, ceil(extent)))) : 1)
-            // Lists do not supply the BrowseScroll coordinate environment. Their
-            // row lifecycle is the fallback gate; do not permanently require height > 0.
-            let eligible = appeared && tracking && contentActive && (viewportHeight <= 0 || prefetched)
+            // Lazy row appearance owns admission. Parent tracking and geometry
+            // preferences may remain stale across navigation; neither may prevent
+            // an appeared row from restoring its image. Geometry only sets priority.
             Group {
-                if let image = image {
+                if let image = image, loadedURL == url, loadedRevision == cacheState.revision {
                     Image(uiImage: image).resizable().scaledToFill()
                 } else {
                     ZStack {
@@ -623,41 +652,47 @@ private struct PosterView: View {
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
             // Keep a stable measurement layer across image/placeholder changes.
-            // Read the frame in that layer so scrolling re-evaluates eligibility.
+            // Read the frame in that layer so scrolling re-evaluates priority.
             .background {
                 GeometryReader { measurement in
                     let frame = measurement.frame(in: .named(coordinateSpace))
-                    Color.clear.preference(key: PosterPrefetchKey.self,
-                        value: frame.width > 0 && frame.maxY > -viewportHeight && frame.minY < viewportHeight * 2)
-                        .preference(key: PosterVisibleKey.self,
-                            value: frame.width > 0 && frame.maxY > 0 && frame.minY < viewportHeight)
+                    Color.clear.preference(key: PosterVisibleKey.self,
+                        value: frame.width > 0 && frame.maxY > 0 && frame.minY < viewportHeight)
                 }
-            }
-            .onPreferenceChange(PosterPrefetchKey.self) { value in
-                prefetched = value
-                if viewportHeight > 0 && !value { image = nil; loadedURL = nil }
             }
             .onPreferenceChange(PosterVisibleKey.self) { value in
                 visible = value
-                if value, eligible, let source = URL(string: url) {
+                if value, appeared, let source = URL(string: url) {
                     Task { await PosterImagePipeline.shared.promote(url: source, pixels: pixels) }
                 }
             }
-            .task(id: "\(url)|\(pixels)|\(eligible)|\(cacheState.revision)") {
+            .task(id: "\(url)|\(pixels)|\(appeared)|\(cacheState.revision)") {
                 let revision = cacheState.revision
                 if loadedRevision != revision || loadedURL != url { image = nil; loadedURL = nil }
-                guard eligible else { image = nil; loadedURL = nil; return }
+                guard appeared else { return }
                 guard let source = URL(string: url), ["http", "https"].contains(source.scheme?.lowercased() ?? "") else { return }
                 guard loadedURL != url || image == nil else { return }
-                let result = await PosterImagePipeline.shared.image(url: source, pixels: pixels,
-                                                                    visible: viewportHeight <= 0 || visible)
-                guard !Task.isCancelled, revision == cacheState.revision else { return }
-                image = result
-                loadedURL = url
-                loadedRevision = revision
+                // Bounded admission or a transient transfer can return nil. Retry
+                // locally without needing another geometry/preference transition.
+                for attempt in 0..<3 {
+                    let result = await PosterImagePipeline.shared.image(url: source, pixels: pixels,
+                                                                        visible: viewportHeight <= 0 || visible)
+                    guard !Task.isCancelled, revision == cacheState.revision else { return }
+                    if let result = result {
+                        image = result
+                        loadedURL = url
+                        loadedRevision = revision
+                        return
+                    }
+                    guard attempt < 2 else { return }
+                    do { try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 250_000_000) }
+                    catch { return }
+                }
             }
             .onAppear { appeared = true }
-            .onDisappear { appeared = false; image = nil; loadedURL = nil; prefetched = false; visible = false }
+            // Cancellation stops unfinished work, but a successful same-URL image
+            // belongs to this row until URL/revision changes or SwiftUI releases it.
+            .onDisappear { appeared = false }
         }
         .aspectRatio(0.7, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
