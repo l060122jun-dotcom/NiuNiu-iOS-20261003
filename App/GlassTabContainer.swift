@@ -6,13 +6,14 @@ import UIKit
 @MainActor
 final class GlassTabContainer: UIViewController, UITabBarDelegate {
     var dark = false
-    var glassOpacity = GlassAppearance.defaultOpacity
+    var glassConfiguration = GlassConfiguration()
     var selection = 0
     var badge: String?
     var active = true { didSet { if oldValue != active { refresh() } } }
     var onSelect: ((Int) -> Void)?
     private let capsule = UIView()
-    private let glass = UIVisualEffectView()
+    private let glass = UIHostingController(rootView: GlassTabSurface(configuration: GlassConfiguration(), dark: false))
+    private var appliedGlassConfiguration: GlassConfiguration?
     private let indicator = LiquidTabIndicatorView()
     private let compactBar = CompactTabBar()
     private let emptyMask = CALayer()
@@ -60,10 +61,14 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         capsule.layer.cornerRadius = 35
         capsule.clipsToBounds = true
         capsule.isHidden = true
-        glass.isUserInteractionEnabled = false
+        addChild(glass)
+        glass.view.backgroundColor = .clear
+        glass.view.isUserInteractionEnabled = false
+        glass.view.accessibilityElementsHidden = true
         indicator.isUserInteractionEnabled = false
         // Explicit sibling ordering: glass -> selection -> native item controls.
-        capsule.addSubview(glass)
+        capsule.addSubview(glass.view)
+        glass.didMove(toParent: self)
         capsule.addSubview(indicator)
         capsule.addSubview(compactBar)
         compactBar.delegate = self
@@ -160,7 +165,7 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         if layoutFrame != frame {
             layoutFrame = frame
             capsule.frame = frame
-            glass.frame = capsule.bounds
+            glass.view.frame = capsule.bounds
             // The complete icon/title stack and selection share 58pt coordinates.
             let itemFrame = CGRect(x: 6, y: 6, width: max(0, width - 12), height: 58)
             compactBar.frame = itemFrame
@@ -187,12 +192,12 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
             itemState = state
         }
         displayLink?.isPaused = CACurrentMediaTime() >= burstDeadline
-        let opacity = opaque ? 1 : GlassAppearance.normalized(glassOpacity)
+        let opacity = opaque ? 1 : glassConfiguration.normalizedOpacity
         let key = "\(dark)|\(opaque)|\(opacity)"
-        guard key != appearanceKey else { return }
+        guard key != appearanceKey || appliedGlassConfiguration != glassConfiguration else { return }
         appearanceKey = key
-        glass.effect = opacity >= 1 ? nil : UIBlurEffect(style: dark ? .systemMaterialDark : .systemMaterialLight)
-        glass.contentView.backgroundColor = GlassAppearance.solidColor(dark: dark).withAlphaComponent(CGFloat(opacity))
+        appliedGlassConfiguration = glassConfiguration
+        glass.rootView = GlassTabSurface(configuration: glassConfiguration, dark: dark)
         capsule.layer.borderWidth = 0.75
         capsule.layer.borderColor = (dark ? UIColor.white : UIColor.black).withAlphaComponent(0.12).cgColor
         let appearance = UITabBarAppearance()
@@ -278,5 +283,19 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
     /// a home-indicator safe-area extension. No KVC or private UIKit override.
     private final class CompactTabBar: UITabBar {
         override var safeAreaInsets: UIEdgeInsets { .zero }
+    }
+}
+
+/// Explicit UIKit -> SwiftUI bridge. Only the capsule's decorative background is
+/// hosted; UITabBar controls, indicator, navigation and polling stay UIKit-owned.
+private struct GlassTabSurface: View {
+    let configuration: GlassConfiguration
+    let dark: Bool
+
+    var body: some View {
+        GlassSurface(shape: Capsule(), material: .regularMaterial, dark: dark)
+            .environment(\.liuyunGlassConfiguration, configuration)
+            .environment(\.colorScheme, dark ? .dark : .light)
+            .environment(\.accessibilityReduceTransparency, UIAccessibility.isReduceTransparencyEnabled)
     }
 }

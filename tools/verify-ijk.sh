@@ -162,8 +162,8 @@ print('IJK: archives, patch applicability and restored source hashes verified')
 PY
     exit 0
 fi
-[[ "$(uname -s)" == Darwin ]] || { echo 'Requires macOS and Xcode 16.4.' >&2; exit 1; }
-[[ "$(xcodebuild -version | head -n 1)" == 'Xcode 16.4' ]] || { echo 'Expected Xcode 16.4' >&2; exit 1; }
+[[ "$(uname -s)" == Darwin ]] || { echo 'Requires macOS and Xcode 26.3.' >&2; exit 1; }
+[[ "$(xcodebuild -version | head -n 1)" == 'Xcode 26.3' ]] || { echo 'Expected Xcode 26.3' >&2; exit 1; }
 LOGS="$ROOT/build/ijk-logs"
 mkdir -p "$LOGS"
 WORK="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ijk-verify.XXXXXX")"

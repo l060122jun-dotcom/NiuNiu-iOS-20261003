@@ -11,7 +11,7 @@ if [[ "${1:-}" == --print-lock ]]; then
     exit 0
 fi
 [[ "$(uname -s)" == Darwin ]] || { echo 'Requires macOS and Xcode.' >&2; exit 1; }
-[[ "$(xcodebuild -version | head -n 1)" == 'Xcode 16.4' ]] || { echo 'Requires Xcode 16.4; select DEVELOPER_DIR explicitly.' >&2; exit 1; }
+[[ "$(xcodebuild -version | head -n 1)" == 'Xcode 26.3' ]] || { echo 'Requires Xcode 26.3; select DEVELOPER_DIR explicitly.' >&2; exit 1; }
 LOGS="$ROOT/build/ijk-logs"
 mkdir -p "$LOGS" "$ROOT/Vendor"
 WORK="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ijk-source.XXXXXX")"
@@ -307,12 +307,12 @@ Path(os.environ['COMPLIANCE'], 'source-tree-sha256.json').write_text(json.dumps(
 (package / 'restore-exclusions.json').write_text(json.dumps(exclusions, sort_keys=True, indent=2) + '\n')
 PY
 cat >"$WORK/compliance/REBUILD.md" <<'DOC'
-# Restore and rebuild the exact patched sources (macOS / Xcode 16.4)
+# Restore and rebuild the exact patched sources (macOS / Xcode 26.3)
 
 Extract IJK-corresponding-source.tar.gz into a new directory. From compliance/:
 
 ```sh
-export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+export DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer
 test -d "$DEVELOPER_DIR"
 bash verify-ijk.sh --restore-source ./restored
 cd restored/ijk/ios

@@ -20,6 +20,7 @@ struct NiuNiuApp: App {
     @StateObject private var catalog = BrowseCatalog()
     @StateObject private var account = AccountStore.shared
     @AppStorage("niuniu.appearance") private var appearance = "system"
+    @AppStorage(GlassAppearance.storageKey) private var glassOpacity = GlassAppearance.defaultOpacity
 
     private var colorScheme: ColorScheme? {
         switch appearance {
@@ -38,6 +39,9 @@ struct NiuNiuApp: App {
                 .tint(BrowseTheme.accent)
                 .background(BrowseTheme.background)
                 .preferredColorScheme(colorScheme)
+                .environment(\.liuyunGlassConfiguration, GlassConfiguration(opacity: GlassAppearance.normalized(glassOpacity)))
+                .onAppear { GlassAppearance.migrate() }
+                .onChange(of: glassOpacity) { _ in GlassAppearance.migrate() }
                 .task { await catalog.load() }
         }
     }

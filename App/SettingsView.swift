@@ -43,6 +43,7 @@ struct SettingsView: View {
                                in: GlassAppearance.opacityRange, step: 0.01)
                             .accessibilityLabel("液态玻璃不透明度")
                             .accessibilityValue("\(Int((GlassAppearance.normalized(glassOpacity) * 100).rounded()))%")
+                        glassPreview
                         Text(reduceTransparency ? "系统已开启降低透明度，玻璃背景始终显示为实色；此设置将在关闭后生效。" : "15% 更通透，100% 为实色背景；即时应用并自动保存，不影响文字和图标。")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                     }.padding(.vertical, 12)
@@ -103,7 +104,6 @@ struct SettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
         .task {
-            GlassAppearance.migrate()
             teenMode = APIClient.shared.isTeenModeEnabled
             await refreshCaches()
             await loadConfig()
@@ -122,6 +122,30 @@ struct SettingsView: View {
             Button("确定") { Task { await validatePassword() } }
             Button("取消", role: .cancel) { password = "" }
         } message: { Text("关闭青少年模式需要验证服务端配置的口令") }
+    }
+
+    private var glassPreview: some View {
+        ZStack {
+            // High-contrast source detail makes transparency changes visible even
+            // when the rest of Settings sits on a uniform background.
+            LinearGradient(colors: [.blue, .purple, .orange], startPoint: .leading, endPoint: .trailing)
+            HStack(spacing: 18) {
+                ForEach(0..<8, id: \.self) { _ in
+                    Rectangle().fill(Color.white.opacity(0.6)).frame(width: 8)
+                }
+            }.rotationEffect(.degrees(20)).accessibilityHidden(true)
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                Text("玻璃实时预览").font(.system(size: 14, weight: .semibold))
+            }
+            .foregroundStyle(Color.primary)
+            .padding(.horizontal, 20).frame(height: 44)
+            .liuyunGlass(in: Capsule())
+        }
+        .frame(height: 76)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("玻璃实时预览，文字和图标保持不透明")
     }
 
     private func caption(_ title: String, _ subtitle: String) -> some View {

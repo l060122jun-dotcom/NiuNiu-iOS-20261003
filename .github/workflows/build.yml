@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: macos-15
     env:
-      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
       - run: brew install xcodegen
@@ -19,7 +19,7 @@ jobs:
         run: |
           test "$(uname -m)" = arm64
           test -d "$DEVELOPER_DIR"
-          test "$(xcodebuild -version | head -n 1)" = 'Xcode 16.4'
+          test "$(xcodebuild -version | head -n 1)" = 'Xcode 26.3'
           echo "identity=$(xcodebuild -version | shasum -a 256 | cut -c1-16)-$(xcrun --sdk iphoneos --show-sdk-version)" >> "$GITHUB_OUTPUT"
       - name: Cache pinned official IJK framework and corresponding source
         id: ijk-cache

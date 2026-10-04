@@ -390,7 +390,7 @@ struct MainTabView: View {
 
 /// Keep SwiftUI's native navigation/visibility router; the compact bar owns its UI.
 private struct MainTabAppearance: UIViewControllerRepresentable {
-    @AppStorage(GlassAppearance.storageKey) private var glassOpacity = GlassAppearance.defaultOpacity
+    @Environment(\.liuyunGlassConfiguration) private var glassConfiguration
     let dark: Bool
     @Binding var selection: Int
     let badge: String?
@@ -408,12 +408,11 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
     }
 
     func makeUIViewController(context: Context) -> GlassTabContainer {
-        GlassAppearance.migrate()
         return GlassTabContainer()
     }
     func updateUIViewController(_ controller: GlassTabContainer, context: Context) {
         controller.dark = dark
-        controller.glassOpacity = GlassAppearance.normalized(glassOpacity)
+        controller.glassConfiguration = glassConfiguration
         controller.selection = selection
         controller.badge = badge
         controller.active = active
