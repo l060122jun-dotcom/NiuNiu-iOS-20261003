@@ -296,6 +296,5 @@ private struct GlassTabSurface: View {
         GlassSurface(shape: Capsule(), material: .regularMaterial, dark: dark)
             .environment(\.liuyunGlassConfiguration, configuration)
             .environment(\.colorScheme, dark ? .dark : .light)
-            .environment(\.accessibilityReduceTransparency, UIAccessibility.isReduceTransparencyEnabled)
     }
 }

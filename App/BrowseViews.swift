@@ -124,7 +124,11 @@ final class BrowseCatalog: ObservableObject {
     private var visibilitySignature: String?
     func refreshVisibility() {
         let signature = String(APIClient.shared.isTeenModeEnabled) + String(describing:
-            allCategories.map { [$0.id, $0.name] + $0.filters.keys.sorted().map { "\($0)=\($0.filters[$0] ?? "")" } })
+            allCategories.map { category in
+                [category.id, category.name] + category.filters.keys.sorted().map { key in
+                    "\(key)=\(category.filters[key] ?? "")"
+                }
+            })
         if visibilitySignature != signature {
             visibilitySignature = signature
             visibilityRevision &+= 1
