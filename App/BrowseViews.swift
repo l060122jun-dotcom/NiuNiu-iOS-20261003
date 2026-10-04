@@ -26,6 +26,9 @@ private struct BrowsePressStyle: ButtonStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
+            // Crop limits drawing, not SwiftUI hit testing. Make the label's
+            // own layout rectangle authoritative before applying press effects.
+            .contentShape(Rectangle())
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
             .opacity(configuration.isPressed ? 0.78 : 1)
             .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: configuration.isPressed)
@@ -429,7 +432,7 @@ private struct MainTabRoot<Content: View>: View {
                         .frame(maxWidth: 280).frame(height: 70)
                         .background { GlassSurface(shape: Capsule(), material: .regularMaterial, dark: dark) }
                         .clipShape(Capsule())
-                        .overlay { Capsule().stroke((dark ? Color.white : Color.black).opacity(0.12), lineWidth: 0.75) }
+                        .overlay { Capsule().stroke((dark ? Color.white : Color.black).opacity(0.12), lineWidth: 0.75).allowsHitTesting(false) }
                         .accessibilityIdentifier("liuyun.mainTab.capsule")
                         .padding(.horizontal, 44).padding(.vertical, 10)
                         .frame(maxWidth: .infinity)
@@ -495,13 +498,13 @@ private struct BrowseTopBar: View {
             }.buttonStyle(BrowsePressStyle()).accessibilityLabel("搜索影片、剧集")
             NavigationLink { DownloadsView().toolbar(.visible, for: .navigationBar) } label: {
                 Image(systemName: "arrow.down.to.line").font(.body.weight(.semibold)).frame(width: 44, height: 44).glassBackground(in: Circle())
-            }.accessibilityLabel("下载管理")
+            }.buttonStyle(BrowsePressStyle()).accessibilityLabel("下载管理")
             NavigationLink { SavedLibraryView(kind: .history).toolbar(.visible, for: .navigationBar) } label: {
                 Image(systemName: "clock").font(.body.weight(.semibold)).frame(width: 44, height: 44).glassBackground(in: Circle())
-            }.accessibilityLabel("观看历史")
+            }.buttonStyle(BrowsePressStyle()).accessibilityLabel("观看历史")
             NavigationLink { MessagesView().toolbar(.visible, for: .navigationBar) } label: {
                 Image(systemName: "bell").font(.body.weight(.semibold)).frame(width: 44, height: 44).glassBackground(in: Circle())
-            }.accessibilityLabel("消息通知")
+            }.buttonStyle(BrowsePressStyle()).accessibilityLabel("消息通知")
         }
         .foregroundStyle(Color.primary)
         .padding(.horizontal).padding(.vertical, 6)
@@ -696,6 +699,9 @@ private struct PosterView: View {
         }
         .aspectRatio(0.7, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        // Posters are decorative children of their owning NavigationLink.
+        // An aspect-fill image must never intercept an adjacent card's touch.
+        .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
 }
@@ -724,6 +730,8 @@ private struct VideoTile: View {
                 Text([video.year, video.area].filter { !$0.isEmpty }.joined(separator: " · "))
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }.buttonStyle(BrowsePressStyle())
     }
 }
@@ -1017,9 +1025,9 @@ struct HomeView: View {
                     } label: {
                         Image(systemName: "xmark").font(.caption.bold()).foregroundStyle(.secondary)
                             .frame(width: 44, height: 44)
-                    }.accessibilityLabel("关闭继续观看提示，不删除观看历史")
+                    }.buttonStyle(BrowsePressStyle()).accessibilityLabel("关闭继续观看提示，不删除观看历史")
                 }.frame(height: 42).padding(12).background(BrowseTheme.surface, in: RoundedRectangle(cornerRadius: 20))
-                    .overlay { RoundedRectangle(cornerRadius: 20).stroke(BrowseTheme.accent.opacity(0.18), lineWidth: 1) }
+                    .overlay { RoundedRectangle(cornerRadius: 20).stroke(BrowseTheme.accent.opacity(0.18), lineWidth: 1).allowsHitTesting(false) }
                     .padding(.horizontal).padding(.vertical, 8).background(BrowseTheme.background.opacity(0.96))
             } else {
                 // Keep the retained scroll viewport unchanged when history or
@@ -1194,11 +1202,11 @@ struct CategoryVideosView: View {
                     Spacer()
                     Button { showFilters = true } label: {
                         Label("筛选", systemImage: "slider.horizontal.3").font(.caption.weight(.semibold)).frame(minHeight: 44)
-                    }
+                    }.buttonStyle(BrowsePressStyle())
                     Button { columnCount = columnCount == 2 ? 3 : 2 } label: {
                         Label(columnCount == 2 ? "三列" : "两列", systemImage: columnCount == 2 ? "square.grid.3x3" : "square.grid.2x2")
                             .font(.caption).frame(minHeight: 44)
-                    }.accessibilityLabel("切换为\(columnCount == 2 ? "三" : "两")列布局")
+                    }.buttonStyle(BrowsePressStyle()).accessibilityLabel("切换为\(columnCount == 2 ? "三" : "两")列布局")
                 }.padding(.horizontal)
                 let summary = ["class", "area", "year", "state"].compactMap { snapshot[$0] }.filter { !$0.isEmpty }.joined(separator: " · ")
                 if !summary.isEmpty {
@@ -1469,18 +1477,30 @@ struct SearchView: View {
 
     private var searchHeader: some View {
         HStack(spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("搜索影片、演员或关键词", text: $text).focused($focused)
-                    .autocorrectionDisabled()
-                    .submitLabel(.search).onSubmit { submit(text) }
-                if !text.isEmpty {
-                    Button { text = ""; submitted = "" } label: { Image(systemName: "xmark.circle.fill") }
-                        .accessibilityLabel("清空搜索").frame(width: 36, height: 44)
+            HStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("搜索影片、演员或关键词", text: $text).focused($focused)
+                        .autocorrectionDisabled()
+                        .submitLabel(.search).onSubmit { submit(text) }
+                        .frame(minHeight: 44)
                 }
-                Button("搜索") { submit(text) }.disabled(trimmedText.isEmpty)
+                .padding(.leading, 13).padding(.trailing, 8)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+                // Focus only the editable section, preserving native cursor taps.
+                // Clear/submit/cancel are siblings, never children of this gesture.
+                .simultaneousGesture(TapGesture().onEnded { focused = true })
+                if !text.isEmpty {
+                    Button { text = ""; submitted = "" } label: {
+                        Image(systemName: "xmark.circle.fill").frame(width: 44, height: 44)
+                    }.buttonStyle(BrowsePressStyle()).accessibilityLabel("清空搜索")
+                }
+                Button { submit(text) } label: {
+                    Text("搜索").frame(minWidth: 44, minHeight: 44).padding(.trailing, 13)
+                }.buttonStyle(BrowsePressStyle()).disabled(trimmedText.isEmpty)
             }
-            .padding(.horizontal, 13).frame(minHeight: 44)
+            .frame(minHeight: 44)
             .background {
                 if let namespace = searchNamespace, !reduceMotion {
                     GlassSearchPill()
@@ -1488,8 +1508,9 @@ struct SearchView: View {
                 } else { GlassSearchPill() }
             }
             if onCancel != nil {
-                Button("取消", action: closeSearch)
-                    .frame(minHeight: 44).accessibilityLabel("取消搜索，返回原列表位置")
+                Button(action: closeSearch) {
+                    Text("取消").frame(minWidth: 44, minHeight: 44)
+                }.buttonStyle(BrowsePressStyle()).accessibilityLabel("取消搜索，返回原列表位置")
             }
         }.padding(.horizontal).padding(.vertical, 6)
     }
@@ -1530,6 +1551,7 @@ struct SearchView: View {
                             Spacer()
                             if !library.searches.isEmpty {
                                 Button { library.clearSearches() } label: { Label("清空", systemImage: "trash").font(.caption).frame(minHeight: 44) }
+                                    .buttonStyle(BrowsePressStyle())
                             }
                         }
                         if library.searches.isEmpty {
@@ -1550,7 +1572,7 @@ struct SearchView: View {
                             Spacer()
                              Button { refreshHot() } label: {
                                 Image(systemName: "arrow.clockwise").frame(width: 44, height: 44)
-                             }.accessibilityLabel("刷新热门搜索")
+                              }.buttonStyle(BrowsePressStyle()).accessibilityLabel("刷新热门搜索")
                         }
                          Text("服务端实时配置 · 点击关键词搜索").font(.caption).foregroundStyle(.secondary)
                          ForEach(Array(hotWords.enumerated()), id: \.element) { index, term in
@@ -1974,6 +1996,9 @@ private struct ProfileHistoryTile: View {
                         Text(time).font(.system(size: 11)).foregroundStyle(.white).padding(.horizontal, 4).padding(.vertical, 1)
                             .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 3)).padding(5)
                     }
+                    // The clipped aspect-fill preview is decorative; only the
+                    // tile's bounded NavigationLink label owns its hit region.
+                    .allowsHitTesting(false)
                 Text([video.title, video.episode].filter { !$0.isEmpty }.joined(separator: " "))
                     .font(.system(size: 14)).foregroundStyle(.primary).lineLimit(1)
             }

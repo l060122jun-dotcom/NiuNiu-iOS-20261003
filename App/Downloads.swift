@@ -1125,6 +1125,7 @@ private struct OfflinePlaybackSelection: Identifiable {
                     ZStack {
                         Color.black
                         PlaybackSurface(controller: playback, fill: fill)
+                            .allowsHitTesting(false)
                         Color.clear.contentShape(Rectangle())
                             .onTapGesture { interaction.toggle() }
                         AndroidPlayerControls(
@@ -1146,7 +1147,7 @@ private struct OfflinePlaybackSelection: Identifiable {
                         ) {
                             Button("后退15秒") { seek(playback.position - 15) }
                             Button("前进15秒") { seek(playback.position + 15) }
-                            DisclosureGroup("播放倍速") {
+                            Menu("播放倍速") {
                                 ForEach(rates, id: \.self) { rate in
                                     Button(String(format: "%g×", rate)) { playback.setRate(rate) }
                                 }

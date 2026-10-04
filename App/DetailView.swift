@@ -88,7 +88,7 @@ import UIKit
                                        onDismiss: { locked = false },
                                        onDismantle: dismantleDetail) {
                 FullscreenInsetsReader { insets in playerArea(insets: insets) }
-                    .overlay(alignment: .leading) { edgeBackArea }
+                    .simultaneousGesture(edgeBackGesture(fullscreenHost: true))
                     .preferredColorScheme(.dark).environmentObject(library)
                     .sheet(item: $sheet) { value in sheetContent(value) }
             }
@@ -108,7 +108,7 @@ import UIKit
         }
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
-        .overlay(alignment: .leading) { if !fullScreen { edgeBackArea } }
+        .simultaneousGesture(edgeBackGesture(fullscreenHost: false))
         .task {
             configureCallbacks()
             playback.restorePictureInPictureUI = {
@@ -153,17 +153,17 @@ import UIKit
         }
     }
 
-    private var edgeBackArea: some View {
-        Color.clear.frame(width: 22).contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 16, coordinateSpace: .local)
-                .onEnded { value in
-                    guard !locked, value.startLocation.x <= 22,
-                          value.translation.width > 70,
-                          abs(value.translation.width) > abs(value.translation.height) * 1.5 else { return }
-                    if fullScreen { fullScreen = false }
-                    else { closeDetail(); dismiss() }
-                })
-            .accessibilityLabel("从左边缘右滑返回")
+    // Observe an edge-origin drag without putting a transparent hit-test view
+    // above the back button, episode cells or the player's native Slider.
+    private func edgeBackGesture(fullscreenHost: Bool) -> some Gesture {
+        DragGesture(minimumDistance: 16, coordinateSpace: .local)
+            .onEnded { value in
+                guard fullScreen == fullscreenHost, !locked, value.startLocation.x >= 0, value.startLocation.x <= 22,
+                      value.translation.width > 70,
+                      abs(value.translation.width) > abs(value.translation.height) * 1.5 else { return }
+                if fullScreen { fullScreen = false }
+                else { closeDetail(); dismiss() }
+            }
     }
 
     private func playerArea(insets: EdgeInsets) -> some View {
@@ -343,9 +343,10 @@ import UIKit
         let active = index == episodeIndex
         return Text(episodes[index].name)
             .font(.subheadline)
-            .frame(maxWidth: .infinity)
-            .padding(10)
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, minHeight: 44)
             .background(active ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
     }
     private var displayedIndices: [Int] {
         let indices = Array(episodes.indices)
@@ -368,9 +369,10 @@ import UIKit
                     HStack {
                         AsyncImage(url: URL(string: item.poster)) { image in image.resizable().scaledToFill() } placeholder: { Color.secondary.opacity(0.1) }
                             .frame(width: 55, height: 76).clipped().clipShape(RoundedRectangle(cornerRadius: 6))
+                            .contentShape(Rectangle())
                         VStack(alignment: .leading) { Text(item.name); Text(item.remark).font(.caption).foregroundStyle(.secondary) }
                         Spacer(); Image(systemName: "chevron.right")
-                    }
+                    }.contentShape(Rectangle())
                 }.foregroundStyle(.primary)
             }
         }
@@ -419,20 +421,24 @@ import UIKit
                     HStack {
                         Button("全选未缓存") { selectedDownloads = Set(episodes.indices.filter { cachedDownload($0) == nil }) }
                         Spacer(); Button("取消全选") { selectedDownloads = [] }
-                    }.disabled(downloading)
+                    }.buttonStyle(.borderless).disabled(downloading)
                 }
                 ForEach(Array(episodes.enumerated()), id: \.offset) { index, item in
                     HStack {
                         Button {
                             if selectedDownloads.contains(index) { selectedDownloads.remove(index) } else { selectedDownloads.insert(index) }
-                        } label: { Label(item.name, systemImage: selectedDownloads.contains(index) ? "checkmark.circle.fill" : "circle") }
+                        } label: {
+                            Label(item.name, systemImage: selectedDownloads.contains(index) ? "checkmark.circle.fill" : "circle")
+                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
                         .disabled(downloading || cachedDownload(index) != nil)
                         Spacer()
                         if let cached = cachedDownload(index) {
                             Text(cached.state.label).font(.caption).foregroundStyle(.secondary)
                             if [.queued, .downloading].contains(cached.state) { Button("取消") { downloads.cancel(cached.id) } }
                         }
-                    }
+                    }.buttonStyle(.borderless)
                 }
                 if let error = downloads.storageError { Text(error).font(.caption).foregroundStyle(.red) }
                 if downloads.isRestoring { ProgressView("正在恢复下载记录…") }

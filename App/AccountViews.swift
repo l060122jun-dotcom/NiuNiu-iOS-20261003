@@ -332,8 +332,10 @@ private struct AccountPasswordField: View {
                 if visible { TextField(title, text: $text) }
                 else { SecureField(title, text: $text) }
             }.textInputAutocapitalization(.never).autocorrectionDisabled()
+                .frame(minHeight: 44).contentShape(Rectangle())
             Button { visible.toggle() } label: {
                 Image(systemName: visible ? "eye.slash" : "eye")
+                    .frame(width: 44, height: 44).contentShape(Rectangle())
             }.buttonStyle(.borderless).accessibilityLabel(visible ? "隐藏密码" : "显示密码")
         }
     }
@@ -345,7 +347,7 @@ private struct AccountAvatar: View {
     var body: some View {
         AsyncImage(url: AccountJSON.webURL(url)) { image in image.resizable().scaledToFill() } placeholder: {
             Image(systemName: "person.crop.circle.fill").resizable().foregroundStyle(.secondary)
-        }.frame(width: size, height: size).clipShape(Circle())
+        }.frame(width: size, height: size).clipShape(Circle()).contentShape(Circle())
     }
 }
 
@@ -781,6 +783,8 @@ public struct MemberCenterView: View {
                             Spacer()
                             if AccountJSON.integer(item, "id") == selectedProduct { Image(systemName: "checkmark.circle.fill") }
                         }
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .contentShape(Rectangle())
                     }.buttonStyle(.plain)
                 }
                 if points != nil && products.isEmpty { Text("服务器暂无积分商品") }
@@ -1061,6 +1065,8 @@ public struct MessagesView: View {
                             .font(.subheadline).lineLimit(4).foregroundStyle(.secondary)
                         if !row.original.isEmpty { Text("原评论：" + row.original).font(.caption).lineLimit(2) }
                     }.padding(.vertical, 5)
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .contentShape(Rectangle())
                 }.buttonStyle(.plain)
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if tab == .comments {
@@ -1295,6 +1301,7 @@ public struct AccountLibraryView: View {
                     if editing {
                         Button { if selected.contains(row.id) { selected.remove(row.id) } else { selected.insert(row.id) } } label: {
                             HStack { Image(systemName: selected.contains(row.id) ? "checkmark.circle.fill" : "circle"); libraryRow(row) }
+                                .contentShape(Rectangle())
                         }.buttonStyle(.plain)
                     } else { NavigationLink { DetailView(videoID: row.id) } label: { libraryRow(row) } }
                 }
@@ -1344,9 +1351,9 @@ public struct AccountLibraryView: View {
         HStack(spacing: 12) {
             AsyncImage(url: AccountJSON.webURL(row.poster)) { image in image.resizable().scaledToFill() } placeholder: {
                 Image(systemName: "film").foregroundStyle(.secondary)
-            }.frame(width: 52, height: 70).clipped().cornerRadius(6)
+            }.frame(width: 52, height: 70).clipped().cornerRadius(6).contentShape(Rectangle())
             VStack(alignment: .leading, spacing: 6) { Text(row.title); Text(row.subtitle).font(.caption).foregroundStyle(.secondary) }
-        }
+        }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
     }
     private func snapshotKey() throws -> String {
         try account.requireLogin()

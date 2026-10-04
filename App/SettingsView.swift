@@ -86,14 +86,16 @@ struct SettingsView: View {
                         catch { notice = error.localizedDescription }
                     } label: {
                         Text("退出登录").font(.system(size: 16, weight: .bold))
-                            .foregroundStyle(.secondary).frame(maxWidth: .infinity).frame(height: 40)
+                            .foregroundStyle(.secondary).frame(maxWidth: .infinity).frame(height: 44)
                             .background(BrowseTheme.surface, in: RoundedRectangle(cornerRadius: 20))
+                            .contentShape(Rectangle())
                     }.padding(.horizontal, 73).padding(.top, 12)
                 }
                 if busy { ProgressView().padding() }
                 if let configError {
                     Button { Task { await loadConfig(); await refreshCaches() } } label: {
                         Text("配置加载失败：\(configError)\n点击重试").font(.footnote).foregroundStyle(.secondary)
+                            .frame(minHeight: 44).contentShape(Rectangle())
                     }.padding(15)
                 }
             }
@@ -375,7 +377,7 @@ private struct SettingsUpdateView: View {
                 VStack(alignment: .leading, spacing: 20) {
                     Text(update.content)
                     Text("这是 Android 对照版本的更新通知，不能安装到 iOS。").font(.footnote).foregroundStyle(.secondary)
-                    Button(update.positive.isEmpty ? "查看更新说明" : update.positive) {
+                    Button {
                         // Never redirect an APK download into an iOS installation workflow.
                         guard let url = URL(string: update.link), ["https", "http"].contains(url.scheme?.lowercased() ?? ""),
                               url.pathExtension.lowercased() != "apk" else {
@@ -385,8 +387,14 @@ private struct SettingsUpdateView: View {
                         UIApplication.shared.open(url) { opened in
                             if !opened { Task { @MainActor in message = "无法打开更新说明链接" } }
                         }
+                    } label: {
+                        Text(update.positive.isEmpty ? "查看更新说明" : update.positive)
+                            .frame(minHeight: 44).contentShape(Rectangle())
                     }
-                    Button(update.negative.isEmpty ? "关闭" : update.negative) { dismiss() }
+                    Button { dismiss() } label: {
+                        Text(update.negative.isEmpty ? "关闭" : update.negative)
+                            .frame(minHeight: 44).contentShape(Rectangle())
+                    }
                     if let message { Text(message).font(.footnote).foregroundStyle(.secondary) }
                 }.padding(20)
             }.navigationTitle(update.title.isEmpty ? "版本更新" : update.title)

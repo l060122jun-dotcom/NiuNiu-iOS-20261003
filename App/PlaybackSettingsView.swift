@@ -52,9 +52,9 @@ import Combine
                 Section("系统显示与音量") {
                     VStack(alignment: .leading) {
                         Label("屏幕亮度", systemImage: "sun.max")
-                        Slider(value: $brightness, in: 0...1).onChange(of: brightness) { UIScreen.main.brightness = CGFloat($0) }
+                        Slider(value: $brightness, in: 0...1).frame(minHeight: 44).onChange(of: brightness) { UIScreen.main.brightness = CGFloat($0) }
                     }
-                    VStack(alignment: .leading) { Label("系统媒体音量", systemImage: "speaker.wave.2"); PlaybackVolumeView().frame(height: 32) }
+                    VStack(alignment: .leading) { Label("系统媒体音量", systemImage: "speaker.wave.2"); PlaybackVolumeView().frame(height: 44) }
                 }
                 Section("倍速") {
                     Picker("普通倍速", selection: $settings.rate) {
@@ -99,7 +99,7 @@ import Combine
         let safeValue = Binding(get: { PlaybackPreferences.skipValue(value.wrappedValue) }, set: { value.wrappedValue = PlaybackPreferences.skipValue($0) })
         return VStack(alignment: .leading) {
             Stepper("跳过\(title) \(Int(safeValue.wrappedValue)) 秒", value: safeValue, in: 0...300, step: 1)
-            Slider(value: safeValue, in: 0...300, step: 1)
+            Slider(value: safeValue, in: 0...300, step: 1).frame(minHeight: 44)
         }
     }
 }

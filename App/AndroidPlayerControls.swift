@@ -129,12 +129,18 @@ import MediaPlayer
             icon("电视投屏", "tv", action: onCast)
             if let onPictureInPicture { icon("画中画", "pip", action: onPictureInPicture) }
             icon("播放设置", "gearshape", action: onSettings)
-            Menu { more() } label: { Image(systemName: "ellipsis").frame(width: 40, height: 40) }
+            Menu { more() } label: {
+                Image(systemName: "ellipsis").font(.system(size: 17))
+                    .frame(width: 44, height: 44).contentShape(Rectangle())
+            }
                 .accessibilityLabel("更多播放功能")
                 .simultaneousGesture(TapGesture().onEnded { interaction.show() })
         }
         .padding(.horizontal, wide ? 16 : 4).padding(.top, 4)
-        .background(LinearGradient(colors: [.black.opacity(0.8), .clear], startPoint: .top, endPoint: .bottom))
+        .background {
+            LinearGradient(colors: [.black.opacity(0.8), .clear], startPoint: .top, endPoint: .bottom)
+                .allowsHitTesting(false)
+        }
     }
 
     private var bottomBar: some View {
@@ -145,7 +151,10 @@ import MediaPlayer
                     icon("前进15秒", "goforward.15") { onSeek(time + 15) }
                     Spacer(minLength: 0)
                     icon(danmakuShown ? "关闭弹幕" : "打开弹幕", "text.bubble", action: onDanmaku)
-                    Button("选集 / 换源") { interaction.show(); onEpisodes() }.font(.system(size: 14))
+                    Button { interaction.show(); onEpisodes() } label: {
+                        Text("选集 / 换源").font(.system(size: 14))
+                            .frame(minHeight: 44).contentShape(Rectangle())
+                    }
                     rateMenu
                 }
             }
@@ -157,17 +166,20 @@ import MediaPlayer
                 Slider(value: Binding(get: { safePosition(scrubbing ? scrubTime : time) }, set: { scrubTime = safePosition($0) }), in: 0...safeDuration, onEditingChanged: { active in
                     if active { scrubTime = safePosition(time); scrubbing = true; interaction.begin() }
                     else if scrubbing { onSeek(safePosition(scrubTime)); scrubbing = false; interaction.end() }
-                }).tint(.green).disabled(!duration.isFinite || duration <= 0).accessibilityLabel("播放进度")
+                }).frame(minHeight: 44).tint(.green).disabled(!duration.isFinite || duration <= 0).accessibilityLabel("播放进度")
                 Text(Self.format(duration)).font(.system(size: 11)).monospacedDigit().allowsHitTesting(false)
                 icon(fullScreen ? "退出全屏" : "全屏", fullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right", action: onFullScreen)
             }
         }
         .padding(.horizontal, wide ? 16 : 4).padding(.bottom, 4)
-        .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
+        .background {
+            LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom)
+                .allowsHitTesting(false)
+        }
         .anchorPreference(key: PlayerControlBoundsKey.self, value: .bounds) { [.bottomBar: $0] }
     }
     private var rateMenu: some View {
-        Button { toggleMenu(.rate) } label: { Text(String(format: "%g×", rate)).font(.system(size: 14)).frame(minWidth: 44, minHeight: 40) }
+        Button { toggleMenu(.rate) } label: { Text(String(format: "%g×", rate)).font(.system(size: 14)).frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }
             .accessibilityLabel("播放倍速")
             .anchorPreference(key: PlayerControlBoundsKey.self, value: .bounds) { [.rate: $0] }
     }
@@ -226,8 +238,9 @@ import MediaPlayer
                 ZStack(alignment: .topLeading) {
                 // Only consume an outside tap while a menu is open. No pan/hold or
                 // high-priority recognizers: system navigation edge gestures remain free.
-                Color.clear.contentShape(Rectangle()).onTapGesture { closeMenu() }
-                    .frame(width: geometry.size.width, height: max(0, bottom))
+                Color.clear
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .contentShape(Rectangle()).onTapGesture { closeMenu() }
                 VStack(spacing: 0) {
                     ScrollView(.vertical, showsIndicators: true) {
                         VStack(alignment: .leading, spacing: 0) {
@@ -265,7 +278,8 @@ import MediaPlayer
     }
     private func icon(_ title: String, _ symbol: String, action: @escaping () -> Void) -> some View {
         Button { closeMenu(); interaction.show(); action() } label: {
-            Image(systemName: symbol).font(.system(size: 17)).frame(width: 40, height: 40)
+            Image(systemName: symbol).font(.system(size: 17))
+                .frame(width: 44, height: 44).contentShape(Rectangle())
         }.accessibilityLabel(title)
     }
     private func cancelScrubbing() {
@@ -377,7 +391,7 @@ struct PlayerMenuDisclosure<Content: View>: View {
     }
     static func dismantleUIView(_ view: GestureView, coordinator: ()) { view.cancelInteraction() }
 
-    final class GestureView: UIView {
+    final class GestureView: UIView, UIGestureRecognizerDelegate {
         var configuration: AndroidPlayerGestureSurface?
         private let volumeView = MPVolumeView(frame: CGRect(x: -100, y: -100, width: 80, height: 20))
         private var volumeSlider: UISlider? { volumeView.subviews.compactMap { $0 as? UISlider }.first }
@@ -399,10 +413,18 @@ struct PlayerMenuDisclosure<Content: View>: View {
             let hold = UILongPressGestureRecognizer(target: self, action: #selector(longPress(_:)))
             hold.minimumPressDuration = 0.35; hold.allowableMovement = 12
             let pan = UIPanGestureRecognizer(target: self, action: #selector(pan(_:)))
+            pan.delegate = self
             single.require(toFail: hold); double.require(toFail: hold)
             [single, double, hold, pan].forEach { addGestureRecognizer($0) }
         }
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            guard gestureRecognizer is UIPanGestureRecognizer else { return true }
+            // Reject edge-origin touches before the pan can begin/cancel another
+            // recognizer. Checking only .began sees a point already moved inward.
+            let point = touch.location(in: self)
+            return point.x > 22 && point.x < bounds.width - 20 && point.y > 12 && point.y < bounds.height - 12
+        }
         @objc private func tap() { configuration?.interaction.toggle() }
         @objc private func doubleTap() {
             guard let config = configuration, config.enabled, !config.locked else { return }

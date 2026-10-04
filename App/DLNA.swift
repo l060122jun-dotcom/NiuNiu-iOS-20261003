@@ -789,7 +789,7 @@ struct DLNADeviceView: View {
                         }
                         Spacer()
                         if store.selectedDevice?.id == device.id { Image(systemName: "checkmark.circle.fill") }
-                    }
+                    }.frame(minHeight: 44).contentShape(Rectangle())
                 }.disabled(uiBusy)
             }
             if choosingDevice && store.isCasting {
@@ -814,6 +814,7 @@ struct DLNADeviceView: View {
                     scrubbing = false
                 }
             })
+            .frame(minHeight: 44)
             .disabled(store.duration <= 0 || uiBusy)
             .accessibilityLabel("投屏播放进度")
             HStack {

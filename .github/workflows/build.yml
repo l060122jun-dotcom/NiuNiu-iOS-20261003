@@ -12,6 +12,8 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
+      - name: Check interaction source contracts
+        run: python3 tools/check-hit-regions.py
       - run: brew install xcodegen
       - name: Identify Apple toolchain
         id: toolchain

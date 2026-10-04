@@ -336,7 +336,8 @@ private struct CommentComposeTarget: Identifiable {
                 .refreshable { await store.refresh(); await store.configure() }
             }
             Button { beginCompose(nil, at: false) } label: {
-                HStack { Image(systemName: "square.and.pencil"); Text("也来说一句吧…"); Spacer(); Text("发送").bold() }.padding()
+                HStack { Image(systemName: "square.and.pencil"); Text("也来说一句吧…"); Spacer(); Text("发送").bold() }
+                    .padding().contentShape(Rectangle())
             }.background(.thinMaterial)
         }
         .navigationTitle(parent == nil ? "评论\(store.total.map { "（\($0)）" } ?? "")" : "回复详情")
@@ -400,7 +401,7 @@ private struct CommentComposeTarget: Identifiable {
                         guard AccountStore.shared.isLoggedIn else { showLogin = true; return }
                         confirmation = item; showConfirmation = true
                     }
-                } label: { Image(systemName: "ellipsis").padding(8) }
+                } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44).contentShape(Rectangle()) }
             }
             Text(item.content).font(.body).textSelection(.enabled)
                 .onTapGesture { beginCompose(item, at: false) }
@@ -442,7 +443,7 @@ private struct CommentComposeTarget: Identifiable {
                                     guard AccountStore.shared.isLoggedIn else { showLogin = true; return }
                                     confirmation = preview; showConfirmation = true
                                 }
-                            } label: { Image(systemName: "ellipsis") }
+                            } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44).contentShape(Rectangle()) }
                         }.font(.caption2)
                     }
                     Button("查看全部 \(item.replyCount) 条回复 ›") { detail = item }.font(.caption)
@@ -711,8 +712,9 @@ private struct DanmakuPlacement: Identifiable {
                             .shadow(color: .black, radius: 1, x: 1, y: 1)
                             .fixedSize().padding(.horizontal, 3)
                             .background(placement.item.mine ? Color.white.opacity(0.15) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
-                            .opacity(min(1, max(0.1, store.opacity / 100)))
-                            .position(placement.point)
+                             .opacity(min(1, max(0.1, store.opacity / 100)))
+                             .contentShape(Rectangle())
+                             .position(placement.point)
                             .onTapGesture { selected = placement.item }
                             .onLongPressGesture { selected = placement.item }
                             .accessibilityLabel("弹幕 \(placement.item.content)，点击互动")
@@ -740,7 +742,7 @@ private struct DanmakuPlacement: Identifiable {
     private func hover(_ captured: DanmakuItem) -> some View {
         let item = store.items.first(where: { $0.id == captured.id }) ?? captured
         return VStack(alignment: .leading, spacing: 10) {
-            HStack { Text(item.content).font(.callout).lineLimit(3); Spacer(); Button { selected = nil } label: { Image(systemName: "xmark.circle.fill") } }
+            HStack { Text(item.content).font(.callout).lineLimit(3); Spacer(); Button { selected = nil } label: { Image(systemName: "xmark.circle.fill").frame(width: 44, height: 44).contentShape(Rectangle()) } }
             HStack(spacing: 18) {
                 if item.supportsActions {
                     Button {
@@ -820,7 +822,8 @@ private struct DanmakuPlacement: Identifiable {
                             Button { color = value } label: {
                                 Circle().fill(socialColor(value)).frame(width: 32, height: 32)
                                     .overlay(Circle().stroke(color == value ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: color == value ? 3 : 1))
-                                    .overlay { if color == value { Image(systemName: "checkmark").font(.caption.bold()).foregroundStyle(value == "#FFFFFF" ? .black : .white) } }
+                                     .overlay { if color == value { Image(systemName: "checkmark").font(.caption.bold()).foregroundStyle(value == "#FFFFFF" ? .black : .white) } }
+                                     .frame(width: 44, height: 44).contentShape(Rectangle())
                             }.buttonStyle(.plain).accessibilityLabel("颜色 \(value)").accessibilityAddTraits(color == value ? .isSelected : [])
                         }
                     }.padding(.vertical, 6)
