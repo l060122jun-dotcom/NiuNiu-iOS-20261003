@@ -7,6 +7,7 @@ import IJKMediaFramework
 /// The playback engine is Bilibili's IJKFFMoviePlayerController (FFmpeg), not AVPlayer.
 @MainActor
 final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
+    static var releasePlaybackResource: ((URL) -> Void)?
     @Published private(set) var core: IJKFFMoviePlayerController?
     var view: UIView? { core?.view }
     @Published private(set) var position: Double = 0
@@ -453,7 +454,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         previous?.view?.removeFromSuperview()
         previous?.stop()
         previous?.shutdown() // Official shutdown releases native FFmpeg threads asynchronously.
-        if let releasedURL { SpecialSourceResolver.shared.releasePlayback(url: releasedURL) }
+        if let releasedURL { Self.releasePlaybackResource?(releasedURL) }
     }
 
     private func completeSkip() {
