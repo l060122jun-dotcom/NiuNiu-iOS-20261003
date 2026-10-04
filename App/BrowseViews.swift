@@ -121,9 +121,15 @@ final class BrowseCatalog: ObservableObject {
     @Published private(set) var visibilityContext = ""
     private var visibilityRevision: UInt64 = 0
     private var allCategories: [VideoCategory] = []
+    private var visibilitySignature: String?
     func refreshVisibility() {
-        visibilityRevision &+= 1
-        visibilityContext = "\(visibilityRevision)|\(APIClient.shared.isTeenModeEnabled)"
+        let signature = String(APIClient.shared.isTeenModeEnabled) + String(describing:
+            allCategories.map { [$0.id, $0.name] + $0.filters.keys.sorted().map { "\($0)=\($0.filters[$0] ?? "")" } })
+        if visibilitySignature != signature {
+            visibilitySignature = signature
+            visibilityRevision &+= 1
+            visibilityContext = "\(visibilityRevision)|\(APIClient.shared.isTeenModeEnabled)"
+        }
         var seen = Set<String>()
         categories = allCategories.filter {
             !$0.id.isEmpty && seen.insert($0.id).inserted
@@ -178,13 +184,15 @@ private final class VideoPageStore: ObservableObject {
     @Published private(set) var loading = false
     @Published private(set) var error: String?
     @Published private(set) var hasMore = true
+    @Published var scrollResetRevision = 0
     private var page = 0
     private var generation = UUID()
     private var rankCompleted = false
     var needsFirstPage: Bool { page == 0 && error == nil && hasMore }
     var needsRank: Bool { !rankCompleted && error == nil }
 
-    func loadRank(category: String, order: String, reset: Bool = false) async {
+    func loadRank(category: String, order: String, reset: Bool = false,
+                  shouldCommit: () -> Bool = { true }) async {
         guard reset || !loading else { return }
         generation = UUID()
         let request = generation
@@ -198,14 +206,14 @@ private final class VideoPageStore: ObservableObject {
         do {
             let response = try await APIClient.shared.rank(category: category, order: order)
             try Task.checkCancellation()
-            guard request == generation else { return }
+            guard request == generation, shouldCommit() else { return }
             var seen = Set<String>()
             videos = response.filter { !$0.id.isEmpty && seen.insert($0.id).inserted }
             rankCompleted = true
         } catch is CancellationError {
         } catch {
             guard request == generation else { return }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, shouldCommit() else { return }
             self.error = error.localizedDescription
         }
     }
@@ -250,6 +258,83 @@ private final class VideoPageStore: ObservableObject {
             self.error = error.localizedDescription
         }
     }
+}
+
+/// This is a page-state cache, not a URL/HTTP response cache. Strong ownership
+/// survives SwiftUI destination destruction; completed empty pages and errors
+/// are retained along with page number, hasMore and in-flight request guards.
+@MainActor
+private final class BrowsePageCache {
+    static let shared = BrowsePageCache()
+    private var context = ""
+    private var pages: [String: VideoPageStore] = [:]
+    private var recommendations: [String: RecommendationPageStore] = [:]
+    private var recency: [String] = []
+    private let limit = 64
+
+    static func contextKey(_ catalog: BrowseCatalog) -> String {
+        // APIClient.contextRevision is private. The observable account token,
+        // effective teen mode, metadata revision and persisted endpoint are the
+        // available public context; no APIClient changes are required here.
+        String(describing: [AccountStore.shared.token, catalog.visibilityContext,
+            String(APIClient.shared.isTeenModeEnabled), UserDefaults.standard.string(forKey: "api.baseURL") ?? ""])
+    }
+
+    private func prepare(_ newContext: String, key: String) {
+        if context != newContext {
+            context = newContext
+            pages.removeAll()
+            recommendations.removeAll()
+            recency.removeAll()
+        }
+        recency.removeAll { $0 == key }
+        recency.append(key)
+        while recency.count > limit {
+            let victim = recency.removeFirst()
+            pages.removeValue(forKey: victim)
+            recommendations.removeValue(forKey: victim)
+        }
+    }
+
+    func page(context: String, key: String) -> VideoPageStore {
+        prepare(context, key: key)
+        if let page = pages[key] { return page }
+        let page = VideoPageStore()
+        pages[key] = page
+        return page
+    }
+
+    func recommendation(context: String) -> RecommendationPageStore {
+        let key = "recommendations"
+        prepare(context, key: key)
+        if let page = recommendations[key] { return page }
+        let page = RecommendationPageStore()
+        recommendations[key] = page
+        return page
+    }
+}
+
+@MainActor
+private final class RecommendationPageStore: ObservableObject {
+    @Published var blocks: [Recommendation] = []
+    @Published var loading = false
+    @Published var error: String?
+    @Published var visibleGroups = 4
+    @Published var completed = false
+    @Published var scrollResetRevision = 0
+}
+
+@MainActor
+private struct ObservedVideoPage<Content: View>: View {
+    @ObservedObject var store: VideoPageStore
+    let content: (VideoPageStore) -> Content
+    var body: some View { content(store) }
+}
+
+private func retainBrowseKey(_ key: String, in keys: inout [String], limit: Int = 6) {
+    keys.removeAll { $0 == key }
+    keys.append(key)
+    if keys.count > limit { keys.removeFirst(keys.count - limit) }
 }
 
 @MainActor
@@ -496,6 +581,7 @@ private struct PosterView: View {
     @Environment(\.posterCoordinateSpace) private var coordinateSpace
     @State private var prefetched = false
     @State private var image: UIImage?
+    @State private var loadedURL: String?
     var body: some View {
         GeometryReader { geometry in
             let frame = geometry.frame(in: .named(coordinateSpace))
@@ -517,11 +603,13 @@ private struct PosterView: View {
                         && frame.maxY > -viewportHeight && frame.minY < viewportHeight * 2)
             .onPreferenceChange(PosterPrefetchKey.self) { prefetched = $0 }
             .task(id: "\(url)|\(pixels)|\(eligible)") {
-                image = nil
+                if loadedURL != url { image = nil }
                 guard eligible, let source = URL(string: url), ["http", "https"].contains(source.scheme?.lowercased() ?? "") else { return }
+                guard loadedURL != url || image == nil else { return }
                 let result = await PosterImagePipeline.shared.image(url: source, pixels: pixels)
                 guard !Task.isCancelled else { return }
                 image = result
+                loadedURL = url
             }
             .onDisappear { image = nil; prefetched = false }
         }
@@ -773,6 +861,13 @@ struct HomeView: View {
     @EnvironmentObject private var library: LibraryStore
     @State private var selection = "recommended"
     @State private var dismissedResume: String?
+    @ObservedObject private var account = AccountStore.shared
+    @State private var visited = ["recommended"]
+    @State private var visible = false
+    private var pageContext: String { BrowsePageCache.contextKey(catalog) }
+    private var selectedPage: String {
+        catalog.categories.contains(where: { $0.id == selection }) ? selection : "recommended"
+    }
 
     private var resumeVideo: SavedVideo? {
         guard let video = library.history.first, !video.id.isEmpty,
@@ -783,7 +878,7 @@ struct HomeView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if let error = catalog.error {
+            if let error = catalog.error, catalog.categories.isEmpty {
                 BrowseMessage(title: "分类加载失败", detail: error) { Task { await catalog.load() } }
                 Spacer()
             } else if catalog.loading && catalog.categories.isEmpty {
@@ -791,10 +886,24 @@ struct HomeView: View {
             } else if catalog.categories.isEmpty {
                 BrowseMessage(title: "暂无支持的分类") { Task { await catalog.load() } }
                 Spacer()
-            } else if let category = catalog.categories.first(where: { $0.id == selection }) {
-                CategoryVideosView(category: category).id(category.id)
             } else {
-                RecommendationsView()
+                GeometryReader { viewport in
+                    ZStack {
+                        ForEach(visited, id: \.self) { key in
+                            Group {
+                                if key == "recommended" {
+                                    RecommendationsView(active: visible && selectedPage == key)
+                                } else if let category = catalog.categories.first(where: { $0.id == key }) {
+                                    CategoryVideosView(category: category, active: visible && selectedPage == key)
+                                }
+                            }
+                            .frame(width: viewport.size.width, height: viewport.size.height)
+                            .opacity(selectedPage == key ? 1 : 0)
+                            .allowsHitTesting(visible && selectedPage == key)
+                            .accessibilityHidden(!visible || selectedPage != key)
+                        }
+                    }
+                }.id(pageContext)
             }
         }
         .background(BrowseTheme.background)
@@ -827,12 +936,20 @@ struct HomeView: View {
                         Image(systemName: "xmark").font(.caption.bold()).foregroundStyle(.secondary)
                             .frame(width: 44, height: 44)
                     }.accessibilityLabel("关闭继续观看提示，不删除观看历史")
-                }.padding(12).background(BrowseTheme.surface, in: RoundedRectangle(cornerRadius: 20))
+                }.frame(height: 42).padding(12).background(BrowseTheme.surface, in: RoundedRectangle(cornerRadius: 20))
                     .overlay { RoundedRectangle(cornerRadius: 20).stroke(BrowseTheme.accent.opacity(0.18), lineWidth: 1) }
                     .padding(.horizontal).padding(.vertical, 8).background(BrowseTheme.background.opacity(0.96))
+            } else {
+                // Keep the retained scroll viewport unchanged when history or
+                // dismissal changes while navigating to and from a detail page.
+                Color.clear.frame(height: 82).accessibilityHidden(true)
             }
         }
         .modifier(SearchMorphHost())
+        .onAppear { visible = true; retainBrowseKey(selectedPage, in: &visited) }
+        .onDisappear { visible = false }
+        .onChange(of: selectedPage) { retainBrowseKey($0, in: &visited) }
+        .onChange(of: pageContext) { _ in visited = [selectedPage] }
     }
 }
 
@@ -840,21 +957,27 @@ struct HomeView: View {
 private struct RecommendationsView: View {
     @EnvironmentObject private var catalog: BrowseCatalog
     @ObservedObject private var account = AccountStore.shared
-    @State private var blocks: [Recommendation] = []
-    @State private var loading = false
-    @State private var error: String?
-    @State private var visibleGroups = 4
-    @State private var lastRequestKey: String?
-    @State private var completed = false
-    @State private var scrollResetRevision = 0
-    private var requestKey: String {
-        "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|" + catalog.categories.map(\.id).joined(separator: "|")
+    var active = true
+    var body: some View {
+        let context = BrowsePageCache.contextKey(catalog)
+        RecommendationPageView(active: active,
+            store: BrowsePageCache.shared.recommendation(context: context), requestKey: context)
+            .id(context)
     }
+}
+
+@MainActor
+private struct RecommendationPageView: View {
+    @EnvironmentObject private var catalog: BrowseCatalog
+    @ObservedObject private var account = AccountStore.shared
+    let active: Bool
+    @ObservedObject var store: RecommendationPageStore
+    let requestKey: String
 
     var body: some View {
-        BrowseScroll(resetKey: requestKey, resetRevision: scrollResetRevision) {
+        BrowseScroll(resetRevision: store.scrollResetRevision, active: active) {
             VStack(alignment: .leading, spacing: 22) {
-                if lastRequestKey == requestKey, let video = blocks.first?.videos.first {
+                if let video = store.blocks.first?.videos.first {
                     NavigationLink { DetailView(videoID: video.id) } label: {
                         HStack(spacing: 18) {
                             VStack(alignment: .leading, spacing: 12) {
@@ -873,7 +996,7 @@ private struct RecommendationsView: View {
                     }.buttonStyle(BrowsePressStyle()).padding(.horizontal)
                         .modifier(BrowseAnchor(id: "recommend.hero." + video.id))
                 }
-                ForEach(Array((lastRequestKey == requestKey ? blocks : []).prefix(visibleGroups))) { block in
+                ForEach(Array(store.blocks.prefix(store.visibleGroups))) { block in
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             RoundedRectangle(cornerRadius: 2).fill(BrowseTheme.green).frame(width: 4, height: 20)
@@ -889,62 +1012,56 @@ private struct RecommendationsView: View {
                         VideoGrid(videos: Array(block.videos.prefix(6)), columns: 3, anchorPrefix: "recommend.\(block.id).")
                     }
                 }
-                if lastRequestKey == requestKey, !blocks.isEmpty {
-                    RecommendationGroupsFooter(visibleGroups: $visibleGroups, total: blocks.count,
-                                               enabled: !loading && error == nil)
+                if !store.blocks.isEmpty {
+                    RecommendationGroupsFooter(visibleGroups: $store.visibleGroups, total: store.blocks.count,
+                                               enabled: active && !store.loading && store.error == nil)
                 }
-                if loading { ProgressView("正在加载推荐…").frame(maxWidth: .infinity).padding() }
-                if let error = error {
+                if store.loading { ProgressView("正在加载推荐…").frame(maxWidth: .infinity).padding() }
+                if let error = store.error {
                     BrowseMessage(title: "推荐加载失败", detail: error) { Task { await load() } }
-                } else if !loading && blocks.isEmpty {
+                } else if !store.loading && store.blocks.isEmpty {
                     BrowseMessage(title: "暂无推荐", detail: "可切换上方分类浏览影片")
                 }
             }.padding(.vertical)
         }
-        .task(id: requestKey) {
-            if lastRequestKey != requestKey {
-                lastRequestKey = requestKey
-                blocks = []
-                visibleGroups = 4
-                completed = false
-                error = nil
-            }
-            while loading {
+        .task(id: "\(requestKey)|\(active)") {
+            guard active else { return }
+            while store.loading {
                 do { try await Task.sleep(nanoseconds: 20_000_000) } catch { return }
             }
-            guard !Task.isCancelled, !completed, error == nil else { return }
+            guard !Task.isCancelled, !store.completed, store.error == nil else { return }
             await load()
         }
         .refreshable {
-            scrollResetRevision += 1
-            visibleGroups = 4
+            store.scrollResetRevision += 1
+            store.visibleGroups = 4
             await load()
         }
         .background(BrowseTheme.background)
     }
 
     @MainActor private func load() async {
-        guard !loading else { return }
-        loading = true
+        guard active, !store.loading else { return }
+        store.loading = true
         let identity = requestKey
-        error = nil
-        defer { loading = false }
+        store.error = nil
+        defer { store.loading = false }
         do {
             let response = try await APIClient.shared.recommendations()
             try Task.checkCancellation()
-            guard identity == requestKey else { return }
+            guard identity == BrowsePageCache.contextKey(catalog) else { return }
             var seen = Set<String>()
-            blocks = response.filter { catalog.accepts($0) && !$0.videos.isEmpty && seen.insert($0.id).inserted }
+            store.blocks = response.filter { catalog.accepts($0) && !$0.videos.isEmpty && seen.insert($0.id).inserted }
                 .map { block in
                     var videos = Set<String>()
                     return Recommendation(id: block.id, title: block.title,
                                           videos: block.videos.filter { !$0.id.isEmpty && videos.insert($0.id).inserted })
                 }
-            completed = true
+            store.completed = true
         } catch is CancellationError {
         } catch {
-            guard !Task.isCancelled, identity == requestKey else { return }
-            self.error = error.localizedDescription
+            guard !Task.isCancelled, identity == BrowsePageCache.contextKey(catalog) else { return }
+            store.error = error.localizedDescription
         }
     }
 }
@@ -952,18 +1069,19 @@ private struct RecommendationsView: View {
 @MainActor
 struct CategoryVideosView: View {
     let category: VideoCategory
+    var active = true
     @EnvironmentObject private var catalog: BrowseCatalog
     @ObservedObject private var account = AccountStore.shared
-    @StateObject private var store = VideoPageStore()
     @State private var filters: [String: String] = ["by": "time"]
     @AppStorage("niuniu.gridColumns") private var columnCount = 3
     @State private var showFilters = false
-    @State private var lastRequestKey: String?
-    @State private var scrollResetRevision = 0
+    @State private var visited: [String] = []
+    @State private var pageFilters: [String: [String: String]] = [:]
 
     private var requestKey: String {
-        "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|" + category.id + filters.keys.sorted().map { "|\($0)=\(filters[$0] ?? "")" }.joined()
+        "category|" + String(describing: [category.id] + filters.keys.sorted().filter { !(filters[$0] ?? "").isEmpty }.map { "\($0)=\(filters[$0] ?? "")" })
     }
+    private var context: String { BrowsePageCache.contextKey(catalog) }
 
     private func binding(_ key: String) -> Binding<String> {
         Binding(get: { filters[key] ?? "" }, set: { filters[key] = $0 })
@@ -978,7 +1096,13 @@ struct CategoryVideosView: View {
     }
 
     var body: some View {
-        BrowseScroll(resetKey: requestKey, resetRevision: scrollResetRevision) {
+        GeometryReader { viewport in
+            ZStack {
+                ForEach(visited.contains(requestKey) ? visited : Array((visited + [requestKey]).suffix(6)), id: \.self) { key in
+                    let snapshot = pageFilters[key] ?? filters
+                    let pageActive = active && key == requestKey
+                    ObservedVideoPage(store: BrowsePageCache.shared.page(context: context, key: key)) { store in
+        BrowseScroll(resetRevision: store.scrollResetRevision, active: pageActive) {
             VStack(spacing: 12) {
                 ChoiceStrip(title: "排序", choices: [Choice(id: "time", title: "最新"), Choice(id: "hits", title: "最热"), Choice(id: "score", title: "评分")], selection: binding("by"))
                     .padding(.horizontal, 8)
@@ -993,32 +1117,42 @@ struct CategoryVideosView: View {
                             .font(.caption).frame(minHeight: 44)
                     }.accessibilityLabel("切换为\(columnCount == 2 ? "三" : "两")列布局")
                 }.padding(.horizontal)
-                if !filterSummary.isEmpty {
-                    Text(filterSummary).font(.caption).foregroundStyle(.secondary)
+                let summary = ["class", "area", "year", "state"].compactMap { snapshot[$0] }.filter { !$0.isEmpty }.joined(separator: " · ")
+                if !summary.isEmpty {
+                    Text(summary).font(.caption).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
                 }
-                VideoGrid(videos: lastRequestKey == requestKey ? store.videos : [], columns: columnCount == 2 ? 2 : 3)
-                PagingFooter(store: store, automaticLoad: { await load(reset: false) }) {
-                    Task { await load(reset: false) }
+                VideoGrid(videos: store.videos, columns: columnCount == 2 ? 2 : 3)
+                PagingFooter(store: store, automaticEnabled: pageActive, automaticLoad: { await load(store, filters: snapshot, reset: false, active: pageActive) }) {
+                    Task { await load(store, filters: snapshot, reset: false, active: pageActive) }
                 }
             }.padding(.vertical, 10)
         }
-        .task(id: requestKey) {
-            if lastRequestKey != requestKey {
-                lastRequestKey = requestKey
-                await load(reset: true)
-            } else if store.needsFirstPage {
+        .task(id: "\(context)|\(key)|\(pageActive)") {
+            guard pageActive else { return }
+            if store.needsFirstPage {
                 while store.loading {
                     do { try await Task.sleep(nanoseconds: 20_000_000) } catch { return }
                 }
                 guard !Task.isCancelled, store.needsFirstPage else { return }
-                await load(reset: false)
+                await load(store, filters: snapshot, reset: false, active: pageActive)
             }
         }
         .refreshable {
-            scrollResetRevision += 1
-            await load(reset: true)
+            store.scrollResetRevision += 1
+            await load(store, filters: snapshot, reset: true, active: pageActive)
         }
+                    }
+                    .frame(width: viewport.size.width, height: viewport.size.height)
+                    .opacity(pageActive ? 1 : 0)
+                    .allowsHitTesting(pageActive)
+                    .accessibilityHidden(!pageActive)
+                }
+            }
+        }.id(context)
+        .onAppear { rememberPage() }
+        .onChange(of: requestKey) { _ in rememberPage() }
+        .onChange(of: context) { _ in visited = []; pageFilters = [:]; rememberPage() }
         .background(BrowseTheme.background)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
@@ -1040,14 +1174,17 @@ struct CategoryVideosView: View {
         }
     }
 
-    private var filterSummary: String {
-        ["class", "area", "year", "state"].compactMap { filters[$0] }
-            .filter { !$0.isEmpty }.joined(separator: " · ")
+    private func rememberPage() {
+        pageFilters[requestKey] = filters
+        retainBrowseKey(requestKey, in: &visited)
+        pageFilters = pageFilters.filter { visited.contains($0.key) }
     }
 
-    private func load(reset: Bool) async {
-        guard reset || lastRequestKey == requestKey else { return }
-        await store.load(reset: reset, category: category.id, filters: filters.filter { !$0.value.isEmpty })
+    private func load(_ store: VideoPageStore, filters: [String: String], reset: Bool, active: Bool) async {
+        guard active else { return }
+        let identity = context
+        await store.load(reset: reset, category: category.id, filters: filters.filter { !$0.value.isEmpty },
+                         shouldCommit: { identity == BrowsePageCache.contextKey(catalog) })
     }
 }
 
@@ -1055,14 +1192,15 @@ struct CategoryVideosView: View {
 struct RankingView: View {
     @EnvironmentObject private var catalog: BrowseCatalog
     @ObservedObject private var account = AccountStore.shared
-    @StateObject private var store = VideoPageStore()
     @State private var categoryID = ""
     @State private var order = ""
-    @State private var lastRequestKey: String?
-    @State private var scrollResetRevision = 0
+    @State private var visited: [String] = []
+    @State private var parameters: [String: [String]] = [:]
+    @State private var visible = false
     private var requestKey: String {
-        "\(account.token)|\(catalog.visibilityContext)|\(APIClient.shared.isTeenModeEnabled)|\(selectedID)|\(selectedOrder)"
+        "rank|" + String(describing: [selectedID, selectedOrder])
     }
+    private var context: String { BrowsePageCache.contextKey(catalog) }
     private var selectedID: String { catalog.categories.first(where: { $0.id == categoryID })?.id ?? catalog.categories.first?.id ?? "" }
     private var rankChoices: [Choice] {
         let category = catalog.categories.first { $0.id == selectedID }
@@ -1084,7 +1222,13 @@ struct RankingView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-              BrowseScroll(resetKey: requestKey, resetRevision: scrollResetRevision) {
+            GeometryReader { viewport in
+                ZStack {
+                    ForEach(visited.contains(requestKey) ? visited : Array((visited + [requestKey]).suffix(6)), id: \.self) { key in
+                        let snapshot = parameters[key] ?? [selectedID, selectedOrder]
+                        let pageActive = visible && key == requestKey
+                        ObservedVideoPage(store: BrowsePageCache.shared.page(context: context, key: key)) { store in
+               BrowseScroll(resetRevision: store.scrollResetRevision, active: pageActive) {
                  VStack(spacing: 14) {
                      HStack(alignment: .bottom) {
                          VStack(alignment: .leading, spacing: 6) {
@@ -1097,16 +1241,16 @@ struct RankingView: View {
                          Image(systemName: "chart.bar.xaxis").font(.system(size: 32, weight: .light))
                              .foregroundStyle(BrowseTheme.accent)
                      }.frame(maxWidth: .infinity, alignment: .leading).padding(.bottom, 6)
-                     if let error = catalog.error {
+                      if let error = catalog.error, catalog.categories.isEmpty {
                         BrowseMessage(title: "分类加载失败", detail: error) { Task { await catalog.load() } }
-                    } else if catalog.loading {
+                     } else if catalog.loading && catalog.categories.isEmpty {
                         ProgressView().padding()
-                    } else if selectedID.isEmpty {
+                     } else if snapshot[0].isEmpty {
                         BrowseMessage(title: "暂无支持的分类")
-                    } else if selectedOrder.isEmpty {
+                     } else if snapshot[1].isEmpty {
                         BrowseMessage(title: "当前分类暂无榜单", detail: "榜单类型以服务端提供的配置为准")
                     } else {
-                        ForEach(Array((lastRequestKey == requestKey ? store.videos : []).enumerated()), id: \.element.id) { index, video in
+                        ForEach(Array(store.videos.enumerated()), id: \.element.id) { index, video in
                             NavigationLink { DetailView(videoID: video.id) } label: {
                                 HStack(alignment: .top, spacing: 14) {
                                     PosterView(url: video.poster).frame(width: 92)
@@ -1128,16 +1272,32 @@ struct RankingView: View {
                         }
                         if store.loading { ProgressView("正在加载榜单…").padding() }
                         else if let error = store.error {
-                            BrowseMessage(title: "榜单加载失败", detail: error) { Task { await load() } }
+                            BrowseMessage(title: "榜单加载失败", detail: error) { Task { await load(store, parameters: snapshot, active: pageActive) } }
                         } else if store.videos.isEmpty {
                             BrowseMessage(title: "暂无上榜影片", detail: "稍后刷新，或切换其他分类")
                         }
                     }
                 }.padding()
              }.refreshable {
-                 scrollResetRevision += 1
-                 await load(reset: true)
-            }
+                  store.scrollResetRevision += 1
+                  await load(store, parameters: snapshot, active: pageActive, reset: true)
+             }
+              .task(id: "\(context)|\(key)|\(pageActive)") {
+                  guard pageActive else { return }
+                  while store.loading {
+                      do { try await Task.sleep(nanoseconds: 20_000_000) } catch { return }
+                  }
+                  guard !Task.isCancelled, store.needsRank else { return }
+                  await load(store, parameters: snapshot, active: pageActive)
+              }
+                        }
+                        .frame(width: viewport.size.width, height: viewport.size.height)
+                        .opacity(pageActive ? 1 : 0)
+                        .allowsHitTesting(pageActive)
+                        .accessibilityHidden(!pageActive)
+                    }
+                }
+            }.id(context)
         }
         .background(BrowseTheme.background)
         .safeAreaInset(edge: .top, spacing: 0) {
@@ -1151,23 +1311,24 @@ struct RankingView: View {
             }.modifier(FloatingBrowseHeader())
         }
         .navigationTitle("榜单").navigationBarTitleDisplayMode(.inline)
-        .task(id: requestKey) {
-            if lastRequestKey != requestKey {
-                lastRequestKey = requestKey
-                await load(reset: true)
-            } else if store.needsRank {
-                while store.loading {
-                    do { try await Task.sleep(nanoseconds: 20_000_000) } catch { return }
-                }
-                guard !Task.isCancelled, store.needsRank else { return }
-                await load()
-            }
-        }
+        .onAppear { visible = true; rememberPage() }
+        .onDisappear { visible = false }
+        .onChange(of: requestKey) { _ in rememberPage() }
+        .onChange(of: context) { _ in visited = []; parameters = [:]; rememberPage() }
         .modifier(SearchMorphHost())
     }
 
-    private func load(reset: Bool = false) async {
-        await store.loadRank(category: selectedID, order: selectedOrder, reset: reset)
+    private func rememberPage() {
+        parameters[requestKey] = [selectedID, selectedOrder]
+        retainBrowseKey(requestKey, in: &visited)
+        parameters = parameters.filter { visited.contains($0.key) }
+    }
+
+    private func load(_ store: VideoPageStore, parameters: [String], active: Bool, reset: Bool = false) async {
+        guard active else { return }
+        let identity = context
+        await store.loadRank(category: parameters[0], order: parameters[1], reset: reset,
+                             shouldCommit: { identity == BrowsePageCache.contextKey(catalog) })
     }
 }
 
