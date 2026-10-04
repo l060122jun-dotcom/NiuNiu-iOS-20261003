@@ -1435,6 +1435,7 @@ struct SearchView: View {
     var onCancel: (() -> Void)? = nil
     @Environment(\.searchMorphNamespace) private var searchNamespace
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var catalog: BrowseCatalog
     @ObservedObject private var account = AccountStore.shared
@@ -1486,8 +1487,8 @@ struct SearchView: View {
                         .matchedGeometryEffect(id: "browse.search.pill", in: namespace, isSource: morphPresented)
                 } else { GlassSearchPill() }
             }
-            if let onCancel = onCancel {
-                Button("取消") { focused = false; onCancel() }
+            if onCancel != nil {
+                Button("取消", action: closeSearch)
                     .frame(minHeight: 44).accessibilityLabel("取消搜索，返回原列表位置")
             }
         }.padding(.horizontal).padding(.vertical, 6)
@@ -1601,6 +1602,14 @@ struct SearchView: View {
             BrowseTheme.background.ignoresSafeArea(.container, edges: .all)
         }
         .navigationTitle("搜索").navigationBarTitleDisplayMode(.inline)
+        .simultaneousGesture(DragGesture(minimumDistance: 18, coordinateSpace: .local)
+            .onEnded { value in
+                guard morphPresented, morphReady, value.startLocation.x >= 0,
+                      value.startLocation.x <= 24,
+                      value.translation.width >= 70,
+                      value.translation.width > abs(value.translation.height) * 1.5 else { return }
+                closeSearch()
+            })
         .onChange(of: morphReady) { ready in
             // Focus only after expansion. A detail pop does not rerun this edge
             // or force the keyboard over retained search results.
@@ -1648,6 +1657,11 @@ struct SearchView: View {
                 await load(reset: false)
             }
         }
+    }
+    private func closeSearch() {
+        focused = false
+        if let onCancel { onCancel() }
+        else { dismiss() }
     }
 
     private func submit(_ value: String) {
