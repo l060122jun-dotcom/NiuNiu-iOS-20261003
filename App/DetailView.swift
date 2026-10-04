@@ -120,11 +120,9 @@ import UIKit
             else if suspended {
                 suspended = false
                 danmaku.retry()
-                if let resolved {
-                    playback.load(resolved.url, headers: resolved.headers, resume: time)
-                    playback.setRate(settings.rate)
-                    if !resumeAfterNavigation { playback.pause() }
-                } else { startEpisode(episodeIndex, resume: time) }
+                // A signed URL or local capability is not a durable permission.
+                // Re-read authoritative metadata in the current account/mode context.
+                await resumeDetailPlayback()
             }
         }
         .onReceive(clock) { _ in tickTimer() }
@@ -559,6 +557,32 @@ import UIKit
             await loadRelated()
         } catch is CancellationError {} catch { failure = error.localizedDescription }
     }
+    private func resumeDetailPlayback() async {
+        let oldSourceID = source?.id
+        let oldEpisodeURL = episode?.url
+        let oldIndex = episodeIndex
+        let resume = time
+        resolved = nil
+        do {
+            let refreshed = try await APIClient.shared.detail(id: videoID)
+            try Task.checkCancellation()
+            guard !suspended, let oldSourceID, let oldEpisodeURL,
+                  let selected = refreshed.sources.firstIndex(where: { $0.id == oldSourceID }),
+                  refreshed.sources.filter({ $0.id == oldSourceID }).count == 1,
+                  refreshed.sources[selected].episodes.indices.contains(oldIndex),
+                  refreshed.sources[selected].episodes[oldIndex].url == oldEpisodeURL else {
+                failure = "原播放线路或剧集已变更，请重新选择后播放。"
+                return
+            }
+            video = refreshed
+            sourceIndex = selected
+            episodeIndex = oldIndex
+            startEpisode(oldIndex, resume: resume, preferSuccessful: false,
+                         preservePaused: !resumeAfterNavigation)
+        } catch is CancellationError {} catch {
+            if !suspended { failure = "恢复播放需重新确认权限与地址：\(error.localizedDescription)" }
+        }
+    }
     private func loadRelated() async {
         do { related = try await APIClient.shared.related(id: videoID); relatedFailure = nil }
         catch { relatedFailure = error.localizedDescription }
@@ -764,7 +788,7 @@ import UIKit
             if poster, let video {
                 var image: UIImage?
                 if let posterURL = URL(string: video.poster), ["https", "http"].contains(posterURL.scheme?.lowercased() ?? "") {
-                    let (data, response) = try await URLSession.shared.data(from: posterURL)
+                    let (data, response) = try await BoundedHTTP.data(for: URLRequest(url: posterURL), session: .shared, limit: 10 * 1024 * 1024)
                     guard (response as? HTTPURLResponse)?.statusCode == 200, data.count <= 10 * 1024 * 1024 else { throw APIError.invalidResponse }
                     image = UIImage(data: data)
                 }

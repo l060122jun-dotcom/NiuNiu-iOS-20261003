@@ -21,6 +21,10 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
     private weak var cachedRoot: UIViewController?
     private var originalInteraction = true
     private var originalAccessibilityHidden = false
+    private var originalMask: CALayer?
+    private var refreshPending = false
+    private var refreshing = false
+    private var invalidated = false
     private var displayLink: CADisplayLink?
     private var idleTimer: Timer?
     private var visibilityObservers: [NSKeyValueObservation] = []
@@ -61,14 +65,12 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         capsule.layer.cornerRadius = 35
         capsule.clipsToBounds = true
         capsule.isHidden = true
-        addChild(glass)
         glass.view.backgroundColor = .clear
         glass.view.isUserInteractionEnabled = false
         glass.view.accessibilityElementsHidden = true
         indicator.isUserInteractionEnabled = false
         // Explicit sibling ordering: glass -> selection -> native item controls.
-        capsule.addSubview(glass.view)
-        glass.didMove(toParent: self)
+        // The hosting view is mounted only after addChild, in refreshNow().
         capsule.addSubview(indicator)
         capsule.addSubview(compactBar)
         compactBar.delegate = self
@@ -95,12 +97,73 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         displayLink?.invalidate()
         idleTimer?.invalidate()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
+        // The normal path is dismantle() on MainActor. Keep a fallback that
+        // does not call UIKit from a potentially nonisolated deinitializer.
+        let host = glass
+        let overlay = capsule
+        let owner = nativeController
+        let mask = emptyMask
+        let savedMask = originalMask
+        let interaction = originalInteraction
+        let accessibilityHidden = originalAccessibilityHidden
+        DispatchQueue.main.async {
+            if host.parent != nil { host.willMove(toParent: nil) }
+            host.viewIfLoaded?.removeFromSuperview()
+            if host.parent != nil { host.removeFromParent() }
+            overlay.removeFromSuperview()
+            if let bar = owner?.tabBar, bar.layer.mask === mask {
+                bar.layer.mask = savedMask
+                bar.isUserInteractionEnabled = interaction
+                bar.accessibilityElementsHidden = accessibilityHidden
+            }
+        }
+    }
+
+    override func willMove(toParent parent: UIViewController?) {
+        if parent == nil { unmount() }
+        super.willMove(toParent: parent)
+    }
+
+    override func didMove(toParent parent: UIViewController?) {
+        super.didMove(toParent: parent)
+        if parent != nil { refresh() }
+    }
+
+    /// SwiftUI owns this bridge, but UIKit owns the mounted decorative child.
+    /// Explicit teardown is required before the bridge itself is released.
+    func dismantle() {
+        guard !invalidated else { return }
+        invalidated = true
+        onSelect = nil
+        displayLink?.invalidate()
+        displayLink = nil
+        idleTimer?.invalidate()
+        idleTimer = nil
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
+        unmount()
+    }
+
+    private func unmount() {
+        visibilityObservers.removeAll()
+        if glass.parent != nil { glass.willMove(toParent: nil) }
+        glass.viewIfLoaded?.removeFromSuperview()
+        if glass.parent != nil { glass.removeFromParent() }
         capsule.removeFromSuperview()
+        capsule.isHidden = true
+        capsule.isUserInteractionEnabled = false
         if let bar = nativeController?.tabBar, bar.layer.mask === emptyMask {
-            bar.layer.mask = nil
+            bar.layer.mask = originalMask
             bar.isUserInteractionEnabled = originalInteraction
             bar.accessibilityElementsHidden = originalAccessibilityHidden
         }
+        nativeController = nil
+        cachedRoot = nil
+        originalMask = nil
+        layoutFrame = nil
+        itemState = nil
+        lastTransition = nil
+        displayLink?.isPaused = true
     }
 
     override func viewDidLayoutSubviews() { super.viewDidLayoutSubviews(); startBurst(); refresh() }
@@ -111,8 +174,30 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
     }
 
     func refresh() {
-        guard isViewLoaded else { return }
-        guard active else { displayLink?.isPaused = true; return }
+        // MainActor alone does not prevent SwiftUI update-transaction reentry.
+        // Coalesce all signals and mutate containment/rootView on the next turn.
+        guard !invalidated, !refreshPending else { return }
+        refreshPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.refreshPending = false
+            self.refreshNow()
+        }
+    }
+
+    private func refreshNow() {
+        guard !invalidated, isViewLoaded else { return }
+        guard !refreshing else { refresh(); return }
+        refreshing = true
+        defer { refreshing = false }
+        guard parent != nil, viewIfLoaded?.window != nil else { unmount(); return }
+        guard active else {
+            capsule.isHidden = true
+            capsule.isUserInteractionEnabled = false
+            itemState = nil
+            displayLink?.isPaused = true
+            return
+        }
         var root: UIViewController = self
         while let parent = root.parent { root = parent }
         let owner: UITabBarController?
@@ -123,24 +208,19 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
             owner = findTabController(root)
         }
         guard let owner = owner, owner.viewIfLoaded?.window != nil else {
-            capsule.isHidden = true
-            itemState = nil
-            displayLink?.isPaused = true
+            unmount()
             return
         }
         let native = owner.tabBar
         if nativeController !== owner {
-            if let previous = nativeController?.tabBar, previous.layer.mask === emptyMask {
-                previous.layer.mask = nil
-                previous.isUserInteractionEnabled = originalInteraction
-                previous.accessibilityElementsHidden = originalAccessibilityHidden
-            }
+            unmount()
             nativeController = owner
             cachedRoot = root
             layoutFrame = nil
             itemState = nil
             originalInteraction = native.isUserInteractionEnabled
             originalAccessibilityHidden = native.accessibilityElementsHidden
+            originalMask = native.layer.mask
             visibilityObservers = [
                 native.observe(\.isHidden, options: [.new]) { [weak self] _, _ in
                     DispatchQueue.main.async { self?.nativeVisibilityChanged() }
@@ -156,7 +236,22 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
         if native.layer.mask !== emptyMask { native.layer.mask = emptyMask }
         if native.isUserInteractionEnabled { native.isUserInteractionEnabled = false }
         if !native.accessibilityElementsHidden { native.accessibilityElementsHidden = true }
-        if capsule.superview !== owner.view { capsule.removeFromSuperview(); owner.view.addSubview(capsule) }
+        // The hosting controller must belong to the same controller whose view
+        // contains its root view. UIKit 26 enforces this during window attachment.
+        if glass.parent !== owner || capsule.superview !== owner.view || glass.view.superview !== capsule {
+            if glass.parent != nil {
+                glass.willMove(toParent: nil)
+                glass.view.removeFromSuperview()
+                glass.removeFromParent()
+            }
+            capsule.removeFromSuperview()
+            owner.addChild(glass)
+            capsule.insertSubview(glass.view, at: 0)
+            owner.view.addSubview(capsule)
+            glass.didMove(toParent: owner)
+            layoutFrame = nil
+            itemState = nil
+        }
 
         let bounds = owner.view.bounds
         let safe = owner.view.safeAreaInsets
@@ -242,7 +337,7 @@ final class GlassTabContainer: UIViewController, UITabBarDelegate {
     }
 
     private func startBurst(duration: CFTimeInterval = 0.5) {
-        guard active else { return }
+        guard active, !invalidated else { return }
         burstDeadline = max(burstDeadline, CACurrentMediaTime() + duration)
         displayLink?.isPaused = false
     }

@@ -1,6 +1,7 @@
 import Foundation
 import Security
 import Network
+import CryptoKit
 
 enum SpecialSourceError: LocalizedError {
     case configuration(String), response(String), verification, advertisingGate, authorization
@@ -27,6 +28,11 @@ enum SpecialResolvePurpose: Equatable { case playback, download }
 final class SpecialSourceResolver {
     static let shared = SpecialSourceResolver()
     private var activeProxy: SpecialHLSProxy?
+    private var activePlaybackURL: URL?
+    private var accountScope = SpecialSourceResolver.accountDigest("")
+    private static func accountDigest(_ token: String) -> String {
+        SHA256.hash(data: Data(("special-account-v1:" + token).utf8)).map { String(format: "%02x", $0) }.joined()
+    }
     private var initialization: [String: (id: UUID, task: Task<String, Error>)] = [:]
     private var contextGeneration: UInt64 = 0
     private var playbackGeneration: UInt64 = 0
@@ -43,13 +49,15 @@ final class SpecialSourceResolver {
     }
 
     /// Account/mode/domain changes retire all credentials-in-flight and owned media sessions.
-    func invalidateContext() {
+    func invalidateContext(accountToken: String? = nil) {
+        if let accountToken { accountScope = Self.accountDigest(accountToken) }
         contextGeneration &+= 1
         playbackGeneration &+= 1
         initialization.values.forEach { $0.task.cancel() }
         initialization.removeAll()
         hemaClock.removeAll()
         activeProxy?.stop(); activeProxy = nil
+        activePlaybackURL = nil
         downloadProxies.values.forEach { $0.stop() }; downloadProxies.removeAll()
     }
 
@@ -80,7 +88,7 @@ final class SpecialSourceResolver {
             hemaClock.removeValue(forKey: namespace)
         }
         // Do not advance the global playback generation or stop another source's player.
-        if let proxy = activeProxy, namespaces.contains(proxy.namespace) { proxy.stop(); activeProxy = nil }
+        if let proxy = activeProxy, namespaces.contains(proxy.namespace) { proxy.stop(); activeProxy = nil; activePlaybackURL = nil }
         let downloads = downloadProxies.filter { namespaces.contains($0.value.namespace) }.map(\.key)
         for url in downloads { downloadProxies.removeValue(forKey: url)?.stop() }
         var removed = 0
@@ -95,7 +103,7 @@ final class SpecialSourceResolver {
 
     func resolve(episode: Episode, source: String, config: [String: Any], purpose: SpecialResolvePurpose = .playback) async throws -> ResolvedVideo {
         try Task.checkCancellation()
-        let settings = try SpecialSettings(source: source, config: config)
+        let settings = try SpecialSettings(source: source, config: config, accountScope: accountScope)
         if namespaceGenerations[settings.namespace] == nil { namespaceGenerations[settings.namespace] = 0 }
         let context = contextGeneration
         let generation = namespaceGenerations[settings.namespace, default: 0]
@@ -165,6 +173,7 @@ final class SpecialSourceResolver {
             if purpose == .playback {
                 let previous = activeProxy
                 activeProxy = proxy
+                activePlaybackURL = local
                 previous?.stop()
             } else { downloadProxies[local] = proxy }
             return ResolvedVideo(url: local)
@@ -172,7 +181,13 @@ final class SpecialSourceResolver {
     }
 
     /// Player may call this on dismissal; the next successful resolve also replaces the old proxy.
-    func stop() { playbackGeneration &+= 1; activeProxy?.stop(); activeProxy = nil }
+    func stop() { playbackGeneration &+= 1; activeProxy?.stop(); activeProxy = nil; activePlaybackURL = nil }
+
+    /// A departed player must not revoke a newer player's capability.
+    func releasePlayback(url: URL) {
+        guard activePlaybackURL == url else { return }
+        activeProxy?.stop(); activeProxy = nil; activePlaybackURL = nil
+    }
 
     /// A download owns its returned URL until completion/failure/cancellation.
     /// The caller must release it in defer; the bounded pool never evicts a playing proxy.
@@ -182,12 +197,12 @@ final class SpecialSourceResolver {
         let context = contextGeneration
         let generation = namespaceGenerations[settings.namespace, default: 0]
         try check(context, namespace: settings.namespace, generation: generation)
-        if let token = try credentials.get("token"), !token.isEmpty { return token }
         // Optional runtime token must be supplied by the caller's legitimate authorization flow.
         if !settings.authorizedToken.isEmpty {
             try credentials.set(settings.authorizedToken, key: "token")
             return settings.authorizedToken
         }
+        if let token = try credentials.get("token"), !token.isEmpty { return token }
         guard !settings.hema else { throw SpecialSourceError.authorization }
         if let pending = initialization[settings.namespace] {
             let token = try await pending.task.value
@@ -243,7 +258,7 @@ final class SpecialSourceResolver {
         request.httpBody = Data(fields.sorted { $0.key < $1.key }.map {
             Crypto.androidURIEncode($0.key) + "=" + Crypto.androidURIEncode($0.value)
         }.joined(separator: "&").utf8)
-        let (data, response) = try await transport.session.data(for: request)
+        let (data, response) = try await BoundedHTTP.data(for: request, session: transport.session, limit: 8 * 1024 * 1024)
         try check(context, namespace: settings.namespace, generation: generation)
         guard let http = response as? HTTPURLResponse else { throw SpecialSourceError.response("无 HTTP 响应") }
         guard (200..<300).contains(http.statusCode) else { throw SpecialSourceError.response("HTTP \(http.statusCode)，未重试或重新生成权益") }
@@ -300,7 +315,7 @@ private struct SpecialSettings {
     let playerHeaders: [String: String]
     let adEndpoints: Set<String>
 
-    init(source: String, config: [String: Any]) throws {
+    init(source: String, config: [String: Any], accountScope: String) throws {
         let name: String
         switch source { case "xm3u8": name = "src1"; case "xiaocao": name = "src7"; case "hema": name = "src2"
         default: throw SpecialSourceError.configuration("未知特殊源") }
@@ -327,7 +342,8 @@ private struct SpecialSettings {
         }
         salt = values.text("salt"); signingSalt = values.text("replaceEncryptDomain")
         guard !signingSalt.isEmpty, hema || !salt.isEmpty else { throw SpecialSourceError.configuration("缺少签名盐") }
-        namespace = source + "." + Crypto.md5(listURL.absoluteString)
+        let originScope = SHA256.hash(data: Data(listURL.absoluteString.utf8)).map { String(format: "%02x", $0) }.joined()
+        namespace = source + "." + originScope + "." + accountScope
         authorizedToken = values.text("authorizedToken")
         func headerMap(_ name: String) -> [String: String] {
             if let map = values[name] as? [String: String] { return map }
@@ -375,15 +391,19 @@ private struct SpecialCredentials {
                   account.hasPrefix(source + ".") else { return nil }
             let parts = account.components(separatedBy: ".")
             // Only the exact account format written by this App; never account-store tokens.
-            guard parts.count == 3, parts[1].count == 32,
-                  parts[1].allSatisfy({ $0.isASCII && "0123456789abcdef".contains($0) }),
-                  ["token", "device", "timestamp"].contains(parts[2]) else { return nil }
+            // Enumerate both legacy and account-scoped records for source-wide clear.
+            // Legacy credentials are not replayed into the new account namespace.
+            let legacy = parts.count == 3 && parts[1].count == 32
+            let scoped = parts.count == 4 && parts[1].count == 64 && parts[2].count == 64
+            guard legacy || scoped,
+                  parts.dropFirst().dropLast().allSatisfy({ $0.allSatisfy({ $0.isASCII && "0123456789abcdef".contains($0) }) }),
+                  let key = parts.last, ["token", "device", "timestamp"].contains(key) else { return nil }
             guard let data = item[kSecValueData as String] as? Data,
                   let value = String(data: data, encoding: .utf8),
                   let reference = item[kSecValuePersistentRef as String] as? Data else {
                 throw SpecialSourceError.keychain(errSecDecode)
             }
-            return Record(namespace: source + "." + parts[1], key: parts[2], value: value, reference: reference)
+            return Record(namespace: parts.dropLast().joined(separator: "."), key: key, value: value, reference: reference)
         }
     }
 
@@ -514,7 +534,7 @@ private final class SpecialHLSProxy {
             for (key, value) in settings.playerHeaders where !["host", "content-length", "connection"].contains(key.lowercased()) {
                 request.setValue(value, forHTTPHeaderField: key)
             }
-            let (body, response) = try await transport.session.data(for: request)
+            let (body, response) = try await BoundedHTTP.data(for: request, session: transport.session, limit: 2 * 1024 * 1024)
             try Task.checkCancellation()
             guard !stopped else { throw CancellationError() }
             guard let http = response as? HTTPURLResponse, http.statusCode == 200,
@@ -608,7 +628,11 @@ private final class SpecialHLSProxy {
                 guard value.range(of: "^bytes=[0-9]+-[0-9]*$", options: .regularExpression) != nil else { throw SpecialSourceError.proxy("Range 不受支持") }
                 request.setValue(value, forHTTPHeaderField: "Range")
             }
-            let (body, response) = try await transport.session.data(for: request)
+            // Fetch GET for HEAD too: playlists have transformed representations,
+            // so upstream HEAD length cannot describe the rewritten local body.
+            let head = request.httpMethod == "HEAD"
+            if head { request.httpMethod = "GET" }
+            let (body, response) = try await BoundedHTTP.data(for: request, session: transport.session, limit: 32 * 1024 * 1024)
             try Task.checkCancellation()
             guard !stopped, connections[id] != nil else { throw CancellationError() }
             guard let http = response as? HTTPURLResponse, [200, 206].contains(http.statusCode) else { throw SpecialSourceError.response("媒体请求被拒绝；可能需要重新授权或验证") }
@@ -623,7 +647,7 @@ private final class SpecialHLSProxy {
             }
             send(connection, id: id, status: http.statusCode, body: output,
                  type: isHLS ? "application/vnd.apple.mpegurl" : (http.mimeType ?? "application/octet-stream"),
-                 head: request.httpMethod == "HEAD", extra: extra)
+                 head: head, extra: extra)
         } catch {
             guard !stopped, !Task.isCancelled, connections[id] != nil else { connection.cancel(); return }
             send(connection, id: id, status: 502, body: Data(error.localizedDescription.utf8), type: "text/plain; charset=utf-8")

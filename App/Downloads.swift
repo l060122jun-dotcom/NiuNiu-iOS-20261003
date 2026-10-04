@@ -227,12 +227,12 @@ final class DownloadsStore: NSObject, ObservableObject {
                     origin = OfflineDownloadOrigin(videoID: videoID, playerID: playerID,
                                                    episodeIndex: episodeIndex, episodeURL: episodeURL)
                 } else { origin = nil }
-                if self.isLoopback(old.sourceURL) || old.format == .foregroundHLS {
+                if origin != nil || self.isLoopback(old.sourceURL) || old.format == .foregroundHLS {
                     guard let origin = origin, !origin.videoID.isEmpty, !origin.playerID.isEmpty,
                           origin.episodeIndex >= 0, !origin.episodeURL.isEmpty else {
-                        throw ForegroundHLSDownload.Failure("旧特殊源下载记录没有影片/源/集元数据，不能复用失效代理；请从视频详情重新下载。")
+                        throw ForegroundHLSDownload.Failure("下载记录没有有效影片/源/集元数据，不能复用旧授权地址；请从视频详情重新下载。")
                     }
-                    guard UIApplication.shared.applicationState != .background else {
+                    guard !(self.isLoopback(old.sourceURL) || old.format == .foregroundHLS) || UIApplication.shared.applicationState != .background else {
                         throw ForegroundHLSDownload.Failure("特殊源需保持 App 前台解析并完成下载。")
                     }
                     let video = try await APIClient.shared.detail(id: origin.videoID)
@@ -248,11 +248,12 @@ final class DownloadsStore: NSObject, ObservableObject {
                     var transferred = false
                     defer { if !transferred { SpecialSourceResolver.shared.releaseDownload(url: result.url) } }
                     try Task.checkCancellation()
-                    guard UIApplication.shared.applicationState != .background,
+                    guard !self.isLoopback(result.url) || UIApplication.shared.applicationState != .background,
                           let current = self.index(id), [.failed, .cancelled].contains(self.items[current].state) else {
                         throw ForegroundHLSDownload.Failure("重试已停止或原记录已删除，未加入新任务。")
                     }
-                    let addedID = self.add(title: old.title, url: result.url, headers: result.headers, origin: origin)
+                    let addedID = self.add(title: old.title, url: result.url, headers: result.headers,
+                                          format: old.format == .foregroundHLS ? .hls : old.format, origin: origin)
                     guard let added = self.items.first(where: { $0.id == addedID }),
                           [.queued, .downloading, .completed].contains(added.state) else {
                         throw ForegroundHLSDownload.Failure(self.items.first(where: { $0.id == addedID })?.errorMessage
@@ -260,14 +261,7 @@ final class DownloadsStore: NSObject, ObservableObject {
                     }
                     transferred = true
                 } else {
-                    try Task.checkCancellation()
-                    guard self.index(id) != nil else { return }
-                    let addedID = self.add(title: old.title, url: old.sourceURL, headers: old.headers,
-                                          format: old.format, origin: origin)
-                    guard let added = self.items.first(where: { $0.id == addedID }),
-                          [.queued, .downloading, .completed].contains(added.state) else {
-                        throw ForegroundHLSDownload.Failure(self.storageError ?? "下载入队失败。")
-                    }
+                    throw ForegroundHLSDownload.Failure("旧下载缺少影片/源/集元数据，不能确认签名地址仍有效；请从视频详情重新下载。")
                 }
             } catch {
                 if let current = self.index(id) {

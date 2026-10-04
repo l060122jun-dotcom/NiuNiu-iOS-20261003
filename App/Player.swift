@@ -31,6 +31,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
     var pictureInPictureStatus: String { capabilityMessage ?? "画中画使用 IJK 真实解码帧；首帧显示且系统允许后可启动。" }
     var restorePictureInPictureUI: (() -> Bool)?
     private var renderer: IJKSampleBufferView?
+    private var loadedURL: URL?
     private var pip: AVPictureInPictureController?
     private var pipPossibleObservation: NSKeyValueObservation?
     private var pipStarting = false
@@ -74,6 +75,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
 
     func load(_ url: URL, headers: [String: String] = [:], resume: Double = 0) {
         releaseCore()
+        loadedURL = url // Also release capabilities if configuration/initialization fails.
         error = nil
         capabilityMessage = nil
         position = 0
@@ -424,6 +426,8 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
     }
 
     private func releaseCore() {
+        let releasedURL = loadedURL
+        loadedURL = nil
         videoDisplayAspect = nil
         hasRenderedFrame = false
         nativeSeekTarget = nil
@@ -449,6 +453,7 @@ final class PlaybackController: NSObject, ObservableObject, AVPictureInPictureCo
         previous?.view?.removeFromSuperview()
         previous?.stop()
         previous?.shutdown() // Official shutdown releases native FFmpeg threads asynchronously.
+        if let releasedURL { SpecialSourceResolver.shared.releasePlayback(url: releasedURL) }
     }
 
     private func completeSkip() {

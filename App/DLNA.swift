@@ -613,6 +613,9 @@ final class DLNAStore: ObservableObject {
         mediaProxy?.stop()
         mediaProxy = nil
         castID = UUID()
+        mediaAccessRevoked = true
+        activeMediaURL = nil
+        transportState = "UNKNOWN"
         try await control("Stop", state: "STOPPED")
         isCasting = false
         mediaAccessRevoked = false

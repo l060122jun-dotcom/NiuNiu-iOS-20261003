@@ -51,7 +51,7 @@ final class APIClient {
         adultCategories = []
         knownVideoCategories = [:]
         episodeCategories = [:]
-        SpecialSourceResolver.shared.invalidateContext()
+        SpecialSourceResolver.shared.invalidateContext(accountToken: token)
     }
     private var categoryCache: [VideoCategory]?
     private var adultCategories = Set<String>()
@@ -510,7 +510,7 @@ final class APIClient {
             request.setValue(value, forHTTPHeaderField: key)
         }
         if let contentType = contentType, request.value(forHTTPHeaderField: "Content-Type") == nil { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await BoundedHTTP.data(for: request, session: session, limit: 16 * 1024 * 1024)
         try checkContext(revision)
         guard let response = response as? HTTPURLResponse else { throw APIError.invalidResponse }
         guard (200..<300).contains(response.statusCode) else { throw APIError.http(response.statusCode) }

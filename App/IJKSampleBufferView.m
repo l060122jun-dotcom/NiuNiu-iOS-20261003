@@ -143,7 +143,13 @@
                              (id)kCVImageBufferPixelAspectRatioVerticalSpacingKey: @(sarDen)};
     CVBufferSetAttachment(buffer, kCVImageBufferPixelAspectRatioKey, (__bridge CFDictionaryRef)aspect, kCVAttachmentMode_ShouldPropagate);
     os_unfair_lock_lock(&_lock);
-    if (_closed || generation != _generation) { os_unfair_lock_unlock(&_lock); CVPixelBufferRelease(buffer); return; }
+    // Confirmation can arrive while pixels are copied outside the lock. Recheck
+    // the exact serial under the SAME lock as acceptance, not just generation.
+    if (_closed || generation != _generation ||
+        (_waitingSerial && _seekConfirmed && overlay->serial != _seekSerial) ||
+        (!_waitingSerial && _hasAcceptedSerial && overlay->serial < _acceptedSerial)) {
+        os_unfair_lock_unlock(&_lock); CVPixelBufferRelease(buffer); return;
+    }
     if (_waitingSerial && _seekConfirmed) {
         // Latch the exact completion serial at acceptance, NOT drain.
         // Subsequent seek increments generation even when this hasn't drained.

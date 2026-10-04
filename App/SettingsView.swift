@@ -59,7 +59,7 @@ struct SettingsView: View {
                     })) {
                         caption("青少年模式", "默认开启，关闭后将显示R18内容")
                     }.frame(minHeight: 60)
-                    Button { clearCache() } label: {
+                    Button { Task { await clearCache() } } label: {
                         row("清除缓存") { Text(ByteCountFormatter.string(fromByteCount: cacheBytes, countStyle: .file)) }
                     }
                     ForEach(sources.indices, id: \.self) { index in
@@ -186,7 +186,7 @@ struct SettingsView: View {
     }
 
     private func configuredPasswords() throws -> [String] {
-        guard let raw = serverConfig["pwd"], !(raw is NSNull) else { return [] }
+        guard let raw = serverConfig["pwd"], !(raw is NSNull) else { throw APIError.invalidResponse }
         guard let values = raw as? [String] else { throw APIError.invalidResponse }
         return values
     }
@@ -231,10 +231,14 @@ struct SettingsView: View {
         }
     }
 
-    private func clearCache() {
+    private func clearCache() async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
         // AVPlayer does not expose Android's disk video-proxy cache on iOS.
         // Only remove the cache actually owned by this client, never downloads/history.
         URLCache.shared.removeAllCachedResponses()
+        await PosterImagePipeline.shared.clearCache()
         cacheBytes = Int64(URLCache.shared.currentDiskUsage + URLCache.shared.currentMemoryUsage)
         notice = "图片与请求缓存已清除。iOS 系统播放缓存由 AVPlayer 管理。"
     }

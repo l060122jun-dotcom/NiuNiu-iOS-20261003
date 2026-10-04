@@ -60,6 +60,7 @@ private extension EnvironmentValues {
 }
 
 private struct BrowseScroll<Content: View>: View {
+    @Environment(\.browseContentActive) private var contentActive
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var tracking = false
     private let resetKey: String
@@ -92,7 +93,7 @@ private struct BrowseScroll<Content: View>: View {
             }
             .coordinateSpace(name: "browse.results")
             .environment(\.browseViewportHeight, viewport.size.height)
-            .environment(\.browseTracking, tracking && active)
+            .environment(\.browseTracking, tracking && active && contentActive)
             .environment(\.posterCoordinateSpace, "browse.results")
             .onAppear { tracking = true }
             .onDisappear { tracking = false }
@@ -381,7 +382,8 @@ struct MainTabView: View {
                     guard account.isLoggedIn, let counts = response as? [String: Any] else { return }
                     let total = MainTabAppearance.integer(counts["total"])
                     unreadCount = total > 0 ? total : ["system", "message_reply", "comment"].reduce(0) {
-                        $0 + max(0, MainTabAppearance.integer(counts[$1]))
+                        // Badge only distinguishes 0...99 and 99+. Clamp before adding.
+                        min(100, $0 + min(100, max(0, MainTabAppearance.integer(counts[$1]))))
                     }
                 } catch is CancellationError { return }
                 catch { /* An unavailable count must never become a fabricated badge. */ }
@@ -393,6 +395,7 @@ struct MainTabView: View {
 }
 
 /// Keep SwiftUI's native navigation/visibility router; the compact bar owns its UI.
+@MainActor
 private struct MainTabAppearance: UIViewControllerRepresentable {
     @Environment(\.liuyunGlassConfiguration) private var glassConfiguration
     let dark: Bool
@@ -422,6 +425,10 @@ private struct MainTabAppearance: UIViewControllerRepresentable {
         controller.active = active
         controller.onSelect = { selection = $0 }
         controller.refresh()
+    }
+
+    static func dismantleUIViewController(_ controller: GlassTabContainer, coordinator: ()) {
+        controller.dismantle()
     }
 }
 
@@ -576,20 +583,27 @@ private struct PosterPrefetchKey: PreferenceKey {
     static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
 }
 
+@MainActor
 private struct PosterView: View {
     let url: String
     @Environment(\.displayScale) private var displayScale
     @Environment(\.browseViewportHeight) private var viewportHeight
     @Environment(\.browseTracking) private var tracking
     @Environment(\.posterCoordinateSpace) private var coordinateSpace
+    @Environment(\.browseContentActive) private var contentActive
+    @ObservedObject private var cacheState = PosterCacheState.shared
+    @State private var appeared = false
     @State private var prefetched = false
     @State private var image: UIImage?
     @State private var loadedURL: String?
+    @State private var loadedRevision: UInt64?
     var body: some View {
         GeometryReader { geometry in
-            let frame = geometry.frame(in: .named(coordinateSpace))
-            let pixels = min(2048, max(1, Int(ceil(max(geometry.size.width, geometry.size.height) * displayScale))))
-            let eligible = tracking && prefetched
+            let extent = max(geometry.size.width, geometry.size.height) * displayScale
+            let pixels = extent.isFinite ? Int(min(2048, max(1, ceil(extent)))) : 1
+            // Lists do not supply the BrowseScroll coordinate environment. Their
+            // row lifecycle is the fallback gate; do not permanently require height > 0.
+            let eligible = appeared && tracking && contentActive && (viewportHeight <= 0 || prefetched)
             Group {
                 if let image = image {
                     Image(uiImage: image).resizable().scaledToFill()
@@ -602,19 +616,33 @@ private struct PosterView: View {
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
-            .preference(key: PosterPrefetchKey.self, value: viewportHeight > 0 && frame.width > 0
-                        && frame.maxY > -viewportHeight && frame.minY < viewportHeight * 2)
-            .onPreferenceChange(PosterPrefetchKey.self) { prefetched = $0 }
-            .task(id: "\(url)|\(pixels)|\(eligible)") {
-                if loadedURL != url { image = nil }
-                guard eligible, let source = URL(string: url), ["http", "https"].contains(source.scheme?.lowercased() ?? "") else { return }
+            // Keep a stable measurement layer across image/placeholder changes.
+            // Read the frame in that layer so scrolling re-evaluates eligibility.
+            .background {
+                GeometryReader { measurement in
+                    let frame = measurement.frame(in: .named(coordinateSpace))
+                    Color.clear.preference(key: PosterPrefetchKey.self,
+                        value: frame.width > 0 && frame.maxY > -viewportHeight && frame.minY < viewportHeight * 2)
+                }
+            }
+            .onPreferenceChange(PosterPrefetchKey.self) { value in
+                prefetched = value
+                if viewportHeight > 0 && !value { image = nil; loadedURL = nil }
+            }
+            .task(id: "\(url)|\(pixels)|\(eligible)|\(cacheState.revision)") {
+                let revision = cacheState.revision
+                if loadedRevision != revision || loadedURL != url { image = nil; loadedURL = nil }
+                guard eligible else { image = nil; loadedURL = nil; return }
+                guard let source = URL(string: url), ["http", "https"].contains(source.scheme?.lowercased() ?? "") else { return }
                 guard loadedURL != url || image == nil else { return }
                 let result = await PosterImagePipeline.shared.image(url: source, pixels: pixels)
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, revision == cacheState.revision else { return }
                 image = result
                 loadedURL = url
+                loadedRevision = revision
             }
-            .onDisappear { image = nil; prefetched = false }
+            .onAppear { appeared = true }
+            .onDisappear { appeared = false; image = nil; loadedURL = nil; prefetched = false }
         }
         .aspectRatio(0.7, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -860,6 +888,7 @@ private struct SearchResultsScroll: View {
 
 @MainActor
 struct HomeView: View {
+    @Environment(\.browseContentActive) private var contentActive
     @EnvironmentObject private var catalog: BrowseCatalog
     @EnvironmentObject private var library: LibraryStore
     @State private var selection = "recommended"
@@ -895,9 +924,9 @@ struct HomeView: View {
                         ForEach(visited, id: \.self) { key in
                             Group {
                                 if key == "recommended" {
-                                    RecommendationsView(active: visible && selectedPage == key)
+                                    RecommendationsView(active: visible && contentActive && selectedPage == key)
                                 } else if let category = catalog.categories.first(where: { $0.id == key }) {
-                                    CategoryVideosView(category: category, active: visible && selectedPage == key)
+                                    CategoryVideosView(category: category, active: visible && contentActive && selectedPage == key)
                                 }
                             }
                             .frame(width: viewport.size.width, height: viewport.size.height)
@@ -1071,6 +1100,7 @@ private struct RecommendationPageView: View {
 
 @MainActor
 struct CategoryVideosView: View {
+    @Environment(\.browseContentActive) private var contentActive
     let category: VideoCategory
     var active = true
     @EnvironmentObject private var catalog: BrowseCatalog
@@ -1103,7 +1133,7 @@ struct CategoryVideosView: View {
             ZStack {
                 ForEach(visited.contains(requestKey) ? visited : Array((visited + [requestKey]).suffix(6)), id: \.self) { key in
                     let snapshot = pageFilters[key] ?? filters
-                    let pageActive = active && key == requestKey
+                    let pageActive = active && contentActive && key == requestKey
                     ObservedVideoPage(store: BrowsePageCache.shared.page(context: context, key: key)) { store in
         BrowseScroll(resetRevision: store.scrollResetRevision, active: pageActive) {
             VStack(spacing: 12) {
@@ -1193,6 +1223,7 @@ struct CategoryVideosView: View {
 
 @MainActor
 struct RankingView: View {
+    @Environment(\.browseContentActive) private var contentActive
     @EnvironmentObject private var catalog: BrowseCatalog
     @ObservedObject private var account = AccountStore.shared
     @State private var categoryID = ""
@@ -1208,6 +1239,7 @@ struct RankingView: View {
     private var rankChoices: [Choice] {
         let category = catalog.categories.first { $0.id == selectedID }
         var seen = Set<String>()
+        var requestIDs = Set<String>()
         return (category?.filters["director"] ?? "")
             .components(separatedBy: CharacterSet(charactersIn: ",，|/"))
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1220,6 +1252,7 @@ struct RankingView: View {
                 // not the full UI metadata string day_电影榜_1.
                 return Choice(id: parts.first ?? value, title: period.map { "\(name) · \($0)" } ?? name)
             }
+            .filter { !$0.id.isEmpty && requestIDs.insert($0.id).inserted }
     }
     private var selectedOrder: String { rankChoices.first(where: { $0.id == order })?.id ?? rankChoices.first?.id ?? "" }
 
@@ -1229,7 +1262,7 @@ struct RankingView: View {
                 ZStack {
                     ForEach(visited.contains(requestKey) ? visited : Array((visited + [requestKey]).suffix(6)), id: \.self) { key in
                         let snapshot = parameters[key] ?? [selectedID, selectedOrder]
-                        let pageActive = visible && key == requestKey
+                        let pageActive = visible && contentActive && key == requestKey
                         ObservedVideoPage(store: BrowsePageCache.shared.page(context: context, key: key)) { store in
                BrowseScroll(resetRevision: store.scrollResetRevision, active: pageActive) {
                  VStack(spacing: 14) {
@@ -1626,8 +1659,7 @@ struct SearchView: View {
             guard activity.visible, activity.revision == revision, morphPresented, identity == hotKey else { return }
             // Verified in SexyConfig.java: @SerializedName("search_hot_words") List<String>.
             guard let response = configuration["search_hot_words"] as? [String] else {
-                hotWords = []
-                return
+                throw APIError.invalidResponse
             }
             var seen = Set<String>()
             hotWords = response.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }

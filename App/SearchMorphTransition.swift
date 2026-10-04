@@ -20,7 +20,15 @@ private struct SearchMorphNamespaceKey: EnvironmentKey {
     static let defaultValue: Namespace.ID? = nil
 }
 
+private struct BrowseContentActiveKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
 extension EnvironmentValues {
+    var browseContentActive: Bool {
+        get { self[BrowseContentActiveKey.self] }
+        set { self[BrowseContentActiveKey.self] = newValue }
+    }
     var searchMorphNamespace: Namespace.ID? {
         get { self[SearchMorphNamespaceKey.self] }
         set { self[SearchMorphNamespaceKey.self] = newValue }
@@ -73,6 +81,7 @@ struct SearchMorphHost: ViewModifier {
     func body(content: Content) -> some View {
         ZStack(alignment: .top) {
             content
+                .environment(\.browseContentActive, !presentation.expanded)
                 // Blur belongs to the transition backdrop, never the active
                 // search content or its full-page background.
                 .blur(radius: presentation.expanded && !presentation.ready && !reduceMotion ? 9 : 0)
