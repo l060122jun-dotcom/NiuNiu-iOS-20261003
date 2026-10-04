@@ -1948,7 +1948,7 @@ private struct ProfileHistoryTile: View {
             : String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
     var body: some View {
-        NavigationLink { DetailView(videoID: video.id).toolbar(.visible, for: .navigationBar) } label: {
+        NavigationLink { DetailView(videoID: video.id) } label: {
             VStack(alignment: .leading, spacing: 4) {
                 GeometryReader { geometry in
                     AsyncImage(url: URL(string: video.poster)) { phase in

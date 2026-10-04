@@ -228,7 +228,7 @@ import UIKit
         Button("上一集") { startEpisode(episodeIndex - 1) }.disabled(episodeIndex == 0 || resolving)
         Button("后退15秒") { seek(time - 15) }
         Button("前进15秒") { seek(time + 15) }
-        PlayerMenuDisclosure(title: "倍速") {
+        Menu("倍速") {
             ForEach(PlaybackPreferences.rates, id: \.self) { value in
                 Button(String(format: "%g×", value)) { applyRate(value) }
             }
@@ -243,7 +243,7 @@ import UIKit
             Button(landscape ? "切换竖屏" : "切换横屏") { manualLandscape = !landscape }
             if manualLandscape != nil { Button("按视频比例自动方向") { manualLandscape = nil } }
         }
-        PlayerMenuDisclosure(title: "播放方式") {
+        Menu("播放方式") {
             Button("连续播放") { settings.mode = "continuous" }
             Button("单集停止") { settings.mode = "single" }
             Button("单集循环") { settings.mode = "loop" }

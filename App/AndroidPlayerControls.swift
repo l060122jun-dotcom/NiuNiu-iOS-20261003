@@ -80,7 +80,7 @@ import MediaPlayer
                         Spacer()
                     }.padding(.horizontal, 16)
                 }
-            } else if interaction.visible {
+            } else {
                 VStack(spacing: 0) {
                     topBar
                     Spacer(minLength: 0)
@@ -96,6 +96,10 @@ import MediaPlayer
                     }
                     bottomBar
                 }
+                // Keep native Menu's presenter mounted while UIKit owns its
+                // popup. Auto-hide changes visibility, not presenter identity.
+                .opacity(interaction.visible ? 1 : 0)
+                .allowsHitTesting(interaction.visible)
             }
             if let feedback = interaction.feedback, !locked {
                 Text(feedback).font(.system(size: 15, weight: .semibold)).monospacedDigit()
@@ -124,9 +128,9 @@ import MediaPlayer
             icon("电视投屏", "tv", action: onCast)
             if let onPictureInPicture { icon("画中画", "pip", action: onPictureInPicture) }
             icon("播放设置", "gearshape", action: onSettings)
-            Button { toggleMenu(.more) } label: { Image(systemName: "ellipsis").frame(width: 40, height: 40) }
+            Menu { more() } label: { Image(systemName: "ellipsis").frame(width: 40, height: 40) }
                 .accessibilityLabel("更多播放功能")
-                .anchorPreference(key: PlayerControlBoundsKey.self, value: .bounds) { [.more: $0] }
+                .simultaneousGesture(TapGesture().onEnded { interaction.show() })
         }
         .padding(.horizontal, wide ? 16 : 4).padding(.top, 4)
         .background(LinearGradient(colors: [.black.opacity(0.8), .clear], startPoint: .top, endPoint: .bottom))
